@@ -1,0 +1,56 @@
+{
+    "manifest_version": 3,
+    "name": "QA Flight Recorder",
+    "version": "1.0.0",
+    "description": "Record QA sessions: network telemetry, console errors, actions, and screen video",
+    "permissions": [
+        "debugger",
+        "tabs",
+        "tabCapture",
+        "scripting",
+        "storage",
+        "activeTab",
+        "notifications",
+        "offscreen"
+    ],
+    "host_permissions": [
+        "http://127.0.0.1/*",
+        "<all_urls>"
+    ],
+    "background": {
+        "service_worker": "background.js"
+    },
+    "action": {
+        "default_popup": "popup.html",
+        "default_icon": {
+            "16": "icon16.png",
+            "32": "icon32.png",
+            "48": "icon48.png",
+            "128": "icon128.png"
+        },
+        "default_title": "QA Flight Recorder"
+    },
+    "icons": {
+        "16": "icon16.png",
+        "32": "icon32.png",
+        "48": "icon48.png",
+        "128": "icon128.png"
+    },
+    "commands": {
+        "toggle-recording": {
+            "suggested_key": {
+                "default": "Ctrl+Shift+S",
+                "mac": "Command+Shift+S"
+            },
+            "description": "Start or Stop recording"
+        },
+        "add-bug-marker": {
+            "suggested_key": {
+                "default": "Ctrl+Shift+M",
+                "mac": "Command+Shift+M"
+            },
+            "description": "Add a Bug Marker"
+        }
+    },
+    "content_scripts": []
+}
