@@ -2172,6 +2172,7 @@
           <div class="tab" id="tab-events" onclick="switchTab('events')">📋 Events <span class="tab-badge info"
               id="tab-events-badge" style="display:none"></span></div>
           <div class="tab" id="tab-video" onclick="switchTab('video')">🎬 Video</div>
+          <div class="tab" id="tab-runs" onclick="switchTab('runs')">🏃‍♂️ Runs</div>
         </div>
 
         <div class="tab-panels">
@@ -2311,6 +2312,15 @@
                 <div class="no-video">Loading activity…</div>
               </div>
             </div>
+          </div>
+
+          <!-- Sanity Runs History -->
+          <div class="tab-panel" id="panel-runs">
+            <div class="section-header" style="margin-bottom:0">
+              <span class="section-title" style="font-size:12px;">Sanity Runs History</span>
+              <button class="icon-btn" onclick="loadRuns()" title="Refresh" style="margin-left:auto; width:28px; height:28px; font-size:13px;">🔄</button>
+            </div>
+            <div id="runs-list" style="display:flex;flex-direction:column;gap:12px;"></div>
           </div>
 
         </div>

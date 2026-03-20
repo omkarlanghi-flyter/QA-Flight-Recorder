@@ -243,6 +243,12 @@ app.post('/sessions/:id/replay', async (req, res) => {
         activeReplays.set(req.params.id, engine);
         const report = await engine.run();
         activeReplays.delete(req.params.id);
+
+        report.timestamp = Date.now();
+        const replaysDir = path.join(getSessionDir(req.params.id), 'replays');
+        fs.mkdirSync(replaysDir, { recursive: true });
+        fs.writeFileSync(path.join(replaysDir, `${report.timestamp}.json`), JSON.stringify(report, null, 2));
+
         res.json({ report });
     } catch (err) {
         activeReplays.delete(req.params.id);
@@ -261,6 +267,25 @@ app.post('/sessions/:id/replay/stop', async (req, res) => {
         res.json({ ok: true });
     } else {
         res.status(404).json({ error: 'No active replay for this session' });
+    }
+});
+
+/**
+ * GET /sessions/:id/replays
+ * Returns all past sanity run reports for this session
+ */
+app.get('/sessions/:id/replays', (req, res) => {
+    const replaysDir = path.join(getSessionDir(req.params.id), 'replays');
+    if (!fs.existsSync(replaysDir)) return res.json({ replays: [] });
+    
+    try {
+        const files = fs.readdirSync(replaysDir).filter(f => f.endsWith('.json')).sort().reverse();
+        const replays = files.map(f => {
+            try { return JSON.parse(fs.readFileSync(path.join(replaysDir, f), 'utf8')); } catch { return null; }
+        }).filter(Boolean);
+        res.json({ replays });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
     }
 });
 
