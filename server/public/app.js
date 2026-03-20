@@ -351,6 +351,10 @@ async function runSanityFlow(e, sessionId, flowName, moduleName) {
       const errCount = report.failures.ui.length + report.failures.js_errors.length;
       alert(`Replay Finished!\nPassed: ${report.summary.passed}\nFailed: ${report.summary.failed}\nErrors: ${errCount}\nNet Fails: ${report.failures.network.length}`);
     }
+
+    if (currentTab === 'runs' && currentSessionId === sessionId) {
+      loadRuns();
+    }
   } catch (err) {
     alert(`Replay Error: ${err.message}`);
   } finally {
@@ -1432,7 +1436,7 @@ window.seekVideo = function (epochMs) {
 // ── Tabs ──────────────────────────────────────────────────────────────────────
 function switchTab(tab) {
   currentTab = tab;
-  ['overview', 'triage', 'input', 'events', 'video'].forEach(t => {
+  ['overview', 'triage', 'input', 'events', 'video', 'runs'].forEach(t => {
     document.getElementById(`tab-${t}`)?.classList.toggle('active', t === tab);
     document.getElementById(`panel-${t}`)?.classList.toggle('active', t === tab);
   });
@@ -1440,6 +1444,41 @@ function switchTab(tab) {
   else if (tab === 'input') loadInputTrack();
   else if (tab === 'events') loadEvents();
   else if (tab === 'video') loadVideo();
+  else if (tab === 'runs') loadRuns();
+}
+
+async function loadRuns() {
+  if (!currentSessionId) return;
+  const listEl = document.getElementById('runs-list');
+  listEl.innerHTML = '<div class="loading-row"><span class="spinner"></span> Loading…</div>';
+  try {
+    const res = await fetch(`${API}/sessions/${currentSessionId}/replays`);
+    const { replays } = await res.json();
+    if (!replays || !replays.length) {
+      listEl.innerHTML = '<div class="empty-list">No sanity runs executed yet for this flow.</div>';
+      return;
+    }
+    
+    listEl.innerHTML = replays.map(r => {
+      const errCount = (r.failures?.ui?.length || 0) + (r.failures?.js_errors?.length || 0);
+      const isClean = errCount === 0 && (r.failures?.network?.length || 0) === 0;
+      return `
+      <details class="cluster-item" style="display:block; cursor:pointer;">
+          <summary style="display:flex; gap:10px; align-items:center; list-style:none;">
+              <span style="font-weight:600; font-size:12px;">${formatDate(r.timestamp)}</span>
+              ${isClean ? '<span class="badge badge-success">✓ Clean</span>' : `<span class="badge badge-error">⚠ ${errCount} Issues</span>`}
+              <span style="margin-left:auto; font-size:11px; color:var(--text-muted)">Passed: ${r.summary?.passed || 0}/${r.summary?.total_steps || 0}</span>
+          </summary>
+          <div style="margin-top:10px; padding-top:10px; border-top:1px solid var(--border);">
+              <div style="font-size:11px; margin-bottom:6px;"><strong>Report Summary:</strong></div>
+              <pre style="font-size:10px; background:var(--surface); padding:8px; border-radius:4px; max-height:200px; overflow:auto; color:var(--text); white-space:pre-wrap;">${esc(JSON.stringify(r, null, 2))}</pre>
+          </div>
+      </details>
+      `;
+    }).join('');
+  } catch {
+    listEl.innerHTML = '<div class="empty-list" style="color:var(--danger)">Failed to load runs</div>';
+  }
 }
 
 // ── Regen Views ───────────────────────────────────────────────────────────────

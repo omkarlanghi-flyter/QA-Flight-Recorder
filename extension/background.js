@@ -8,6 +8,23 @@ const BATCH_INTERVAL_MS = 2000;
 const MAX_BATCH_SIZE = 50;
 const VIDEO_CHUNK_TIMESLICE_MS = 5000;
 
+// ── Console Breadcrumb Ring-Buffer ───────────────────────────────────────────
+// Stores the last N info/log messages as breadcrumbs for error context
+const BREADCRUMB_BUFFER_SIZE = 50;
+const consoleBreadcrumbs = [];
+
+function addBreadcrumb(level, message) {
+    consoleBreadcrumbs.push({ level, message, ts: Date.now() });
+    if (consoleBreadcrumbs.length > BREADCRUMB_BUFFER_SIZE) {
+        consoleBreadcrumbs.shift();
+    }
+}
+
+function drainBreadcrumbs() {
+    // Returns snapshot of breadcrumbs (do not clear — useful for multiple correlated errors)
+    return consoleBreadcrumbs.slice();
+}
+
 let state = {
     recording: false,
     sessionId: null,
@@ -89,14 +106,47 @@ async function flushEvents() {
 }
 
 // ── CDP Event Handlers ───────────────────────────────────────────────────────
-// Static asset extensions — skip these entirely to avoid flooding events
-const STATIC_ASSET_RE = /\.(png|jpe?g|gif|svg|ico|webp|avif|woff2?|ttf|eot|otf|css|map|mp4|webm|mp3|wav|pdf|zip|gz)(\?|#|$)/i;
+// Static asset extensions to skip — NOTE: .js and .css are intentionally NOT here
+// so we can still detect 4xx/5xx failures on critical scripts and stylesheets.
+const STATIC_ASSET_RE = /\.(png|jpe?g|gif|svg|ico|webp|avif|woff2?|ttf|eot|otf|map|mp4|webm|mp3|wav|pdf|zip|gz)(\?|#|$)/i;
 const BODY_SIZE_LIMIT_BYTES = 50000; // 50KB — skip body capture for large responses
 
 function isStaticAsset(url) {
     if (!url) return false;
     try { return STATIC_ASSET_RE.test(new URL(url).pathname); }
     catch { return STATIC_ASSET_RE.test(url); }
+}
+
+/**
+ * Attempt to extract GraphQL operation name and query type from a POST body.
+ * Returns null if the request is not a GraphQL request.
+ */
+function parseGraphQL(url, postBody) {
+    if (!postBody || !url) return null;
+    try {
+        // Check if URL pattern suggests GraphQL
+        if (!/graphql|gql/i.test(url)) return null;
+        const body = JSON.parse(postBody);
+        if (!body || (!body.query && !body.operationName)) return null;
+        const operationName = body.operationName || null;
+        // Extract the operation type and name from the query string (query/mutation/subscription)
+        let operationType = 'query';
+        let parsedName = operationName;
+        if (body.query) {
+            const match = body.query.trim().match(/^(query|mutation|subscription)\s+([A-Za-z_][A-Za-z0-9_]*)/);
+            if (match) {
+                operationType = match[1];
+                parsedName = parsedName || match[2];
+            }
+        }
+        return {
+            graphql_operation: parsedName || 'anonymous',
+            graphql_type: operationType,
+            graphql_query_preview: body.query ? body.query.trim().slice(0, 200) : null,
+        };
+    } catch {
+        return null;
+    }
 }
 
 function handleCDPEvent(source, method, params) {
@@ -110,7 +160,7 @@ function handleCDPEvent(source, method, params) {
             const reqId = params.requestId;
             const rawUrl = req.url;
 
-            // PERF FIX 1: Skip static assets entirely — no events, no memory
+            // Skip media/font/image static assets but keep .js/.css so we detect critical failures
             if (isStaticAsset(rawUrl)) break;
 
             const url = sanitizeUrl(rawUrl);
@@ -121,8 +171,10 @@ function handleCDPEvent(source, method, params) {
                 requestBody = req.postData.substring(0, BODY_SIZE_LIMIT_BYTES);
             }
 
-            // PERF FIX 2: Only capture request headers for API calls, not assets
             const requestHeaders = redactHeaders(req.headers || {});
+
+            // Extract GraphQL operation metadata if applicable
+            const gql = parseGraphQL(rawUrl, requestBody);
 
             state.pendingRequests[reqId] = {
                 url,
@@ -135,10 +187,11 @@ function handleCDPEvent(source, method, params) {
                 responseHeaders: null,
                 responseStatus: null,
                 bodyFetchPromise: null,
-                isAPI: false, // confirmed when responseReceived fires with XHR/Fetch type
+                isAPI: false,
+                graphql: gql,
             };
 
-            bufferEvent(makeEvent('network.request', 'cdp', {
+            const eventData = {
                 request_id: reqId,
                 method: req.method,
                 url_sanitized: url,
@@ -146,7 +199,11 @@ function handleCDPEvent(source, method, params) {
                 request_body: requestBody,
                 request_headers: requestHeaders,
                 initiator: params.initiator?.type,
-            }, url));
+            };
+            // Attach GraphQL metadata if present
+            if (gql) Object.assign(eventData, gql);
+
+            bufferEvent(makeEvent('network.request', 'cdp', eventData, url));
             break;
         }
 
@@ -203,10 +260,8 @@ function handleCDPEvent(source, method, params) {
                     ? Math.round((params.timestamp - pending.startTime) * 1000)
                     : null;
 
-                // FIXED: Await the body fetch promise before emitting the timing event
-                // This eliminates the old 50ms race condition where body was always null
                 const emitTiming = () => {
-                    bufferEvent(makeEvent('network.timing', 'cdp', {
+                    const timingData = {
                         request_id: reqId,
                         duration_ms,
                         method: pending.method,
@@ -217,7 +272,10 @@ function handleCDPEvent(source, method, params) {
                         response_body: pending.responseBody,
                         response_headers: pending.responseHeaders,
                         response_status: pending.responseStatus,
-                    }, pending.url));
+                    };
+                    // Include GraphQL metadata on timing events too
+                    if (pending.graphql) Object.assign(timingData, pending.graphql);
+                    bufferEvent(makeEvent('network.timing', 'cdp', timingData, pending.url));
                     delete state.pendingRequests[reqId];
                 };
 
@@ -265,25 +323,64 @@ function handleCDPEvent(source, method, params) {
         // ── Log Entries ────────────────────────────────────────────────────────
         case 'Log.entryAdded': {
             const entry = params.entry;
-            if (!['warning', 'error'].includes(entry.level)) return;
-            const type = entry.level === 'warning' ? 'console.warn' : 'console.error';
-            bufferEvent(makeEvent(type, 'cdp-log', {
-                message: (entry.text || '').slice(0, 500),
-                source: entry.source,
-                url: entry.url,
-            }, entry.url));
+            const level = entry.level;
+            const message = (entry.text || '').slice(0, 500);
+
+            if (level === 'info' || level === 'verbose') {
+                // Info/verbose: add to breadcrumb buffer only, do not stream as event
+                addBreadcrumb(level, message);
+            } else if (level === 'warning') {
+                addBreadcrumb('warn', message);
+                bufferEvent(makeEvent('console.warn', 'cdp-log', {
+                    message,
+                    source: entry.source,
+                    url: entry.url,
+                }, entry.url));
+            } else if (level === 'error') {
+                bufferEvent(makeEvent('console.error', 'cdp-log', {
+                    message,
+                    source: entry.source,
+                    url: entry.url,
+                    breadcrumbs: drainBreadcrumbs(),
+                }, entry.url));
+            }
             break;
         }
 
         // ── Runtime Console messages ───────────────────────────────────────────
         case 'Runtime.consoleAPICalled': {
-            const level = params.type;
-            if (!['warning', 'error'].includes(level)) return;
-            const type = level === 'warning' ? 'console.warn' : 'console.error';
-            const args = (params.args || []).map(a => a.value || a.description || String(a.type)).join(' ');
-            bufferEvent(makeEvent(type, 'cdp-runtime', {
-                message: args.slice(0, 500),
-            }));
+            const level = params.type; // 'log' | 'info' | 'warning' | 'error' | 'debug'
+            const args = (params.args || []).map(a => a.value ?? a.description ?? String(a.type)).join(' ');
+            const message = args.slice(0, 500);
+
+            if (level === 'log' || level === 'info' || level === 'debug') {
+                // Only goes into the breadcrumb ring-buffer for context, not the event stream
+                addBreadcrumb(level, message);
+            } else if (level === 'warning') {
+                addBreadcrumb('warn', message);
+                bufferEvent(makeEvent('console.warn', 'cdp-runtime', { message }));
+            } else if (level === 'error') {
+                bufferEvent(makeEvent('console.error', 'cdp-runtime', {
+                    message,
+                    breadcrumbs: drainBreadcrumbs(),
+                }));
+            }
+            break;
+        }
+
+        // ── CORS / CSP Audit Violations ────────────────────────────────────────
+        case 'Audits.issueAdded': {
+            const issue = params.issue;
+            const code = issue?.code;
+            // Only track CORS and CSP issues
+            if (code === 'CorsIssue' || code === 'ContentSecurityPolicyIssue') {
+                const details = issue.details?.corsIssueDetails || issue.details?.contentSecurityPolicyIssueDetails || {};
+                bufferEvent(makeEvent('browser.audit_violation', 'cdp-audits', {
+                    issue_code: code,
+                    blocked_url: details.blockedURL || details.violatedDirective || null,
+                    details: JSON.stringify(details).slice(0, 500),
+                }));
+            }
             break;
         }
     }
@@ -322,6 +419,11 @@ async function attachCDP(tabId) {
         await chrome.debugger.sendCommand({ tabId }, 'Log.enable', {});
         // Enable console API calls via Runtime
         await chrome.debugger.sendCommand({ tabId }, 'Runtime.setAsyncCallStackDepth', { maxDepth: 32 });
+        // Enable Audits domain for CORS/CSP violation tracking
+        await chrome.debugger.sendCommand({ tabId }, 'Audits.enable', {}).catch(() => {
+            // Audits domain may not be available in all Chrome versions — silent fail
+            console.warn('[QA Recorder] Audits domain not available (Chrome <92?), CORS/CSP tracking disabled');
+        });
         console.log('[QA Recorder] CDP attached to tab', tabId);
     } catch (e) {
         console.error('[QA Recorder] CDP attach failed:', e.message);
@@ -331,6 +433,7 @@ async function attachCDP(tabId) {
 
 async function detachCDP(tabId) {
     try {
+        await chrome.debugger.sendCommand({ tabId }, 'Audits.disable', {}).catch(() => {});
         await chrome.debugger.sendCommand({ tabId }, 'Network.disable', {});
         await chrome.debugger.sendCommand({ tabId }, 'Runtime.disable', {});
         await chrome.debugger.sendCommand({ tabId }, 'Log.disable', {});
