@@ -94,6 +94,12 @@ class ReplayEngine {
         
         const startTime = Date.now();
         await this._executeStep(steps[i], this.page, i + 1);
+        
+        // Provide a breather between steps so UI can settle
+        try {
+          await this.page.waitForTimeout(1000);
+        } catch (e) {}
+
         stepReport.duration_ms = Date.now() - startTime;
       }
     } catch (err) {
@@ -164,7 +170,9 @@ class ReplayEngine {
         let locator;
         if (data.selector && text) {
           locator = page.locator(data.selector, { hasText: text });
-          if ((await locator.count()) === 0) {
+          try {
+            await locator.first().waitFor({ state: 'attached', timeout: 3000 });
+          } catch (e) {
             locator = page.locator(data.selector);
           }
         } else if (data.selector) {
@@ -175,6 +183,7 @@ class ReplayEngine {
 
         if (locator) {
           try {
+            await locator.first().waitFor({ state: 'visible', timeout: 5000 });
             await locator.first().click({ timeout: 5000 });
           } catch (e) {
             await locator.first().click({ timeout: 2000, force: true });
@@ -183,7 +192,9 @@ class ReplayEngine {
       } else if (step.type === 'action.input') {
         if (data.selector && data.text !== undefined) {
           try {
-            await page.locator(data.selector).first().fill(data.text, { timeout: 5000 });
+            const locator = page.locator(data.selector).first();
+            await locator.waitFor({ state: 'visible', timeout: 5000 });
+            await locator.fill(data.text, { timeout: 5000 });
           } catch (e) {
             await page.locator(data.selector).first().fill(data.text, { timeout: 2000, force: true });
           }

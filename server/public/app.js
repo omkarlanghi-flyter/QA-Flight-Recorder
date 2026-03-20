@@ -342,13 +342,14 @@ async function runSanityFlow(e, sessionId, flowName, moduleName) {
     const { report } = data;
     
     // Check if the engine completely crashed or failed to connect
-    const engineCrash = report.errors.find(e => e.type === 'engine_crash');
+    const engineCrash = report.failures.ui.find(e => e.type === 'engine_crash');
     if (engineCrash) throw new Error(engineCrash.message);
-    const wasAborted = report.errors.find(e => e.type === 'engine_aborted');
+    const wasAborted = report.failures.ui.find(e => e.type === 'engine_aborted');
     if (wasAborted) {
       alert('Replay was stopped manually.');
     } else {
-      alert(`Replay Finished!\nPassed: ${report.passed}\nFailed: ${report.failed}\nErrors: ${report.errors.length}\nNet Fails: ${report.networkFailures.length}`);
+      const errCount = report.failures.ui.length + report.failures.js_errors.length;
+      alert(`Replay Finished!\nPassed: ${report.summary.passed}\nFailed: ${report.summary.failed}\nErrors: ${errCount}\nNet Fails: ${report.failures.network.length}`);
     }
   } catch (err) {
     alert(`Replay Error: ${err.message}`);
