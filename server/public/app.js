@@ -269,6 +269,136 @@ function renderSessionList(sessions) {
   }).join('');
 }
 
+// ── Sanity Runs List ──────────────────────────────────────────────────────────
+function switchSidebar(tab) {
+  document.getElementById('sidebar-sessions').style.display = tab === 'sessions' ? 'flex' : 'none';
+  document.getElementById('sidebar-sanity').style.display = tab === 'sanity' ? 'flex' : 'none';
+  document.getElementById('nav-btn-sessions').style.borderBottomColor = tab === 'sessions' ? 'var(--accent)' : 'transparent';
+  document.getElementById('nav-btn-sessions').style.color = tab === 'sessions' ? 'var(--accent)' : 'var(--text-muted)';
+  document.getElementById('nav-btn-sanity').style.borderBottomColor = tab === 'sanity' ? 'var(--accent)' : 'transparent';
+  document.getElementById('nav-btn-sanity').style.color = tab === 'sanity' ? 'var(--accent)' : 'var(--text-muted)';
+  
+  if (tab === 'sanity') {
+    loadSanityFlows();
+  } else {
+    loadSessions();
+  }
+}
+
+let allSanityCache = [];
+
+async function loadSanityFlows() {
+  const listEl = document.getElementById('sanity-list');
+  listEl.innerHTML = '<div class="loading-row"><span class="spinner"></span> Loading…</div>';
+  try {
+    const res = await fetch(`${API}/sanity-flows`);
+    const { flows } = await res.json();
+    allSanityCache = flows;
+    document.getElementById('sanity-count').textContent = flows.length;
+    renderSanityList(flows);
+  } catch {
+    listEl.innerHTML = `<div class="loading-row" style="color:var(--danger)">⚠ Cannot connect to server</div>`;
+  }
+}
+
+function filterSanity() {
+  const q = (document.getElementById('sanity-search').value || '').toLowerCase();
+  if (!q) return renderSanityList(allSanityCache);
+  const filtered = allSanityCache.filter(f => 
+    (f.flow_name || '').toLowerCase().includes(q) ||
+    (f.module_name || '').toLowerCase().includes(q)
+  );
+  renderSanityList(filtered);
+}
+
+async function runSanityFlow(e, sessionId, flowName, moduleName) {
+  e.stopPropagation();
+  const btn = e.currentTarget;
+  
+  if (btn.dataset.running === 'true') {
+    // Stop it
+    btn.disabled = true;
+    btn.textContent = 'Stopping...';
+    try {
+      await fetch(`${API}/sessions/${sessionId}/replay/stop`, { method: 'POST' });
+    } catch (e) {}
+    return;
+  }
+  
+  btn.dataset.running = 'true';
+  btn.textContent = '⏹ Stop';
+  btn.style.backgroundColor = '#ef4444';
+  btn.style.borderColor = '#ef4444';
+  
+  try {
+    const pdir = document.getElementById('sanity-profile-dir')?.value || '';
+    const res = await fetch(`${API}/sessions/${sessionId}/replay`, { 
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ profileDir: pdir })
+    });
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+    const { report } = data;
+    
+    // Check if the engine completely crashed or failed to connect
+    const engineCrash = report.errors.find(e => e.type === 'engine_crash');
+    if (engineCrash) throw new Error(engineCrash.message);
+    const wasAborted = report.errors.find(e => e.type === 'engine_aborted');
+    if (wasAborted) {
+      alert('Replay was stopped manually.');
+    } else {
+      alert(`Replay Finished!\nPassed: ${report.passed}\nFailed: ${report.failed}\nErrors: ${report.errors.length}\nNet Fails: ${report.networkFailures.length}`);
+    }
+  } catch (err) {
+    alert(`Replay Error: ${err.message}`);
+  } finally {
+    btn.dataset.running = 'false';
+    btn.disabled = false;
+    btn.textContent = '▶ Run';
+    btn.style.backgroundColor = '';
+    btn.style.borderColor = '';
+  }
+}
+
+function renderSanityList(flows) {
+  const listEl = document.getElementById('sanity-list');
+  if (!flows.length) {
+    listEl.innerHTML = '<div class="empty-list">No sanity runs found</div>';
+    return;
+  }
+  listEl.innerHTML = flows.map(f => {
+    const health = sessionHealthColor(f);
+    const isClean = (f.error_count || 0) === 0 && (f.network_failure_count || 0) === 0;
+    const moduleBadge = f.module_name ? `<span class="badge" style="background:var(--surface3);color:var(--text-muted);">${esc(f.module_name)}</span>` : '';
+    
+    return `
+    <div class="session-item ${f.id === currentSessionId ? 'active' : ''}"
+         onclick="selectSession('${esc(f.id)}')" data-id="${esc(f.id)}">
+      <div class="session-item-top">
+        <div style="flex:1; min-width:0; display:flex; flex-direction:column; gap:4px;">
+           <div class="session-title" title="${esc(f.flow_name)}">${esc(f.flow_name)}</div>
+           <div>${moduleBadge}</div>
+        </div>
+        <button class="btn btn-primary" style="padding: 4px 8px; font-size: 10px;" onclick="runSanityFlow(event, '${esc(f.id)}', '${esc(f.flow_name)}', '${esc(f.module_name || '')}')">▶ Run</button>
+      </div>
+      <div class="session-meta">
+        <span>${formatDate(f.created_at)}</span>
+        <span>${formatDuration(f.duration_ms)}</span>
+      </div>
+      <div class="session-badges">
+        ${f.last_run_status === 'recording' ? '<span class="badge badge-recording">● Live</span>' : ''}
+        ${(f.error_count || 0) > 0 ? `<span class="badge badge-error">⚠ ${f.error_count} err</span>` : ''}
+        ${(f.network_failure_count || 0) > 0 ? `<span class="badge badge-warn">${f.network_failure_count} net fail</span>` : ''}
+        ${isClean && f.last_run_status !== 'recording' ? '<span class="badge badge-success">✓ Clean</span>' : ''}
+      </div>
+      <div class="health-bar-wrap">
+        <div class="health-bar" style="background:${health};width:${isClean ? 100 : Math.max(10, 100 - (f.error_count || 0) * 15 - (f.network_failure_count || 0) * 10)}%"></div>
+      </div>
+    </div>`;
+  }).join('');
+}
+
 // ── Delete Session ────────────────────────────────────────────────────────────
 async function deleteSession(e, id) {
   e.stopPropagation();
@@ -308,14 +438,37 @@ async function selectSession(id) {
   document.getElementById('detail-title').textContent = session.title || session.url || id;
   document.getElementById('detail-url').textContent = session.url || '';
 
-  const statusBadge = session.status === 'recording'
-    ? `<span class="badge badge-recording">● Live</span>`
-    : `<span class="badge badge-success">✓ Done</span>`;
+  const ec2 = session.error_count || 0;
+  const nc2 = session.network_failure_count || 0;
+  const sc2 = session.slow_request_count || 0;
+  const isLive = session.status === 'recording';
+
   document.getElementById('detail-meta').innerHTML = `
-    <span>🕐 ${formatDate(session.started_at)}</span>
-    <span>⏱ ${formatDuration(session.duration_ms)}</span>
-    <span>📝 ${session.event_count || 0} events</span>
-    ${statusBadge}
+    <span class="meta-chip" data-tip="Session started at ${formatDate(session.started_at)}">
+      <span class="chip-icon">🕐</span>${formatDate(session.started_at)}
+    </span>
+    <span class="meta-chip" data-tip="Total recording duration">
+      <span class="chip-icon">⏱</span>${formatDuration(session.duration_ms)}
+    </span>
+    <span class="meta-chip" data-tip="Total events captured during this session (clicks, network, console, etc.)">
+      <span class="chip-icon">📝</span>${session.event_count || 0} events
+    </span>
+    ${ec2 > 0
+      ? `<span class="meta-chip chip-danger" data-tip="${ec2} JavaScript error${ec2 !== 1 ? 's' : ''} or uncaught exception${ec2 !== 1 ? 's' : ''} were recorded. Check the Triage tab."><span class="chip-icon">⚠️</span>${ec2} JS error${ec2 !== 1 ? 's' : ''}</span>`
+      : `<span class="meta-chip chip-success" data-tip="No JavaScript errors detected in this session"><span class="chip-icon">✅</span>No JS errors</span>`
+    }
+    ${nc2 > 0
+      ? `<span class="meta-chip chip-warn" data-tip="${nc2} API/network request${nc2 !== 1 ? 's' : ''} failed (CORS, timeout, or server error). Check the Triage tab."><span class="chip-icon">🌐</span>${nc2} net failure${nc2 !== 1 ? 's' : ''}</span>`
+      : ''
+    }
+    ${sc2 > 0
+      ? `<span class="meta-chip chip-warn" data-tip="${sc2} request${sc2 !== 1 ? 's' : ''} took longer than 2 seconds — potential performance issue."><span class="chip-icon">🐢</span>${sc2} slow req${sc2 !== 1 ? 's' : ''}</span>`
+      : ''
+    }
+    ${isLive
+      ? `<span class="meta-chip chip-live" data-tip="This session is actively being recorded"><span class="chip-icon">●</span>Live</span>`
+      : `<span class="meta-chip chip-success" data-tip="Recording has finished"><span class="chip-icon">✓</span>Done</span>`
+    }
   `;
   document.getElementById('download-btn').href = `${API}/sessions/${id}/download`;
 
@@ -353,43 +506,109 @@ function renderOverview(session, summary) {
   const totalIssues = ec + nc + sc;
   const overallOk = ec === 0 && nc === 0;
 
-  // Stats grid
-  document.getElementById('overview-stats').innerHTML = `
-    <div class="stat-card accent">
-      <div class="stat-label">Duration</div>
-      <div class="stat-value accent">${formatDuration(session.duration_ms)}</div>
-      <div class="stat-sub">Session length</div>
-    </div>
-    <div class="stat-card ${ec > 0 ? 'danger' : 'success'}">
-      <div class="stat-label">JS Errors</div>
-      <div class="stat-value ${ec > 0 ? 'danger' : 'success'}">${ec}</div>
-      <div class="stat-sub">${ec > 0 ? 'Needs attention' : 'No errors'}</div>
-    </div>
-    <div class="stat-card ${nc > 0 ? 'warn' : 'success'}">
-      <div class="stat-label">Net Failures</div>
-      <div class="stat-value ${nc > 0 ? 'warn' : 'success'}">${nc}</div>
-      <div class="stat-sub">${nc > 0 ? 'Failed requests' : 'All OK'}</div>
-    </div>
-    <div class="stat-card ${sc > 0 ? 'warn' : 'success'}">
-      <div class="stat-label">Slow Reqs (>2s)</div>
-      <div class="stat-value ${sc > 0 ? 'warn' : 'success'}">${sc}</div>
-      <div class="stat-sub">${sc > 0 ? 'Performance issues' : 'Fast'}</div>
-    </div>
-    <div class="stat-card">
-      <div class="stat-label">Events</div>
-      <div class="stat-value">${session.event_count || 0}</div>
-      <div class="stat-sub">Captured</div>
-    </div>
-  `;
+  // ── Stats grid: icons · trend chips · tooltips · priority banners ──────────
+  // priorityBanner: { level: 'critical'|'moderate', text: string } | null
+  function statCard({ variant, icon, label, value, valueCls, trend, trendCls, sub, tip, priorityBanner, ariaLabel }) {
+    const banner = priorityBanner
+      ? `<div class="stat-priority-banner ${priorityBanner.level}" role="status" aria-label="${priorityBanner.text}">
+           <span aria-hidden="true">${priorityBanner.level === 'critical' ? '⛔' : '⚠'}</span>
+           ${priorityBanner.text}
+         </div>`
+      : '';
+    return `
+      <div class="stat-card ${variant}" data-tip="${tip}" role="region" aria-label="${ariaLabel || label + ': ' + value}">
+        <div class="stat-icon-bg" aria-hidden="true">${icon}</div>
+        <div class="stat-header">
+          <span class="stat-icon" aria-hidden="true">${icon}</span>
+          <span class="stat-label">${label}</span>
+          ${trend ? `<span class="stat-trend ${trendCls}" aria-label="${trend}">${trend}</span>` : ''}
+        </div>
+        <div class="stat-value ${valueCls}" aria-live="polite">${value}</div>
+        <div class="stat-sub">${sub}</div>
+        ${banner}
+      </div>`;
+  }
 
-  // Health score (0–100)
+  document.getElementById('overview-stats').innerHTML = [
+    statCard({
+      variant: 'accent', icon: '⏱', label: 'Duration',
+      value: formatDuration(session.duration_ms), valueCls: 'accent',
+      trend: '', trendCls: '',
+      sub: 'Total session length',
+      tip: 'How long the recording ran from start to stop.',
+      ariaLabel: `Session duration: ${formatDuration(session.duration_ms)}`,
+    }),
+    statCard({
+      variant: ec > 0 ? 'danger' : 'success',
+      icon: ec > 0 ? '🚨' : '✅',
+      label: 'JS Errors',
+      value: ec, valueCls: ec > 0 ? 'danger' : 'success',
+      trend: ec > 0 ? '⚠ Action needed' : '✓ Clean',
+      trendCls: ec > 0 ? 'bad' : 'ok',
+      sub: ec > 0 ? `${ec} uncaught exception${ec !== 1 ? 's' : ''}` : 'No exceptions detected',
+      tip: 'console.error events and uncaught runtime exceptions. Each one indicates broken code that ran during the session.',
+      priorityBanner: ec > 0
+        ? { level: 'critical', text: `CRITICAL — ${ec} error${ec !== 1 ? 's' : ''} require attention` }
+        : null,
+      ariaLabel: ec > 0
+        ? `JS Errors: ${ec}, critical — action needed`
+        : 'JS Errors: 0, session is clean',
+    }),
+    statCard({
+      variant: nc > 0 ? 'warn' : 'success',
+      icon: nc > 0 ? '🌐' : '✅',
+      label: 'Net Failures',
+      value: nc, valueCls: nc > 0 ? 'warn' : 'success',
+      trend: nc > 0 ? '⚠ Check Triage' : '✓ All OK',
+      trendCls: nc > 0 ? 'mid' : 'ok',
+      sub: nc > 0 ? `${nc} failed request${nc !== 1 ? 's' : ''}` : 'All requests succeeded',
+      tip: 'Network requests that failed due to CORS, DNS errors, timeouts, or 5xx server errors. Each failure could block a feature.',
+      priorityBanner: nc > 0
+        ? { level: 'moderate', text: `WARNING — ${nc} request${nc !== 1 ? 's' : ''} failed` }
+        : null,
+      ariaLabel: nc > 0
+        ? `Network Failures: ${nc}, warning — check Triage tab`
+        : 'Network Failures: 0, all requests succeeded',
+    }),
+    statCard({
+      variant: sc > 0 ? 'warn' : 'success',
+      icon: sc > 0 ? '🐢' : '⚡',
+      label: 'Slow Reqs (>2s)',
+      value: sc, valueCls: sc > 0 ? 'warn' : 'success',
+      trend: sc > 0 ? 'Perf issue' : '✓ Fast',
+      trendCls: sc > 0 ? 'mid' : 'ok',
+      sub: sc > 0 ? 'Requests over 2 s threshold' : 'All responses fast',
+      tip: 'API calls that took longer than 2 seconds. Slow requests degrade user experience and may indicate backend bottlenecks.',
+      priorityBanner: sc > 0
+        ? { level: 'moderate', text: `SLOW — ${sc} request${sc !== 1 ? 's' : ''} exceeded 2 s` }
+        : null,
+      ariaLabel: sc > 0
+        ? `Slow requests: ${sc}, performance warning`
+        : 'Slow requests: 0, all responses fast',
+    }),
+    statCard({
+      variant: '', icon: '📋', label: 'Total Events',
+      value: session.event_count || 0, valueCls: '',
+      trend: '', trendCls: '',
+      sub: 'Clicks, network, console…',
+      tip: 'Every captured event in this session: user actions, network requests, console logs, and markers.',
+      ariaLabel: `Total events captured: ${session.event_count || 0}`,
+    }),
+  ].join('');
+
+  // ── Health score ring ──
   const score = Math.max(0, 100 - ec * 25 - nc * 15 - sc * 5);
   const scoreColor = score >= 80 ? '#10b981' : score >= 50 ? '#f59e0b' : '#ef4444';
+  const scoreLabel = score >= 80 ? 'Good' : score >= 50 ? 'Fair' : 'Poor';
   const circumference = 2 * Math.PI * 30;
   const offset = circumference - (score / 100) * circumference;
 
+  const healthTip = overallOk
+    ? 'Score 100: No errors or failures — this session is clean.'
+    : `Score ${score}/100 — deducted: ${ec > 0 ? `${ec * 25}pts for JS errors` : ''} ${nc > 0 ? `${nc * 15}pts for net failures` : ''} ${sc > 0 ? `${sc * 5}pts for slow reqs` : ''}.`.replace(/\s+/g,' ').trim();
+
   document.getElementById('health-score-card').innerHTML = `
-    <div class="hs-ring-wrap">
+    <div class="hs-ring-wrap" data-tip="${esc(healthTip)}">
       <svg class="hs-ring" viewBox="0 0 72 72">
         <circle class="hs-ring-bg" cx="36" cy="36" r="30"/>
         <circle class="hs-ring-arc" cx="36" cy="36" r="30"
@@ -400,13 +619,20 @@ function renderOverview(session, summary) {
       <div class="hs-label" style="color:${scoreColor}">${score}</div>
     </div>
     <div class="hs-info">
-      <div class="hs-title">Session Health Score</div>
+      <div class="hs-title">Session Health Score
+        <span style="font-size:11px;font-weight:400;color:var(--text-dim);margin-left:6px;">(${scoreLabel})</span>
+      </div>
       <div class="hs-desc">
         ${overallOk
-      ? '✅ This session is clean — no errors or API failures detected.'
-      : `Found ${totalIssues} issue${totalIssues !== 1 ? 's' : ''}: ${ec > 0 ? `${ec} JS error${ec !== 1 ? 's' : ''}` : ''} ${nc > 0 ? `${nc} network failure${nc !== 1 ? 's' : ''}` : ''} ${sc > 0 ? `${sc} slow request${sc !== 1 ? 's' : ''}` : ''}.`.replace(/\s+/g, ' ').trim()
-    }
+          ? '✅ This session is clean — no errors or API failures detected.'
+          : `Found <strong>${totalIssues} issue${totalIssues !== 1 ? 's' : ''}</strong>: ${[
+              ec > 0 ? `<span style="color:var(--danger)">⚠ ${ec} JS error${ec !== 1 ? 's' : ''}</span>` : '',
+              nc > 0 ? `<span style="color:var(--warn)">🌐 ${nc} net failure${nc !== 1 ? 's' : ''}</span>` : '',
+              sc > 0 ? `<span style="color:var(--warn)">🐢 ${sc} slow request${sc !== 1 ? 's' : ''}</span>` : '',
+            ].filter(Boolean).join(' · ')}.`
+        }
       </div>
+      <div style="margin-top:8px;font-size:11px;color:var(--text-dim);">Hover each card above for details · Check Triage tab for actionable events</div>
     </div>
   `;
 
@@ -462,69 +688,207 @@ function renderOverview(session, summary) {
   if (session.duration_ms > 0) drawTimeline(session, summary);
 }
 
-// ── Mini Timeline ─────────────────────────────────────────────────────────────
+// ── Interactive Timeline ──────────────────────────────────────────────────────
+let _tlState = { zoom: 1, offsetMs: 0, dur: 0, events: [], startMs: 0, buckets: [] };
+
+window.tlZoomIn = () => { if (_tlState.zoom < 16) { _tlState.zoom *= 2; constrainTlOffset(); renderTlCanvas(); } };
+window.tlZoomOut = () => { if (_tlState.zoom > 1) { _tlState.zoom /= 2; constrainTlOffset(); renderTlCanvas(); } };
+window.tlResetZoom = () => { _tlState.zoom = 1; _tlState.offsetMs = 0; renderTlCanvas(); };
+
+function constrainTlOffset() {
+  const visibleDur = _tlState.dur / _tlState.zoom;
+  _tlState.offsetMs = Math.max(0, Math.min(_tlState.dur - visibleDur, _tlState.offsetMs));
+}
+
 async function drawTimeline(session, summary) {
   const wrap = document.getElementById('timeline-wrap');
-  const canvas = document.getElementById('timeline-canvas');
-  const labelsEl = document.getElementById('timeline-labels');
-
-  // Fetch events to build bucketed timeline
   try {
-    const res = await fetch(`${API}/sessions/${session.id}/events?types=network.request,console.error,runtime.exception,console.warn&limit=2000`);
+    const res = await fetch(`${API}/sessions/${session.id}/events?types=network.request,console.error,runtime.exception,console.warn,network.failure&limit=5000`);
     const { events } = await res.json();
-    if (!events.length) { wrap.style.display = 'none'; return; }
+    if (!events || !events.length) { wrap.style.display = 'none'; return; }
 
-    const BUCKETS = 40;
-    const dur = session.duration_ms;
-    const bucketMs = dur / BUCKETS;
-    const counts = new Array(BUCKETS).fill(0);
-    const errorBuckets = new Array(BUCKETS).fill(0);
-
-    for (const ev of events) {
-      const idx = Math.min(BUCKETS - 1, Math.floor((ev.ts_epoch_ms - session.started_at) / bucketMs));
-      if (idx >= 0) {
-        counts[idx]++;
-        if (['console.error', 'runtime.exception'].includes(ev.type)) errorBuckets[idx]++;
-      }
-    }
-
-    const maxCount = Math.max(1, ...counts);
-    const W = canvas.offsetWidth || 600;
-    const H = 60;
-    canvas.width = W;
-    canvas.height = H;
-    const dpr = window.devicePixelRatio || 1;
-    canvas.width = W * dpr;
-    canvas.height = H * dpr;
-    canvas.style.width = W + 'px';
-    canvas.style.height = H + 'px';
-
-    const ctx = canvas.getContext('2d');
-    ctx.scale(dpr, dpr);
-    ctx.clearRect(0, 0, W, H);
-
-    const barW = W / BUCKETS - 1;
-    const isDark = document.documentElement.dataset.theme === 'dark';
-    const normalColor = isDark ? '#6366f1' : '#4f46e5';
-    const errorColor = '#ef4444';
-
-    for (let i = 0; i < BUCKETS; i++) {
-      const x = i * (W / BUCKETS);
-      const h = Math.max(2, (counts[i] / maxCount) * (H - 4));
-      ctx.fillStyle = errorBuckets[i] > 0 ? errorColor : normalColor;
-      ctx.globalAlpha = 0.7;
-      ctx.fillRect(x, H - h, barW, h);
-    }
-    ctx.globalAlpha = 1;
-
-    // Labels
-    labelsEl.innerHTML = `<span>+0s</span><span>+${formatDuration(dur / 2)}</span><span>+${formatDuration(dur)}</span>`;
+    _tlState.events = events;
+    _tlState.dur = session.duration_ms;
+    _tlState.startMs = session.started_at;
+    tlResetZoom();
     wrap.style.display = '';
   } catch {
     wrap.style.display = 'none';
   }
 }
 
+function renderTlCanvas() {
+  const canvas = document.getElementById('timeline-canvas');
+  const labelsEl = document.getElementById('timeline-labels');
+  const infoEl = document.getElementById('tl-zoom-info');
+  if(!canvas) return;
+
+  if (infoEl) infoEl.textContent = Math.round(_tlState.zoom * 100) + '%';
+  const dur = _tlState.dur;
+  const visibleDur = dur / _tlState.zoom;
+  const startVis = _tlState.offsetMs;
+  const endVis = startVis + visibleDur;
+
+  const W = canvas.offsetWidth || 600;
+  const H = canvas.offsetHeight || 80;
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = W * dpr;
+  canvas.height = H * dpr;
+  const ctx = canvas.getContext('2d');
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, W, H);
+
+  const BUCKETS = 60;
+  const bucketMs = visibleDur / BUCKETS;
+  const counts = new Array(BUCKETS).fill(0);
+  const errCounts = new Array(BUCKETS).fill(0);
+  const bucketEvs = Array.from({length: BUCKETS}, () => []);
+
+  for (const ev of _tlState.events) {
+    const relMs = ev.ts_epoch_ms - _tlState.startMs;
+    if (relMs >= startVis && relMs <= endVis) {
+      const idx = Math.min(BUCKETS - 1, Math.max(0, Math.floor((relMs - startVis) / bucketMs)));
+      counts[idx]++;
+      bucketEvs[idx].push(ev);
+      if (['console.error', 'runtime.exception', 'network.failure'].includes(ev.type)) errCounts[idx]++;
+    }
+  }
+
+  const maxCount = Math.max(1, ...counts);
+  const barW = (W / BUCKETS) - 1.5;
+  const isDark = document.documentElement.dataset.theme === 'dark';
+  const normalColor = isDark ? '#6366f1' : '#4f46e5';
+  const errorColor = '#ef4444';
+
+  _tlState.buckets = [];
+
+  for (let i = 0; i < BUCKETS; i++) {
+    if (counts[i] === 0) continue;
+    const x = i * (W / BUCKETS);
+    const h = Math.max(4, (counts[i] / maxCount) * (H - 4));
+    const y = H - h;
+    
+    ctx.fillStyle = errCounts[i] > 0 ? errorColor : normalColor;
+    ctx.globalAlpha = 0.85;
+    ctx.fillRect(x, y, barW, h);
+
+    _tlState.buckets.push({
+      x, y, w: barW, h,
+      events: bucketEvs[i],
+      errors: errCounts[i],
+      timeStr: fmtShortTime(startVis + i*bucketMs)
+    });
+  }
+
+  labelsEl.innerHTML = `<span>+${fmtShortTime(startVis)}</span><span>+${fmtShortTime(startVis + visibleDur/2)}</span><span>+${fmtShortTime(endVis)}</span>`;
+}
+
+function fmtShortTime(ms) {
+  const s = Math.floor(ms / 1000);
+  const m = Math.floor(s / 60);
+  return m > 0 ? `${m}m ${s%60}s` : `${s}s`;
+}
+
+// ── Timeline Interactions (Pan, Hover, Click) ─────────────────────────────────
+let _tlDragging = false;
+let _tlStartX = 0;
+let _tlStartOffset = 0;
+
+document.addEventListener('mousedown', e => {
+  if (e.target.id === 'timeline-canvas' && _tlState.zoom > 1) {
+    _tlDragging = true;
+    _tlStartX = e.clientX;
+    _tlStartOffset = _tlState.offsetMs;
+    e.target.style.cursor = 'grabbing';
+  }
+});
+
+document.addEventListener('mousemove', e => {
+  const canvas = document.getElementById('timeline-canvas');
+  const tooltip = document.getElementById('tl-tooltip');
+  if (!canvas || !tooltip) return;
+
+  if (_tlDragging) {
+    const dx = e.clientX - _tlStartX;
+    const msPerPx = (_tlState.dur / _tlState.zoom) / canvas.offsetWidth;
+    _tlState.offsetMs = _tlStartOffset - (dx * msPerPx);
+    const visibleDur = _tlState.dur / _tlState.zoom;
+    _tlState.offsetMs = Math.max(0, Math.min(_tlState.dur - visibleDur, _tlState.offsetMs));
+    renderTlCanvas();
+    tooltip.classList.remove('visible');
+    return;
+  }
+
+  if (e.target === canvas) {
+    const rect = canvas.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+    
+    const bucket = _tlState.buckets.find(b => x >= b.x && x <= b.x + b.w);
+    if (bucket && y >= bucket.y) {
+      canvas.style.cursor = 'pointer';
+      tooltip.innerHTML = `
+        <div style="font-weight:700;margin-bottom:4px">${bucket.timeStr}</div>
+        <div>${bucket.events.length} events logged</div>
+        ${bucket.errors > 0 ? `<div style="color:#fca5a5;margin-top:2px;font-weight:600">⚠ ${bucket.errors} critical errors</div>` : ''}
+        <div style="color:#94a3b8;font-size:9px;margin-top:5px;border-top:1px solid #334155;padding-top:4px;">(Click to view in Triage)</div>
+      `;
+      tooltip.style.left = e.clientX + 'px';
+      tooltip.style.top = (e.clientY - 15) + 'px';
+      tooltip.style.transform = 'translate(-50%, -100%)';
+      tooltip.classList.add('visible');
+    } else {
+      canvas.style.cursor = _tlState.zoom > 1 ? 'grab' : 'crosshair';
+      tooltip.classList.remove('visible');
+    }
+  } else {
+    tooltip.classList.remove('visible');
+  }
+});
+
+document.addEventListener('mouseup', () => {
+  if (_tlDragging) {
+    _tlDragging = false;
+    const canvas = document.getElementById('timeline-canvas');
+    if (canvas) canvas.style.cursor = _tlState.zoom > 1 ? 'grab' : 'crosshair';
+  }
+});
+
+document.addEventListener('click', e => {
+  if (e.target.id === 'timeline-canvas' && !_tlDragging) {
+    const rect = e.target.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+    const bucket = _tlState.buckets.find(b => x >= b.x && x <= b.x + b.w);
+    if (bucket && y >= bucket.y && bucket.events.length > 0) {
+      // Find the first error or first event
+      const targetEv = bucket.events.find(ev => ['console.error','runtime.exception','network.failure'].includes(ev.type)) || bucket.events[0];
+      
+      // Jump to Triage tab
+      document.querySelector('[onclick="switchTab(\'triage\')"]')?.click();
+      
+      setTimeout(() => {
+        // Attempt to find the specific element in the triage list
+        const rows = document.querySelectorAll('.triage-event');
+        let matched = false;
+        const searchStr = (targetEv.data?.message || targetEv.data?.text || targetEv.type).toLowerCase();
+        
+        for (const row of rows) {
+          if (row.textContent.toLowerCase().includes(searchStr)) {
+            row.scrollIntoView({behavior: 'smooth', block: 'center'});
+            row.classList.remove('tl-flash');
+            void row.offsetWidth; // trigger reflow
+            row.classList.add('tl-flash');
+            matched = true;
+            break;
+          }
+        }
+      }, 150); // slight delay to allow Triage tab to render
+    }
+  }
+});
+
+//
 // ── Triage ────────────────────────────────────────────────────────────────────
 let triageEventsCache = [];
 
@@ -794,11 +1158,15 @@ let _videoFilter = 'all';    // 'all' | 'input' | 'system'
 
 async function loadVideo() {
   if (!currentSessionId) return;
-  const container = document.getElementById('video-container');
-  const sidebar = document.getElementById('video-sidebar');
+  const container   = document.getElementById('video-container');
+  const sidebar     = document.getElementById('video-sidebar');
+  const scrubberEl  = document.getElementById('video-scrubber-wrap');
+  const controlsEl  = document.getElementById('video-custom-controls');
 
-  container.innerHTML = '<div class="no-video"><span class="spinner"></span> Loading video…</div>';
-  sidebar.innerHTML = '<div class="video-sidebar-title">Activity Feed</div><div class="no-video"><span class="spinner"></span></div>';
+  container.innerHTML  = '<div class="no-video"><span class="spinner"></span> Loading video…</div>';
+  scrubberEl.innerHTML = '';
+  controlsEl.innerHTML = '';
+  sidebar.innerHTML    = '<div class="video-sidebar-title">Activity Feed</div><div class="no-video"><span class="spinner"></span></div>';
   _videoFilter = 'all';
 
   try {
@@ -807,19 +1175,19 @@ async function loadVideo() {
 
     if (!chunks || !chunks.length) {
       container.innerHTML = '<div class="no-video">No video recorded for this session</div>';
-      sidebar.innerHTML = '<div class="video-sidebar-title">Activity Feed</div><div class="no-video">No video</div>';
+      sidebar.innerHTML   = '<div class="video-sidebar-title">Activity Feed</div><div class="no-video">No video</div>';
       return;
     }
 
+    // ── Video element ─────────────────────────────────────────────
     container.innerHTML = `
-      <video controls preload="metadata" id="session-video">
+      <video preload="metadata" id="session-video" style="width:100%;max-height:100%;display:block;outline:none;">
         <source src="${API}/sessions/${currentSessionId}/video" type="video/webm" />
-        Your browser does not support video playback.
       </video>`;
 
     const video = document.getElementById('session-video');
 
-    // Fix infinite duration for WebM
+    // Fix infinite WebM duration
     video.addEventListener('loadedmetadata', () => {
       if (video.duration === Infinity || isNaN(video.duration)) {
         video.currentTime = 1e10;
@@ -828,45 +1196,168 @@ async function loadVideo() {
           video.removeEventListener('timeupdate', hack);
         });
       }
+      rebuildScrubber(video, _videoSideEvents);
     });
 
+    // ── Helper: format seconds → m:ss ─────────────────────────────
+    function fmtSec(s) {
+      if (!isFinite(s) || s < 0) return '0:00';
+      const m = Math.floor(s / 60);
+      const ss = Math.floor(s % 60);
+      return `${m}:${ss.toString().padStart(2, '0')}`;
+    }
+
+    // ── Custom Controls bar ───────────────────────────────────────
+    const speeds = [0.5, 1, 1.5, 2];
+    let currentSpeed = 1;
+
+    function buildControls() {
+      const playerRoot = document.getElementById('video-player-root');
+      controlsEl.className = 'video-custom-controls';
+      controlsEl.innerHTML = `
+        <button class="vctrl-btn" id="vctrl-play" title="Play / Pause (Space)" onclick="window._videoTogglePlay()">▶</button>
+        <span class="vctrl-time" id="vctrl-time">0:00 / 0:00</span>
+        <span class="vctrl-spacer"></span>
+        <div class="vctrl-marker-legend">
+          <span><span class="legend-dot" style="background:#ef4444"></span> Error</span>
+          <span><span class="legend-dot" style="background:#f59e0b"></span> Warn</span>
+          <span><span class="legend-dot" style="background:#6366f1"></span> Action</span>
+          <span><span class="legend-dot" style="background:#10b981"></span> Marker</span>
+        </div>
+        <div class="speed-group" id="vctrl-speed-group">
+          ${speeds.map(s => `<button class="speed-btn ${s === 1 ? 'active' : ''}" onclick="window._videoSetSpeed(${s})">${s}×</button>`).join('')}
+        </div>
+        <button class="vctrl-btn" title="Fullscreen (F)" onclick="window._videoFullscreen()">⛶</button>`;
+    }
+    buildControls();
+
+    // Global helpers for inline onclick
+    window._videoTogglePlay = () => { video.paused ? video.play() : video.pause(); };
+    window._videoFullscreen = () => {
+      const root = document.getElementById('video-player-root');
+      if (document.fullscreenElement) document.exitFullscreen();
+      else root.requestFullscreen?.() || root.webkitRequestFullscreen?.();
+    };
+    window._videoSetSpeed = (s) => {
+      currentSpeed = s;
+      video.playbackRate = s;
+      document.querySelectorAll('.speed-btn').forEach(b => {
+        b.classList.toggle('active', parseFloat(b.textContent) === s);
+      });
+    };
+
     // Keyboard shortcuts
-    document.addEventListener('keydown', (e) => {
+    const kbHandler = (e) => {
       const tag = document.activeElement?.tagName;
       if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
-      if (!video) return;
-      if (e.key === 'ArrowLeft') video.currentTime = Math.max(0, video.currentTime - 5);
-      if (e.key === 'ArrowRight') video.currentTime = Math.min(video.duration, video.currentTime + 5);
-      if (e.key === 'f' || e.key === 'F') video.requestFullscreen?.();
-    }, { once: false });
+      if (e.key === ' ') { e.preventDefault(); window._videoTogglePlay(); }
+      if (e.key === 'ArrowLeft')  video.currentTime = Math.max(0, video.currentTime - 5);
+      if (e.key === 'ArrowRight') video.currentTime = Math.min(video.duration || 0, video.currentTime + 5);
+      if (e.key === 'f' || e.key === 'F') window._videoFullscreen();
+    };
+    // Remove previous handler if re-loading video tab
+    document.removeEventListener('keydown', window._videoKbHandler);
+    window._videoKbHandler = kbHandler;
+    document.addEventListener('keydown', kbHandler);
 
-    // Load side events (all relevant types)
-    const reqTypes = 'action.click,action.scroll,action.navigation,console.warn,console.error,runtime.exception,marker.bug';
-    const evRes = await fetch(`${API}/sessions/${currentSessionId}/events?types=${reqTypes}&limit=5000`);
-    const { events: sideEvents } = await evRes.json();
-    _videoSideEvents = sideEvents;
+    // Play/pause icon sync
+    video.addEventListener('play',  () => { const b = document.getElementById('vctrl-play'); if (b) b.textContent = '⏸'; });
+    video.addEventListener('pause', () => { const b = document.getElementById('vctrl-play'); if (b) b.textContent = '▶'; });
 
-    // Attach timeupdate handler once (uses _videoSideEvents so filter doesn't matter)
+    // ── Scrubber builder ──────────────────────────────────────────
+    // Called once metadata is loaded (so video.duration is known)
+    function rebuildScrubber(vid, events) {
+      const dur = vid.duration;
+      if (!isFinite(dur) || dur <= 0) return;
+
+      // Marker kind classifier
+      function markerKind(type) {
+        if (['console.error', 'runtime.exception'].includes(type)) return 'error';
+        if (type === 'console.warn') return 'warn';
+        if (type.startsWith('action.')) return 'action';
+        if (type.startsWith('marker.')) return 'marker';
+        return null;
+      }
+
+      const markerDots = (events || []).map(ev => {
+        const kind = markerKind(ev.type);
+        if (!kind) return '';
+        const pct = Math.min(100, ((ev.ts_epoch_ms - sessionStartMs) / (dur * 1000)) * 100);
+        const brief = String(summarizeEvent(ev) || ev.type).replace(/<[^>]+>/g, '').slice(0, 50);
+        const ts = fmtSec((ev.ts_epoch_ms - sessionStartMs) / 1000);
+        return `<div class="scrubber-marker" data-kind="${kind}"
+                     data-tip="${esc(ts + ' — ' + brief)}"
+                     style="left:${pct}%"
+                     onclick="seekVideo(${ev.ts_epoch_ms})"></div>`;
+      }).join('');
+
+      scrubberEl.className = 'video-scrubber-wrap';
+      scrubberEl.innerHTML = `
+        <div class="video-scrubber-track" id="vscrub-track">
+          <div class="video-scrubber-fill" id="vscrub-fill"></div>
+          <div class="video-scrubber-thumb" id="vscrub-thumb"></div>
+          ${markerDots}
+        </div>`;
+
+      // Click-to-seek on the scrubber track
+      scrubberEl.addEventListener('click', (e) => {
+        const rect = scrubberEl.getBoundingClientRect();
+        const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+        vid.currentTime = pct * dur;
+      });
+    }
+
+    // ── timeupdate: scrubber fill + sidebar highlight ─────────────
     video.addEventListener('timeupdate', () => {
-      const absoluteMs = sessionStartMs + video.currentTime * 1000;
+      const dur = video.duration;
+      const cur = video.currentTime;
+
+      // Update time label
+      const timeEl = document.getElementById('vctrl-time');
+      if (timeEl) timeEl.textContent = `${fmtSec(cur)} / ${fmtSec(dur)}`;
+
+      // Update scrubber fill + thumb
+      if (isFinite(dur) && dur > 0) {
+        const pct = (cur / dur) * 100;
+        const fill  = document.getElementById('vscrub-fill');
+        const thumb = document.getElementById('vscrub-thumb');
+        if (fill)  fill.style.width = pct + '%';
+        if (thumb) thumb.style.left = pct + '%';
+      }
+
+      // Sidebar: highlight nearest event
+      const absoluteMs = sessionStartMs + cur * 1000;
       let activeRef = -1;
       for (let i = 0; i < _videoSideEvents.length; i++) {
         if (_videoSideEvents[i].ts_epoch_ms <= absoluteMs) activeRef = i; else break;
       }
       document.querySelectorAll('.video-event').forEach(el => el.classList.remove('active'));
       if (activeRef !== -1) {
-        // find the rendered element for this event (may be filtered out)
         const el = document.getElementById(`vev-${activeRef}`);
         if (el) { el.classList.add('active'); el.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }
       }
     });
 
+    // ── Load side events ──────────────────────────────────────────
+    const reqTypes = 'action.click,action.scroll,action.navigation,console.warn,console.error,runtime.exception,marker.bug';
+    const evRes = await fetch(`${API}/sessions/${currentSessionId}/events?types=${reqTypes}&limit=5000`);
+    const { events: sideEvents } = await evRes.json();
+    _videoSideEvents = sideEvents;
+
+    // If metadata already loaded, build the scrubber now
+    if (isFinite(video.duration) && video.duration > 0) {
+      rebuildScrubber(video, sideEvents);
+    }
+    // else: loadedmetadata event above will call rebuildScrubber
+
     renderVideoFeed('all');
-  } catch {
+
+  } catch (err) {
     container.innerHTML = '<div class="no-video">Error loading video</div>';
-    sidebar.innerHTML = '<div class="video-sidebar-title">Activity Feed</div>';
+    sidebar.innerHTML   = '<div class="video-sidebar-title">Activity Feed</div>';
   }
 }
+
 
 const INPUT_TYPES = new Set(['action.click', 'action.scroll', 'action.navigation']);
 const SYSTEM_TYPES = new Set(['console.warn', 'console.error', 'runtime.exception', 'marker.bug']);

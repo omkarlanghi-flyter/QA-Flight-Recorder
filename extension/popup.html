@@ -429,9 +429,22 @@
         <button class="btn btn-start" id="btn-start">
             ● Start Recording
         </button>
+        <button class="btn btn-start" id="btn-sanity-start" style="margin-top: 8px; background: linear-gradient(135deg, #10b981, #059669); box-shadow: 0 4px 12px rgba(16, 185, 129, 0.3);">
+            🩺 Start Sanity Recording
+        </button>
         <button class="btn btn-stop" id="btn-stop" style="display:none">
             ■ Stop Recording
         </button>
+
+        <!-- Sanity Inputs -->
+        <div class="sanity-input-row" id="sanity-row" style="display: none; flex-direction: column; gap: 6px; margin-top: 8px;">
+            <input type="text" class="marker-input" id="sanity-flow-name" placeholder="Flow Name (required)..." />
+            <input type="text" class="marker-input" id="sanity-module-name" placeholder="Module Name (optional)..." />
+            <div style="display: flex; gap: 6px;">
+                <button class="marker-submit" id="btn-confirm-sanity" style="flex: 1; background: var(--success); color: #000;">Start</button>
+                <button class="marker-submit" id="btn-cancel-sanity" style="flex: 1; background: var(--surface2); color: var(--text);">Cancel</button>
+            </div>
+        </div>
 
         <!-- Bug Marker -->
         <button class="btn btn-marker" id="btn-marker" disabled>

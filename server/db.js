@@ -52,7 +52,10 @@ async function initDb() {
       error_count INTEGER DEFAULT 0,
       network_failure_count INTEGER DEFAULT 0,
       slow_request_count INTEGER DEFAULT 0,
-      tags TEXT DEFAULT '[]'
+      tags TEXT DEFAULT '[]',
+      recording_type TEXT,
+      flow_name TEXT,
+      module_name TEXT
     );
 
     CREATE TABLE IF NOT EXISTS events_index (
@@ -69,6 +72,11 @@ async function initDb() {
     CREATE INDEX IF NOT EXISTS idx_events_type ON events_index(session_id, type);
     CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at);
   `);
+
+  // Migrate existing DB if necessary
+  try { db.run("ALTER TABLE sessions ADD COLUMN recording_type TEXT"); } catch (e) {}
+  try { db.run("ALTER TABLE sessions ADD COLUMN flow_name TEXT"); } catch (e) {}
+  try { db.run("ALTER TABLE sessions ADD COLUMN module_name TEXT"); } catch (e) {}
 
   persistDb();
   console.log('[DB] SQLite initialized at', DB_PATH);
@@ -113,9 +121,18 @@ module.exports = {
 
   createSession(session) {
     db.run(
-      `INSERT INTO sessions (id, started_at, tab_id, url, title, status)
-       VALUES (?, ?, ?, ?, ?, 'recording')`,
-      [session.id, session.started_at, session.tab_id || null, session.url || null, session.title || null]
+      `INSERT INTO sessions (id, started_at, tab_id, url, title, status, recording_type, flow_name, module_name)
+       VALUES (?, ?, ?, ?, ?, 'recording', ?, ?, ?)`,
+      [
+          session.id, 
+          session.started_at, 
+          session.tab_id || null, 
+          session.url || null, 
+          session.title || null,
+          session.recording_type || null,
+          session.flow_name || null,
+          session.module_name || null
+      ]
     );
     persistDb();
   },
@@ -151,6 +168,18 @@ module.exports = {
       'SELECT * FROM sessions ORDER BY started_at DESC LIMIT ? OFFSET ?',
       [limit, offset]
     );
+  },
+
+  listSanityFlows() {
+    return queryAll(`
+      SELECT 
+        id, flow_name, module_name, MAX(started_at) as created_at, status as last_run_status,
+        duration_ms, error_count, network_failure_count, slow_request_count
+      FROM sessions
+      WHERE recording_type = 'sanity'
+      GROUP BY flow_name, module_name
+      ORDER BY created_at DESC
+    `);
   },
 
   getSession(id) {

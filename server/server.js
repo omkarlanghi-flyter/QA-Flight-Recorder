@@ -7,7 +7,10 @@ const { v4: uuidv4 } = require('uuid');
 const archiver = require('archiver');
 const multer = require('multer');
 
+const { ReplayEngine } = require('./engine/replay');
 const db = require('./db');
+
+const activeReplays = new Map();
 const { generateTriageView } = require('./filter');
 
 const PORT = process.env.PORT || 17890;
@@ -54,19 +57,38 @@ function appendEvents(sessionId, events) {
 app.post('/session/start', (req, res) => {
     const sessionId = uuidv4();
     const now = Date.now();
-    const { tab_id, url, title } = req.body || {};
+    const { tab_id, url, title, recording_type, flow_name, module_name } = req.body || {};
 
     const sessionDir = getSessionDir(sessionId);
     fs.mkdirSync(path.join(sessionDir, 'raw'), { recursive: true });
     fs.mkdirSync(path.join(sessionDir, 'views'), { recursive: true });
     fs.mkdirSync(path.join(sessionDir, 'video'), { recursive: true });
 
-    const meta = { id: sessionId, started_at: now, tab_id, url, title, status: 'recording' };
+    const meta = { 
+        id: sessionId, 
+        started_at: now, 
+        tab_id, 
+        url, 
+        title, 
+        status: 'recording',
+        recording_type,
+        flow_name,
+        module_name 
+    };
     fs.writeFileSync(path.join(sessionDir, 'meta.json'), JSON.stringify(meta, null, 2));
 
-    db.createSession({ id: sessionId, started_at: now, tab_id: tab_id || null, url: url || null, title: title || null });
+    db.createSession({ 
+        id: sessionId, 
+        started_at: now, 
+        tab_id: tab_id || null, 
+        url: url || null, 
+        title: title || null,
+        recording_type,
+        flow_name,
+        module_name
+    });
 
-    console.log(`[START] Session ${sessionId} for tab ${tab_id} url=${url}`);
+    console.log(`[START] Session ${sessionId} for tab ${tab_id} url=${url} type=${recording_type || 'default'}`);
     res.json({ session_id: sessionId, started_at: now });
 });
 
@@ -178,6 +200,68 @@ app.post('/session/:id/stop', async (req, res) => {
     }
 
     res.json({ ok: true, session_id: id, duration_ms: stoppedAt - session.started_at });
+});
+
+/**
+ * GET /sanity-flows
+ * Returns aggregated sanity flows (latest per flow_name)
+ */
+app.get('/sanity-flows', (req, res) => {
+    try {
+        const flows = db.listSanityFlows();
+        res.json({ flows });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+/**
+ * POST /sessions/:id/replay
+ * Replays a session using Playwright and CDP connection
+ */
+app.post('/sessions/:id/replay', async (req, res) => {
+    const eventsFile = getEventsFile(req.params.id);
+    if (!fs.existsSync(eventsFile)) return res.status(404).json({ error: 'Events not found' });
+
+    const content = fs.readFileSync(eventsFile, 'utf8').trim();
+    const events = content ? content.split('\n').map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean) : [];
+
+    const session = db.getSession(req.params.id);
+
+    try {
+        const options = { startUrl: session?.url };
+        if (req.body && req.body.profileDir) {
+            // Expand tilde if present
+            let pdir = req.body.profileDir.trim();
+            if (pdir.startsWith('~')) {
+                pdir = require('path').join(require('os').homedir(), pdir.slice(1));
+            }
+            options.profileDir = pdir;
+        }
+
+        const engine = new ReplayEngine(events, options);
+        activeReplays.set(req.params.id, engine);
+        const report = await engine.run();
+        activeReplays.delete(req.params.id);
+        res.json({ report });
+    } catch (err) {
+        activeReplays.delete(req.params.id);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+/**
+ * POST /sessions/:id/replay/stop
+ * Stops an active replay
+ */
+app.post('/sessions/:id/replay/stop', async (req, res) => {
+    const engine = activeReplays.get(req.params.id);
+    if (engine) {
+        await engine.abort();
+        res.json({ ok: true });
+    } else {
+        res.status(404).json({ error: 'No active replay for this session' });
+    }
 });
 
 /**

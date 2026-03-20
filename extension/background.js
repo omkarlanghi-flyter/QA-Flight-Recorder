@@ -405,7 +405,7 @@ async function stopVideoCapture() {
 }
 
 // ── Start Recording ───────────────────────────────────────────────────────────
-async function startRecording(tabId) {
+async function startRecording(tabId, options = {}) {
     if (state.recording) return { error: 'Already recording' };
 
     const settings = await loadSettings();
@@ -423,7 +423,14 @@ async function startRecording(tabId) {
     const res = await fetch(`${settings.collectorUrl}/session/start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ tab_id: tabId, url: tab.url, title: tab.title }),
+        body: JSON.stringify({ 
+            tab_id: tabId, 
+            url: tab.url, 
+            title: tab.title,
+            recording_type: options.recordingType,
+            flow_name: options.flowName,
+            module_name: options.moduleName
+        }),
     });
     const { session_id, started_at } = await res.json();
     state.sessionId = session_id;
@@ -530,7 +537,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                 break;
 
             case 'START_RECORDING':
-                sendResponse(await startRecording(msg.tabId));
+                sendResponse(await startRecording(msg.tabId, {
+                    recordingType: msg.recordingType,
+                    flowName: msg.flowName,
+                    moduleName: msg.moduleName
+                }));
                 break;
 
             case 'STOP_RECORDING':
