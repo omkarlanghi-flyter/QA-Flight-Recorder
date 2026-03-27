@@ -77,6 +77,13 @@ async function initDb() {
   try { db.run("ALTER TABLE sessions ADD COLUMN recording_type TEXT"); } catch (e) {}
   try { db.run("ALTER TABLE sessions ADD COLUMN flow_name TEXT"); } catch (e) {}
   try { db.run("ALTER TABLE sessions ADD COLUMN module_name TEXT"); } catch (e) {}
+  // Schema v2 normalization fields
+  try { db.run("ALTER TABLE sessions ADD COLUMN normalized_at INTEGER"); } catch (e) {}
+  try { db.run("ALTER TABLE sessions ADD COLUMN normalized_step_count INTEGER DEFAULT 0"); } catch (e) {}
+  // Schema v2 event index fields
+  try { db.run("ALTER TABLE events_index ADD COLUMN event_id TEXT"); } catch (e) {}
+  try { db.run("ALTER TABLE events_index ADD COLUMN schema_version TEXT"); } catch (e) {}
+  try { db.run("ALTER TABLE events_index ADD COLUMN correlation_id TEXT"); } catch (e) {}
 
   persistDb();
   console.log('[DB] SQLite initialized at', DB_PATH);
@@ -173,32 +180,59 @@ module.exports = {
   listSanityFlows() {
     return queryAll(`
       SELECT 
-        id, flow_name, module_name, MAX(started_at) as created_at, status as last_run_status,
+        id, flow_name, module_name, started_at as created_at, status as last_run_status,
         duration_ms, error_count, network_failure_count, slow_request_count
-      FROM sessions
-      WHERE recording_type = 'sanity'
-      GROUP BY flow_name, module_name
+      FROM (
+        SELECT *, ROW_NUMBER() OVER(PARTITION BY flow_name, module_name ORDER BY started_at DESC) as rn
+        FROM sessions
+        WHERE recording_type = 'sanity'
+      )
+      WHERE rn = 1
       ORDER BY created_at DESC
     `);
+  },
+
+  /**
+   * Update session after normalization completes.
+   */
+  updateSessionNormalized(sessionId, stepCount) {
+    db.run(
+      `UPDATE sessions SET normalized_at = ?, normalized_step_count = ? WHERE id = ?`,
+      [Date.now(), stepCount || 0, sessionId]
+    );
+    persistDb();
   },
 
   getSession(id) {
     return queryOne('SELECT * FROM sessions WHERE id = ?', [id]);
   },
 
+  getSessionsByFlow(flowName, moduleName) {
+    if (moduleName) {
+      return queryAll('SELECT * FROM sessions WHERE flow_name = ? AND module_name = ? ORDER BY started_at DESC', [flowName, moduleName]);
+    } else {
+      return queryAll('SELECT * FROM sessions WHERE flow_name = ? AND module_name IS NULL ORDER BY started_at DESC', [flowName]);
+    }
+  },
+
   indexEventsBatch(events) {
     for (const event of events) {
-      if (!HIGH_SIGNAL_TYPES.has(event.type)) continue;
+      // Support both legacy 'type' and new canonical 'event_type'
+      const eventType = event.event_type || event.type;
+      if (!HIGH_SIGNAL_TYPES.has(eventType)) continue;
       db.run(
-        `INSERT INTO events_index (session_id, ts_epoch_ms, type, source, url, summary)
-         VALUES (?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO events_index (session_id, ts_epoch_ms, type, source, url, summary, event_id, schema_version, correlation_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           event.session_id,
-          event.ts_epoch_ms,
-          event.type,
+          event.ts_epoch_ms ?? event.timestamp,
+          eventType,
           event.source || null,
           event.url || null,
           JSON.stringify(event.data || {}).slice(0, 200),
+          event.event_id || null,
+          event.schema_version || null,
+          event.correlation_id || null,
         ]
       );
     }
@@ -215,6 +249,14 @@ module.exports = {
   deleteSession(sessionId) {
     db.run('DELETE FROM sessions WHERE id = ?', [sessionId]);
     db.run('DELETE FROM events_index WHERE session_id = ?', [sessionId]);
+    persistDb();
+  },
+
+  deleteSessions(sessionIds) {
+    if (!sessionIds || sessionIds.length === 0) return;
+    const placeholders = sessionIds.map(() => '?').join(',');
+    db.run(`DELETE FROM sessions WHERE id IN (${placeholders})`, sessionIds);
+    db.run(`DELETE FROM events_index WHERE session_id IN (${placeholders})`, sessionIds);
     persistDb();
   },
 };

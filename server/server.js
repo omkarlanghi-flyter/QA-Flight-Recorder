@@ -9,9 +9,26 @@ const multer = require('multer');
 
 const { ReplayEngine } = require('./engine/replay');
 const db = require('./db');
+const { createIngestionContext, destroyIngestionContext } = require('./ingestion/ingestion');
+const { normalize } = require('./normalization/normalizer');
 
 const activeReplays = new Map();
-const { generateTriageView } = require('./filter');
+const { generateTriageView, errorSignature } = require('./filter');
+
+// ── Ignored Error Signatures ──────────────────────────────────────────────────
+const IGNORED_FILE = path.join(os.homedir(), '.qa-flight-recorder', 'ignored_errors.json');
+
+function loadIgnored() {
+    try {
+        return JSON.parse(fs.readFileSync(IGNORED_FILE, 'utf8'));
+    } catch {
+        return [];
+    }
+}
+
+function saveIgnored(list) {
+    fs.writeFileSync(IGNORED_FILE, JSON.stringify(list, null, 2));
+}
 
 const PORT = process.env.PORT || 17890;
 const app = express();
@@ -164,7 +181,14 @@ app.post('/session/:id/stop', async (req, res) => {
         if (content) {
             const events = content.split('\n').map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
             eventCount = events.length;
+            
+            // Get ignored signatures
+            const ignoredSet = new Set(loadIgnored().map(i => i.signature));
+            
             for (const e of events) {
+                const sig = errorSignature(e);
+                if (ignoredSet.has(sig)) continue; // Skip ignored errors from counts
+
                 if (['console.error', 'runtime.exception'].includes(e.type)) errorCount++;
                 if (e.type === 'network.failure') networkFailureCount++;
                 // Use timing for slow requests
@@ -193,7 +217,8 @@ app.post('/session/:id/stop', async (req, res) => {
 
     // Generate triage views asynchronously
     try {
-        const result = generateTriageView(sessionDir);
+        const ignoredSigs = loadIgnored().map(i => i.signature);
+        const result = generateTriageView(sessionDir, ignoredSigs);
         console.log(`[STOP] Session ${id} done. Triage: ${result.triageEventCount} events, ${result.errorClusters} clusters`);
     } catch (err) {
         console.error(`[STOP] Triage generation failed for ${id}:`, err.message);
@@ -238,6 +263,9 @@ app.post('/sessions/:id/replay', async (req, res) => {
             }
             options.profileDir = pdir;
         }
+        if (req.body && req.body.stepDelay !== undefined) {
+            options.stepDelay = Number(req.body.stepDelay);
+        }
 
         const engine = new ReplayEngine(events, options);
         activeReplays.set(req.params.id, engine);
@@ -275,15 +303,49 @@ app.post('/sessions/:id/replay/stop', async (req, res) => {
  * Returns all past sanity run reports for this session
  */
 app.get('/sessions/:id/replays', (req, res) => {
-    const replaysDir = path.join(getSessionDir(req.params.id), 'replays');
-    if (!fs.existsSync(replaysDir)) return res.json({ replays: [] });
-    
     try {
-        const files = fs.readdirSync(replaysDir).filter(f => f.endsWith('.json')).sort().reverse();
-        const replays = files.map(f => {
-            try { return JSON.parse(fs.readFileSync(path.join(replaysDir, f), 'utf8')); } catch { return null; }
-        }).filter(Boolean);
-        res.json({ replays });
+        const session = db.getSession(req.params.id);
+        if (!session) return res.status(404).json({ error: 'Session not found' });
+
+        let targetSessions = [session];
+        // If it's a sanity flow, find ALL recordings of this flow
+        if (session.recording_type === 'sanity' && session.flow_name) {
+            targetSessions = db.getSessionsByFlow(session.flow_name, session.module_name);
+        }
+
+        const events = [];
+
+        for (const s of targetSessions) {
+            // Add the manual recording baseline block
+            events.push({
+                type: 'manual_recording',
+                timestamp: s.started_at,
+                session_id: s.id,
+                duration_ms: s.duration_ms,
+                error_count: s.error_count || 0,
+                network_failure_count: s.network_failure_count || 0
+            });
+
+            // Find all automated Playwright replays executed on this version
+            const replaysDir = path.join(getSessionDir(s.id), 'replays');
+            if (fs.existsSync(replaysDir)) {
+                const files = fs.readdirSync(replaysDir).filter(f => f.endsWith('.json'));
+                for (const f of files) {
+                    try {
+                        const report = JSON.parse(fs.readFileSync(path.join(replaysDir, f), 'utf8'));
+                        report.type = 'automated_replay';
+                        report.source_session_id = s.id;
+                        events.push(report);
+                    } catch { }
+                }
+            }
+        }
+
+        // Sort descending by timestamp
+        events.sort((a, b) => b.timestamp - a.timestamp);
+        
+        // We still use the 'replays' key so the UI doesn't break
+        res.json({ replays: events });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -316,6 +378,31 @@ app.get('/stats', (req, res) => {
     const totalSlowReqs = sessions.reduce((sum, s) => sum + (s.slow_request_count || 0), 0);
     const clean = sessions.filter(s => (s.error_count || 0) === 0 && (s.network_failure_count || 0) === 0 && s.status === 'done').length;
     res.json({ total, recording, done, clean, totalErrors, totalNetFailures, totalSlowReqs });
+});
+
+/**
+ * POST /sessions/bulk-delete
+ * Body: { ids: ["id1", "id2"] }
+ */
+app.post('/sessions/bulk-delete', (req, res) => {
+    const { ids } = req.body || {};
+    if (!Array.isArray(ids) || ids.length === 0) return res.status(400).json({ error: 'No ids provided' });
+
+    try {
+        // Delete files from disk first
+        for (const id of ids) {
+            const sessionDir = getSessionDir(id);
+            if (fs.existsSync(sessionDir)) {
+                fs.rmSync(sessionDir, { recursive: true, force: true });
+            }
+        }
+        
+        // Delete all from DB in one go
+        db.deleteSessions(ids);
+        res.json({ ok: true, deleted: ids.length });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
 /**
@@ -506,8 +593,278 @@ app.post('/sessions/:id/regenerate-views', (req, res) => {
     const sessionDir = getSessionDir(req.params.id);
     if (!fs.existsSync(sessionDir)) return res.status(404).json({ error: 'Not found' });
     try {
-        const result = generateTriageView(sessionDir);
+        const ignoredSigs = loadIgnored().map(i => i.signature);
+        const result = generateTriageView(sessionDir, ignoredSigs);
+        
+        // Also update the counts in the database based on current ignore list
+        const eventsFile = getEventsFile(req.params.id);
+        if (fs.existsSync(eventsFile)) {
+            const content = fs.readFileSync(eventsFile, 'utf8').trim();
+            if (content) {
+                const events = content.split('\n').map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+                const ignoredSet = new Set(loadIgnored().map(i => i.signature));
+                let errorCount = 0;
+                let networkFailureCount = 0;
+                let slowRequestCount = 0;
+                for (const e of events) {
+                    const sig = errorSignature(e);
+                    if (ignoredSet.has(sig)) continue;
+                    if (['console.error', 'runtime.exception'].includes(e.type)) errorCount++;
+                    if (e.type === 'network.failure') networkFailureCount++;
+                    if (e.type === 'network.timing' && e.data?.duration_ms > 2000) slowRequestCount++;
+                }
+                const session = db.getSession(req.params.id);
+                db.updateSessionStop(req.params.id, session.stopped_at || Date.now(), {
+                    duration_ms: session.duration_ms || 0,
+                    event_count: events.length,
+                    error_count: errorCount,
+                    network_failure_count: networkFailureCount,
+                    slow_request_count: slowRequestCount
+                });
+            }
+        }
+
         res.json({ ok: true, ...result });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ── Ignored Error Signatures API ─────────────────────────────────────────────
+
+/**
+ * GET /ignored-errors
+ * Returns all ignored error signatures
+ */
+app.get('/ignored-errors', (req, res) => {
+    res.json({ ignored: loadIgnored() });
+});
+
+/**
+ * POST /ignored-errors
+ * Body: { signature, label, source_session_id? }
+ * Adds a new signature to the ignore list
+ */
+app.post('/ignored-errors', (req, res) => {
+    const { signature, label, source_session_id } = req.body || {};
+    if (!signature) return res.status(400).json({ error: 'signature is required' });
+
+    const list = loadIgnored();
+    if (list.find(e => e.signature === signature)) {
+        return res.json({ ok: true, already_exists: true });
+    }
+
+    const entry = {
+        id: uuidv4(),
+        signature,
+        label: label || signature,
+        source_session_id: source_session_id || null,
+        ignored_at: Date.now(),
+    };
+    list.push(entry);
+    saveIgnored(list);
+    res.json({ ok: true, entry });
+});
+
+/**
+ * DELETE /ignored-errors/:id
+ * Removes an entry from the ignore list
+ */
+app.delete('/ignored-errors/:id', (req, res) => {
+    let list = loadIgnored();
+    const before = list.length;
+    list = list.filter(e => e.id !== req.params.id);
+    if (list.length === before) return res.status(404).json({ error: 'Not found' });
+    saveIgnored(list);
+    res.json({ ok: true });
+});
+
+// ── Schema v2 API Endpoints (additive — legacy endpoints unchanged below) ─────
+
+/**
+ * POST /sessions
+ * Canonical session start (v2). Same behaviour as POST /session/start but
+ * initialises an IngestionContext for structured batch ingestion.
+ * Body: { tab_id, url, title, recording_type?, flow_name?, module_name? }
+ */
+app.post('/sessions', (req, res) => {
+    const sessionId = uuidv4();
+    const now = Date.now();
+    const { tab_id, url, title, recording_type, flow_name, module_name } = req.body || {};
+
+    const sessionDir = getSessionDir(sessionId);
+    fs.mkdirSync(path.join(sessionDir, 'raw'),    { recursive: true });
+    fs.mkdirSync(path.join(sessionDir, 'views'),  { recursive: true });
+    fs.mkdirSync(path.join(sessionDir, 'video'),  { recursive: true });
+
+    const meta = {
+        id: sessionId, started_at: now, tab_id, url, title,
+        status: 'recording', recording_type, flow_name, module_name,
+        schema_version: '2.0',
+    };
+    fs.writeFileSync(path.join(sessionDir, 'meta.json'), JSON.stringify(meta, null, 2));
+
+    db.createSession({
+        id: sessionId, started_at: now,
+        tab_id: tab_id || null, url: url || null, title: title || null,
+        recording_type, flow_name, module_name,
+    });
+
+    // Pre-create ingestion context so the first batch call is fast
+    createIngestionContext(sessionId, sessionDir, db);
+
+    console.log(`[v2/START] Session ${sessionId} tab=${tab_id} url=${url}`);
+    res.json({ session_id: sessionId, started_at: now, schema_version: '2.0' });
+});
+
+/**
+ * POST /sessions/:id/events/batch
+ * Validated, deduplicated batch event ingestion (v2).
+ * Body: Array of event objects.
+ * Returns: { ok, accepted, rejected, duplicates, errors }
+ */
+app.post('/sessions/:id/events/batch', (req, res) => {
+    const { id } = req.params;
+    const session = db.getSession(id);
+    if (!session) return res.status(404).json({ error: 'Session not found' });
+
+    let events = req.body;
+    if (!Array.isArray(events)) events = [events];
+
+    const sessionDir = getSessionDir(id);
+    const ctx = createIngestionContext(id, sessionDir, db);
+    const result = ctx.ingest(events);
+
+    res.json({ ok: true, ...result });
+});
+
+/**
+ * POST /sessions/:id/video/chunk
+ * Canonical video chunk upload (v2 path). Delegates to same logic as legacy endpoint.
+ */
+app.post('/sessions/:id/video/chunk', upload.single('chunk'), (req, res) => {
+    const { id } = req.params;
+    if (!db.getSession(id)) return res.status(404).json({ error: 'Session not found' });
+
+    const videoDir = path.join(getSessionDir(id), 'video');
+    fs.mkdirSync(videoDir, { recursive: true });
+
+    const chunkIndex = req.headers['x-chunk-index'] || Date.now();
+    const filename = `chunk_${String(chunkIndex).padStart(6, '0')}.webm`;
+    const chunkPath = path.join(videoDir, filename);
+
+    const data = req.file ? req.file.buffer : (req.body?.length > 0 ? req.body : null);
+    if (!data) return res.status(400).json({ error: 'No chunk data' });
+
+    fs.writeFileSync(chunkPath, data);
+    res.json({ ok: true, filename });
+});
+
+/**
+ * POST /sessions/:id/finish
+ * Canonical session stop (v2). Mirrors POST /session/:id/stop.
+ * Destroys the ingestion context to free dedup memory.
+ */
+app.post('/sessions/:id/finish', async (req, res) => {
+    const { id } = req.params;
+    const session = db.getSession(id);
+    if (!session) return res.status(404).json({ error: 'Session not found' });
+
+    const stoppedAt  = Date.now();
+    const sessionDir = getSessionDir(id);
+
+    // Count events
+    let eventCount = 0, errorCount = 0, networkFailureCount = 0, slowRequestCount = 0;
+    const eventsFile = getEventsFile(id);
+    if (fs.existsSync(eventsFile)) {
+        const content = fs.readFileSync(eventsFile, 'utf8').trim();
+        if (content) {
+            const events = content.split('\n').map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+            eventCount = events.length;
+            const ignoredSet = new Set(loadIgnored().map(i => i.signature));
+            for (const e of events) {
+                const sig = errorSignature(e);
+                if (ignoredSet.has(sig)) continue;
+                const evtType = e.event_type || e.type;
+                if (['console.error', 'runtime.exception'].includes(evtType)) errorCount++;
+                if (evtType === 'network.failure') networkFailureCount++;
+                if (evtType === 'network.timing' && e.data?.duration_ms > 2000) slowRequestCount++;
+            }
+        }
+    }
+
+    db.updateSessionStop(id, stoppedAt, {
+        duration_ms: stoppedAt - session.started_at,
+        event_count: eventCount, error_count: errorCount,
+        network_failure_count: networkFailureCount, slow_request_count: slowRequestCount,
+    });
+
+    // Update meta.json
+    const metaPath = path.join(sessionDir, 'meta.json');
+    let meta = {};
+    try { meta = JSON.parse(fs.readFileSync(metaPath, 'utf8')); } catch {}
+    Object.assign(meta, { stopped_at: stoppedAt, duration_ms: stoppedAt - session.started_at, status: 'done', event_count: eventCount });
+    fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2));
+
+    // Generate triage views
+    try {
+        const ignoredSigs = loadIgnored().map(i => i.signature);
+        generateTriageView(sessionDir, ignoredSigs);
+    } catch (err) {
+        console.error(`[FINISH] Triage failed for ${id}:`, err.message);
+    }
+
+    // Destroy ingestion context (free dedup memory)
+    destroyIngestionContext(id);
+
+    console.log(`[v2/FINISH] Session ${id} done. events=${eventCount}`);
+    res.json({ ok: true, session_id: id, duration_ms: stoppedAt - session.started_at });
+});
+
+/**
+ * POST /sessions/:id/normalize
+ * Run the normalization pipeline on demand for a session.
+ * Writes normalized.json to the session dir.
+ */
+app.post('/sessions/:id/normalize', (req, res) => {
+    const { id } = req.params;
+    const session = db.getSession(id);
+    if (!session) return res.status(404).json({ error: 'Session not found' });
+
+    const sessionDir = getSessionDir(id);
+    try {
+        const result = normalize(sessionDir);
+        db.updateSessionNormalized(id, result.step_count);
+        console.log(`[NORMALIZE] Session ${id}: ${result.step_count} steps, ${result.assertion_count} assertions`);
+        res.json({
+            ok: true,
+            step_count: result.step_count,
+            assertion_count: result.assertion_count,
+            group_count: result.group_count,
+            step_type_summary: result.step_type_summary,
+        });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+/**
+ * GET /sessions/:id/normalized
+ * Returns the normalized flow for a session.
+ */
+app.get('/sessions/:id/normalized', (req, res) => {
+    const { id } = req.params;
+    const session = db.getSession(id);
+    if (!session) return res.status(404).json({ error: 'Session not found' });
+
+    const normalizedPath = path.join(getSessionDir(id), 'normalized.json');
+    if (!fs.existsSync(normalizedPath)) {
+        return res.status(404).json({ error: 'Not yet normalized. Call POST /sessions/:id/normalize first.' });
+    }
+
+    try {
+        const data = JSON.parse(fs.readFileSync(normalizedPath, 'utf8'));
+        res.json(data);
     } catch (err) {
         res.status(500).json({ error: err.message });
     }

@@ -271,7 +271,7 @@
     .layout {
       display: grid;
       grid-template-columns: 300px 1fr;
-      height: calc(100vh - 58px - 53px);
+      height: calc(100vh - 58px);
     }
 
     /* ── Sidebar ──────────────────────────────────────────────── */
@@ -410,6 +410,15 @@
       opacity: 1;
     }
 
+    .sanity-run-btn {
+      opacity: 0;
+      transition: opacity 0.15s;
+    }
+
+    .session-item:hover .sanity-run-btn {
+      opacity: 1 !important;
+    }
+
     .session-delete-btn:hover {
       color: var(--danger);
       background: var(--danger-light);
@@ -490,35 +499,57 @@
       flex-direction: column;
     }
 
-    /* ── Empty State ──────────────────────────────────────────── */
+    /* ── Dashboard / Empty State ──────────────────────────────── */
     .empty-state {
       display: flex;
       flex-direction: column;
       align-items: center;
       justify-content: center;
       height: 100%;
-      gap: 14px;
-      color: var(--text-muted);
-      text-align: center;
       padding: 40px;
     }
 
-    .empty-icon {
-      font-size: 52px;
-      opacity: 0.35;
+    .dashboard-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 20px;
+      max-width: 800px;
+      width: 100%;
+      margin-top: 20px;
     }
 
-    .empty-state p {
-      font-size: 15px;
-      font-weight: 500;
+    .dash-stat {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 24px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      box-shadow: var(--shadow);
     }
 
-    .empty-state small {
-      font-size: 12px;
-      color: var(--text-dim);
-      max-width: 300px;
-      line-height: 1.5;
+    .dash-value {
+      font-size: 36px;
+      font-weight: 800;
+      line-height: 1.2;
     }
+
+    .dash-label {
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--text-muted);
+      margin-top: 6px;
+    }
+
+    .dash-value.danger { color: var(--danger); }
+    .dash-value.warn { color: var(--warn); }
+    .dash-value.success { color: var(--success); }
+    .dash-value.accent { color: var(--accent); }
+    .dash-value.live { color: var(--danger); animation: pulse-text 1.4s infinite; }
 
     /* ── Session Detail ───────────────────────────────────────── */
     #session-detail {
@@ -2060,33 +2091,7 @@
     </div>
   </header>
 
-  <!-- ── Global Stats Bar ── -->
-  <div class="global-stats" id="global-stats">
-    <div class="gstat">
-      <span class="gstat-value accent" id="gs-total">—</span>
-      <span class="gstat-label">Sessions</span>
-    </div>
-    <div class="gstat">
-      <span class="gstat-value live" id="gs-recording">—</span>
-      <span class="gstat-label">● Live</span>
-    </div>
-    <div class="gstat">
-      <span class="gstat-value success" id="gs-clean">—</span>
-      <span class="gstat-label">Clean</span>
-    </div>
-    <div class="gstat">
-      <span class="gstat-value danger" id="gs-errors">—</span>
-      <span class="gstat-label">Total Errors</span>
-    </div>
-    <div class="gstat">
-      <span class="gstat-value warn" id="gs-net-fail">—</span>
-      <span class="gstat-label">Net Failures</span>
-    </div>
-    <div class="gstat">
-      <span class="gstat-value warn" id="gs-slow">—</span>
-      <span class="gstat-label">Slow Reqs</span>
-    </div>
-  </div>
+
 
   <div class="layout">
     <!-- ── Sidebar ── -->
@@ -2102,6 +2107,11 @@
           <div class="sidebar-title-row">
             <h2>Sessions</h2>
             <span class="session-count" id="session-count">—</span>
+            <button class="icon-btn" onclick="toggleBulkMode('sessions')" title="Bulk Edit" style="margin-left:auto; font-size:12px;">✅</button>
+          </div>
+          <div id="bulk-controls-sessions" style="display:none; align-items:center; gap:8px; padding:6px 0;">
+            <button class="btn btn-ghost" onclick="executeBulkDelete('sessions')" style="color:var(--danger); padding:4px 8px; font-size:11px;">🗑️ Delete Selected</button>
+            <button class="btn btn-ghost" onclick="toggleBulkMode('sessions')" style="padding:4px 8px; font-size:11px; margin-left:auto;">Cancel</button>
           </div>
           <div class="search-row">
             <input class="search-input" type="search" id="session-search" placeholder="🔍 Search sessions…"
@@ -2124,9 +2134,15 @@
           <div class="sidebar-title-row">
             <h2>Sanity Runs</h2>
             <span class="session-count" id="sanity-count">—</span>
+            <button class="icon-btn" onclick="toggleBulkMode('sanity')" title="Bulk Edit" style="margin-left:auto; font-size:12px;">✅</button>
           </div>
-          <div style="margin-bottom:8px;">
-            <input class="search-input" type="text" id="sanity-profile-dir" placeholder="Profile Dir (e.g. ~/.qa-profile)" style="width:100%; border-color:var(--accent-light);" title="Custom Chrome Profile Directory path to spawn" />
+          <div id="bulk-controls-sanity" style="display:none; align-items:center; gap:8px; padding:6px 0;">
+            <button class="btn btn-ghost" onclick="executeBulkDelete('sanity')" style="color:var(--danger); padding:4px 8px; font-size:11px;">🗑️ Delete Selected</button>
+            <button class="btn btn-ghost" onclick="toggleBulkMode('sanity')" style="padding:4px 8px; font-size:11px; margin-left:auto;">Cancel</button>
+          </div>
+          <div style="margin-bottom:8px; display:flex; gap:8px;">
+            <input class="search-input" type="text" id="sanity-profile-dir" placeholder="Profile Dir (e.g. ~/.qa-profile)" style="flex:1; border-color:var(--accent-light);" title="Custom Chrome Profile Directory path to spawn" />
+            <input class="search-input" type="number" id="sanity-step-delay" placeholder="Step Delay (ms)" style="width:120px; border-color:var(--accent-light);" title="Delay in milliseconds between steps to allow UI animations/transitions to settle" />
           </div>
           <div class="search-row">
             <input class="search-input" type="search" id="sanity-search" placeholder="🔍 Search flows…" oninput="filterSanity()" />
@@ -2141,11 +2157,51 @@
 
     <!-- ── Main ── -->
     <main class="main">
-      <!-- Empty State -->
+      <!-- Dashboard Landing -->
       <div class="empty-state" id="empty-state">
-        <div class="empty-icon">📋</div>
-        <p>No session selected</p>
-        <small>Pick a session from the sidebar, or start recording with the Chrome Extension.</small>
+        <div style="text-align:center; margin-bottom: 20px;">
+          <h2 style="font-size: 24px; font-weight: 700; color: var(--text);">System Dashboard</h2>
+          <p style="font-size: 14px; color: var(--text-dim); margin-top: 6px;">Select a session from the sidebar to view detailed telemetry, or start a new recording via the extension.</p>
+        </div>
+        
+        <div class="dashboard-grid">
+            <div class="dash-stat">
+              <span class="dash-value accent" id="gs-total">—</span>
+              <span class="dash-label">Total Sessions</span>
+            </div>
+            <div class="dash-stat">
+              <span class="dash-value live" id="gs-recording">—</span>
+              <span class="dash-label">● Live Recordings</span>
+            </div>
+            <div class="dash-stat">
+              <span class="dash-value success" id="gs-clean">—</span>
+              <span class="dash-label">Clean Runs</span>
+            </div>
+            <div class="dash-stat">
+              <span class="dash-value danger" id="gs-errors">—</span>
+              <span class="dash-label">Total JS Errors</span>
+            </div>
+            <div class="dash-stat">
+              <span class="dash-value warn" id="gs-net-fail">—</span>
+              <span class="dash-label">Network Failures</span>
+            </div>
+            <div class="dash-stat">
+              <span class="dash-value warn" id="gs-slow">—</span>
+              <span class="dash-label">Slow Requests</span>
+            </div>
+        </div>
+
+        <!-- Muted / Ignored Errors Panel -->
+        <div id="dashboard-ignored-panel" style="width:100%; max-width:800px; margin-top:28px; background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); overflow:hidden; box-shadow:var(--shadow);">
+          <div style="display:flex; align-items:center; gap:10px; padding:14px 18px; border-bottom:1px solid var(--border);">
+            <span style="font-size:15px;">🙈</span>
+            <span style="font-size:13px; font-weight:700; color:var(--text);">Muted / Ignored Errors</span>
+            <span class="session-count" id="dashboard-ignored-count" style="margin-left:auto;"></span>
+          </div>
+          <div id="dashboard-ignored-list">
+            <div class="loading-row"><span class="spinner"></span> Loading…</div>
+          </div>
+        </div>
       </div>
 
       <!-- Session detail -->
@@ -2160,6 +2216,7 @@
             <button class="btn btn-ghost" id="regen-btn" onclick="regenerateViews()" title="Regenerate triage views">⚙
               Regen</button>
             <a class="btn btn-ghost" id="download-btn" href="#" target="_blank">⬇ Export</a>
+            <button class="btn btn-ghost" id="delete-btn" style="color:var(--danger);" onclick="deleteCurrentSession()" title="Delete this session">🗑️ Delete</button>
           </div>
         </div>
 

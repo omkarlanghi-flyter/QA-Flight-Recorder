@@ -66,6 +66,10 @@ function parseEvents(eventsFile) {
  */
 function errorSignature(event) {
     if (!event.data) return event.type;
+    if (event.type === 'network.failure') {
+        const url = event.data.url_sanitized || event.data.url_full || 'unknown_url';
+        return `network.failure::${url}`;
+    }
     const msg = event.data.message || event.data.text || '';
     // Take first 120 chars of message as signature
     return `${event.type}::${msg.slice(0, 120)}`;
@@ -74,7 +78,8 @@ function errorSignature(event) {
 /**
  * Main filtering function
  */
-function generateTriageView(sessionDir) {
+function generateTriageView(sessionDir, ignoredSignatures = []) {
+    const ignoredSet = new Set(ignoredSignatures);
     const eventsFile = path.join(sessionDir, 'raw', 'events.ndjson');
     const viewsDir = path.join(sessionDir, 'views');
     fs.mkdirSync(viewsDir, { recursive: true });
@@ -198,7 +203,13 @@ function generateTriageView(sessionDir) {
                 continue;
             }
             seenErrorSigs.add(sig);
-            const enriched = { ...event, _triage: { dedup_count: signatureCounts[sig].count } };
+            const enriched = { 
+                ...event, 
+                _triage: { 
+                    dedup_count: signatureCounts[sig].count,
+                    is_ignored: ignoredSet.has(sig)
+                } 
+            };
             triageEvents.push(enriched);
         } else {
             triageEvents.push(event);
@@ -250,6 +261,9 @@ function generateTriageView(sessionDir) {
             const url = req.requestEvent?.data?.url_sanitized || 'unknown';
             const status = req.failureEvent ? 'network_failure' : `${req.responseEvent.data.status}`;
             const key = `${status}::${url}`;
+            const eventObj = req.failureEvent || req.responseEvent;
+            const sig = errorSignature(eventObj);
+            if (ignoredSet.has(sig)) continue; // Skip ignored in summary
             failedEndpoints[key] = (failedEndpoints[key] || 0) + 1;
         }
     }
@@ -295,4 +309,4 @@ function generateTriageView(sessionDir) {
     return { triageEventCount: triageEvents.length, errorClusters: errorClusters.length, rulesTriggered: rulesTriggered.length };
 }
 
-module.exports = { generateTriageView, sanitizeUrl, redactHeaders };
+module.exports = { generateTriageView, sanitizeUrl, redactHeaders, errorSignature };

@@ -7,6 +7,13 @@ const COLLECTOR_URL = 'http://127.0.0.1:17890';
 const BATCH_INTERVAL_MS = 2000;
 const MAX_BATCH_SIZE = 50;
 const VIDEO_CHUNK_TIMESLICE_MS = 5000;
+const SCHEMA_VERSION = '2.0';
+
+// Tracks the event_id of the most recent user-action event.
+// Network/console events that fire within 1500ms get this as their correlation_id.
+let _lastActionEventId = null;
+let _lastActionTs = 0;
+const CORRELATION_WINDOW_MS = 1500;
 
 // ── Console Breadcrumb Ring-Buffer ───────────────────────────────────────────
 // Stores the last N info/log messages as breadcrumbs for error context
@@ -69,15 +76,42 @@ async function getStatus() {
 
 // ── Event helpers ────────────────────────────────────────────────────────────
 function makeEvent(type, source, data, url) {
-    return {
-        session_id: state.sessionId,
-        ts_epoch_ms: Date.now(),
-        type,
+    const eventId = crypto.randomUUID();
+    const now = Date.now();
+
+    // Determine correlation_id: network/console events correlate back to the
+    // most recent user action that fired within CORRELATION_WINDOW_MS.
+    let correlationId = null;
+    const isActionEvent = type.startsWith('action.');
+    if (!isActionEvent && _lastActionEventId && (now - _lastActionTs) <= CORRELATION_WINDOW_MS) {
+        correlationId = _lastActionEventId;
+    }
+
+    const evt = {
+        // Schema v2 canonical fields
+        event_id:         eventId,
+        session_id:       state.sessionId,
+        timestamp:        now,
+        event_type:       type,
         source,
-        tab_id: state.tabId,
-        url: url || undefined,
+        correlation_id:   correlationId,
+        schema_version:   SCHEMA_VERSION,
+
+        // Legacy compatibility fields (kept so old server code still reads fine)
+        type,
+        ts_epoch_ms:      now,
+        tab_id:           state.tabId,
+        url:              url || undefined,
         data,
     };
+
+    // Track last action for correlation
+    if (isActionEvent) {
+        _lastActionEventId = eventId;
+        _lastActionTs = now;
+    }
+
+    return evt;
 }
 
 function bufferEvent(event) {
@@ -93,14 +127,34 @@ async function flushEvents() {
     const batch = state.eventBuffer.splice(0, state.eventBuffer.length);
     try {
         const settings = await loadSettings();
-        await fetch(`${settings.collectorUrl}/session/${state.sessionId}/event`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(batch),
-        });
+        const baseUrl = settings.collectorUrl;
+
+        // Try the v2 batch endpoint first; fall back to legacy on error
+        const v2Url = `${baseUrl}/sessions/${state.sessionId}/events/batch`;
+        const legacyUrl = `${baseUrl}/session/${state.sessionId}/event`;
+
+        let ok = false;
+        try {
+            const resp = await fetch(v2Url, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(batch),
+            });
+            ok = resp.ok;
+        } catch (e) {
+            // v2 endpoint failed (e.g. old server), try legacy
+        }
+
+        if (!ok) {
+            await fetch(legacyUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(batch),
+            });
+        }
     } catch (e) {
         console.error('[QA Recorder] Failed to flush events:', e.message);
-        // Put events back on error
+        // Put events back so they aren't lost
         state.eventBuffer.unshift(...batch);
     }
 }
@@ -730,11 +784,21 @@ chrome.debugger.onDetach.addListener((source, reason) => {
 
 // ── Tab Navigation listener ────────────────────────────────────────────────────
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
-    if (state.recording && tabId === state.tabId && changeInfo.url) {
-        bufferEvent(makeEvent('action.navigation', 'browser', {
-            from_url: sanitizeUrl(state.lastUrl || ''),
-            to_url: sanitizeUrl(changeInfo.url),
-        }, changeInfo.url));
-        state.lastUrl = changeInfo.url;
+    if (state.recording && tabId === state.tabId) {
+        if (changeInfo.url) {
+            bufferEvent(makeEvent('action.navigation', 'browser', {
+                from_url: sanitizeUrl(state.lastUrl || ''),
+                to_url: sanitizeUrl(changeInfo.url),
+            }, changeInfo.url));
+            state.lastUrl = changeInfo.url;
+        }
+
+        // Re-inject content script to survive full page navigations
+        if (changeInfo.status === 'complete') {
+            chrome.scripting.executeScript({
+                target: { tabId },
+                files: ['content.js']
+            }).catch(() => {});
+        }
     }
 });

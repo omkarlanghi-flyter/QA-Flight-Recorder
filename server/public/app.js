@@ -8,6 +8,7 @@ let allSessionsCache = [];
 let allEventsCache = [];
 let allInputEventsCache = [];
 let triageFilter = 'all';
+let ignoredSignatures = new Set(); // globally muted error sigs
 
 // ── Theme ─────────────────────────────────────────────────────────────────────
 function toggleTheme() {
@@ -183,6 +184,8 @@ async function loadGlobalStats() {
     // Server status
     document.getElementById('status-dot').className = 'status-dot online';
     document.getElementById('server-status-text').textContent = 'Server Online';
+    // Populate the ignored errors panel (only visible on the dashboard)
+    loadDashboardIgnored();
   } catch {
     document.getElementById('status-dot').className = 'status-dot offline';
     document.getElementById('server-status-text').textContent = 'Server Offline';
@@ -190,6 +193,60 @@ async function loadGlobalStats() {
   const now = new Date();
   document.getElementById('last-refresh').textContent =
     `Updated ${now.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', second: '2-digit' })}`;
+}
+
+// ── Bulk Delete ───────────────────────────────────────────────────────────────
+let isBulkMode = { sessions: false, sanity: false };
+let bulkSelected = { sessions: new Set(), sanity: new Set() };
+
+function toggleBulkMode(type) {
+  isBulkMode[type] = !isBulkMode[type];
+  bulkSelected[type].clear();
+  
+  const controls = document.getElementById(`bulk-controls-${type}`);
+  if (controls) controls.style.display = isBulkMode[type] ? 'flex' : 'none';
+  
+  if (type === 'sessions') renderSessionList(allSessionsCache);
+  if (type === 'sanity') renderSanityList(allSanityCache);
+}
+
+function toggleBulkSelect(type, id, checked, e) {
+  if (e) e.stopPropagation();
+  if (checked) bulkSelected[type].add(id);
+  else bulkSelected[type].delete(id);
+}
+
+async function executeBulkDelete(type) {
+  const ids = Array.from(bulkSelected[type]);
+  if (!ids.length) {
+    showToast('No sessions selected', 'warn');
+    return;
+  }
+  if (!confirm(`Delete ${ids.length} selected sequence(s)? This cannot be undone.`)) return;
+
+  try {
+    const res = await fetch(`${API}/sessions/bulk-delete`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ids })
+    });
+    if (!res.ok) throw new Error();
+    showToast(`${ids.length} item(s) deleted`, 'success');
+    
+    toggleBulkMode(type); // Reset UI
+
+    if (ids.includes(currentSessionId)) {
+      currentSessionId = null;
+      document.getElementById('empty-state').style.display = '';
+      document.getElementById('session-detail').style.display = 'none';
+      loadDashboardIgnored();
+    }
+    
+    await loadSessions();
+    await loadSanityFlows();
+  } catch {
+    showToast('Failed to bulk delete sessions', 'error');
+  }
 }
 
 // ── Sessions List ─────────────────────────────────────────────────────────────
@@ -244,17 +301,31 @@ function renderSessionList(sessions) {
   listEl.innerHTML = sessions.map(s => {
     const health = sessionHealthColor(s);
     const isClean = (s.error_count || 0) === 0 && (s.network_failure_count || 0) === 0;
+    
+    const clickAction = isBulkMode.sessions 
+        ? `toggleBulkSelect('sessions', '${esc(s.id)}', !this.querySelector('input').checked, event); const cb = this.querySelector('input'); cb.checked = !cb.checked;`
+        : `selectSession('${esc(s.id)}')`;
+
+    const checkboxHtml = isBulkMode.sessions 
+        ? `<input type="checkbox" style="margin-right:10px; pointer-events:none;" ${bulkSelected.sessions.has(s.id) ? 'checked' : ''} />` 
+        : '';
+    const deleteBtn = !isBulkMode.sessions 
+        ? `<button class="session-delete-btn" onclick="deleteSession(event,'${esc(s.id)}')" title="Delete session">✕</button>`
+        : '';
+
     return `
-    <div class="session-item ${s.id === currentSessionId ? 'active' : ''}"
-         onclick="selectSession('${esc(s.id)}')" data-id="${esc(s.id)}">
-      <div class="session-item-top">
-        <div class="session-title" title="${esc(s.title || s.url || s.id)}">${esc(s.title || s.url || s.id)}</div>
-        <button class="session-delete-btn" onclick="deleteSession(event,'${esc(s.id)}')" title="Delete session">✕</button>
-      </div>
-      <div class="session-meta">
-        <span>${formatDate(s.started_at)}</span>
-        <span>${formatDuration(s.duration_ms)}</span>
-      </div>
+    <div class="session-item ${s.id === currentSessionId ? 'active' : ''}" style="${isBulkMode.sessions ? 'cursor:pointer;' : ''}"
+         onclick="${clickAction}" data-id="${esc(s.id)}">
+      ${checkboxHtml}
+      <div style="flex:1; min-width:0;">
+          <div class="session-item-top">
+            <div class="session-title" title="${esc(s.title || s.url || s.id)}">${esc(s.title || s.url || s.id)}</div>
+            ${deleteBtn}
+          </div>
+          <div class="session-meta">
+            <span>${formatDate(s.started_at)}</span>
+            <span>${formatDuration(s.duration_ms)}</span>
+          </div>
       <div class="session-badges">
         ${s.status === 'recording' ? '<span class="badge badge-recording">● Live</span>' : ''}
         ${(s.error_count || 0) > 0 ? `<span class="badge badge-error">⚠ ${s.error_count} err</span>` : ''}
@@ -265,6 +336,7 @@ function renderSessionList(sessions) {
       <div class="health-bar-wrap">
         <div class="health-bar" style="background:${health};width:${isClean ? 100 : Math.max(10, 100 - (s.error_count || 0) * 15 - (s.network_failure_count || 0) * 10)}%"></div>
       </div>
+    </div>
     </div>`;
   }).join('');
 }
@@ -332,10 +404,15 @@ async function runSanityFlow(e, sessionId, flowName, moduleName) {
   
   try {
     const pdir = document.getElementById('sanity-profile-dir')?.value || '';
+    const sdelay = document.getElementById('sanity-step-delay')?.value || '';
+    
+    let bodyObj = { profileDir: pdir };
+    if (sdelay) bodyObj.stepDelay = parseInt(sdelay, 10);
+
     const res = await fetch(`${API}/sessions/${sessionId}/replay`, { 
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ profileDir: pdir })
+      body: JSON.stringify(bodyObj)
     });
     const data = await res.json();
     if (data.error) throw new Error(data.error);
@@ -372,41 +449,92 @@ function renderSanityList(flows) {
     listEl.innerHTML = '<div class="empty-list">No sanity runs found</div>';
     return;
   }
-  listEl.innerHTML = flows.map(f => {
-    const health = sessionHealthColor(f);
-    const isClean = (f.error_count || 0) === 0 && (f.network_failure_count || 0) === 0;
-    const moduleBadge = f.module_name ? `<span class="badge" style="background:var(--surface3);color:var(--text-muted);">${esc(f.module_name)}</span>` : '';
+
+  // 1. Group by module
+  const groups = {};
+  for (const f of flows) {
+    const mod = f.module_name || 'Uncategorized';
+    if (!groups[mod]) groups[mod] = [];
+    groups[mod].push(f);
+  }
+
+  // 2. Render groups as <details> accordions
+  let html = '';
+  // Sort keys so Uncategorized is last, others alphabetical
+  const sortedKeys = Object.keys(groups).sort((a,b) => {
+    if (a === 'Uncategorized') return 1;
+    if (b === 'Uncategorized') return -1;
+    return a.localeCompare(b);
+  });
+
+  for (const mod of sortedKeys) {
+    const modFlows = groups[mod];
     
-    return `
-    <div class="session-item ${f.id === currentSessionId ? 'active' : ''}"
-         onclick="selectSession('${esc(f.id)}')" data-id="${esc(f.id)}">
-      <div class="session-item-top">
-        <div style="flex:1; min-width:0; display:flex; flex-direction:column; gap:4px;">
-           <div class="session-title" title="${esc(f.flow_name)}">${esc(f.flow_name)}</div>
-           <div>${moduleBadge}</div>
+    // Check if any flow in this module is currently active
+    const hasActive = modFlows.some(f => f.id === currentSessionId);
+    
+    const flowsHtml = modFlows.map(f => {
+      const health = sessionHealthColor(f);
+      const isClean = (f.error_count || 0) === 0 && (f.network_failure_count || 0) === 0;
+
+      const clickAction = isBulkMode.sanity
+          ? `toggleBulkSelect('sanity', '${esc(f.id)}', !this.querySelector('input').checked, event); const cb = this.querySelector('input'); cb.checked = !cb.checked;`
+          : `selectSession('${esc(f.id)}')`;
+
+      const checkboxHtml = isBulkMode.sanity
+          ? `<input type="checkbox" style="margin-right:10px; pointer-events:none;" ${bulkSelected.sanity.has(f.id) ? 'checked' : ''} />` 
+          : '';
+
+      const actionsHtml = !isBulkMode.sanity
+          ? `<button class="btn btn-primary sanity-run-btn" style="padding: 4px 8px; font-size: 10px;" onclick="runSanityFlow(event, '${esc(f.id)}', '${esc(f.flow_name)}', '${esc(f.module_name || '')}')">▶ Run</button>
+             <button class="session-delete-btn" style="margin-left: 4px;" onclick="deleteSession(event,'${esc(f.id)}')" title="Delete sanity run">✕</button>`
+          : '';
+
+      return `
+      <div class="session-item ${f.id === currentSessionId ? 'active' : ''}" style="border-left: 3px solid transparent; padding-left: 24px; ${isBulkMode.sanity ? 'cursor:pointer;' : ''}"
+           onclick="${clickAction}" data-id="${esc(f.id)}">
+        ${checkboxHtml}
+        <div style="flex:1; min-width:0;">
+            <div class="session-item-top">
+              <div style="flex:1; min-width:0; display:flex; flex-direction:column; gap:4px;">
+                 <div class="session-title" title="${esc(f.flow_name)}">${esc(f.flow_name)}</div>
+              </div>
+              ${actionsHtml}
+            </div>
+            <div class="session-meta">
+              <span>${formatDate(f.created_at)}</span>
+              <span>${formatDuration(f.duration_ms)}</span>
+            </div>
+        <div class="session-badges">
+          ${f.last_run_status === 'recording' ? '<span class="badge badge-recording">● Live</span>' : ''}
+          ${(f.error_count || 0) > 0 ? `<span class="badge badge-error">⚠ ${f.error_count} err</span>` : ''}
+          ${(f.network_failure_count || 0) > 0 ? `<span class="badge badge-warn">${f.network_failure_count} net fail</span>` : ''}
+          ${isClean && f.last_run_status !== 'recording' ? '<span class="badge badge-success">✓ Clean</span>' : ''}
         </div>
-        <button class="btn btn-primary" style="padding: 4px 8px; font-size: 10px;" onclick="runSanityFlow(event, '${esc(f.id)}', '${esc(f.flow_name)}', '${esc(f.module_name || '')}')">▶ Run</button>
+        <div class="health-bar-wrap">
+          <div class="health-bar" style="background:${health};width:${isClean ? 100 : Math.max(10, 100 - (f.error_count || 0) * 15 - (f.network_failure_count || 0) * 10)}%"></div>
+        </div>
       </div>
-      <div class="session-meta">
-        <span>${formatDate(f.created_at)}</span>
-        <span>${formatDuration(f.duration_ms)}</span>
+      </div>`;
+    }).join('');
+
+    html += `
+    <details class="module-group" style="border-bottom: 1px solid var(--border);" ${hasActive ? 'open' : ''}>
+      <summary style="padding: 12px 16px; cursor: pointer; font-size: 12px; font-weight: 700; color: var(--text); background: var(--surface); display: flex; align-items: center; gap: 8px; user-select: none; outline: none;">
+        📁 ${esc(mod)} <span class="session-count" style="margin-left:auto; background: var(--surface3); color: var(--text-dim);">${modFlows.length}</span>
+      </summary>
+      <div class="module-flows" style="background: var(--surface2);">
+        ${flowsHtml}
       </div>
-      <div class="session-badges">
-        ${f.last_run_status === 'recording' ? '<span class="badge badge-recording">● Live</span>' : ''}
-        ${(f.error_count || 0) > 0 ? `<span class="badge badge-error">⚠ ${f.error_count} err</span>` : ''}
-        ${(f.network_failure_count || 0) > 0 ? `<span class="badge badge-warn">${f.network_failure_count} net fail</span>` : ''}
-        ${isClean && f.last_run_status !== 'recording' ? '<span class="badge badge-success">✓ Clean</span>' : ''}
-      </div>
-      <div class="health-bar-wrap">
-        <div class="health-bar" style="background:${health};width:${isClean ? 100 : Math.max(10, 100 - (f.error_count || 0) * 15 - (f.network_failure_count || 0) * 10)}%"></div>
-      </div>
-    </div>`;
-  }).join('');
+    </details>`;
+  }
+
+  listEl.innerHTML = html;
 }
 
 // ── Delete Session ────────────────────────────────────────────────────────────
 async function deleteSession(e, id) {
-  e.stopPropagation();
+  if (e) e.stopPropagation();
   if (!confirm('Delete this session? This cannot be undone.')) return;
   try {
     const res = await fetch(`${API}/sessions/${id}`, { method: 'DELETE' });
@@ -418,15 +546,31 @@ async function deleteSession(e, id) {
       document.getElementById('session-detail').style.display = 'none';
     }
     await loadSessions();
-  } catch {
+    await loadSanityFlows();
+  } catch (err) {
     showToast('Failed to delete session', 'error');
   }
+}
+
+async function deleteCurrentSession() {
+  if (!currentSessionId) return;
+  await deleteSession(null, currentSessionId);
 }
 
 // ── Session Detail ────────────────────────────────────────────────────────────
 let sessionStartMs = null;
 
 async function selectSession(id) {
+  // Toggle: clicking the already-selected session closes it and shows the dashboard
+  if (currentSessionId === id) {
+    currentSessionId = null;
+    document.querySelectorAll('.session-item').forEach(el => el.classList.remove('active'));
+    document.getElementById('empty-state').style.display = '';
+    document.getElementById('session-detail').style.display = 'none';
+    loadDashboardIgnored();
+    return;
+  }
+
   currentSessionId = id;
   document.querySelectorAll('.session-item').forEach(el => {
     el.classList.toggle('active', el.dataset.id === id);
@@ -893,14 +1037,107 @@ document.addEventListener('click', e => {
   }
 });
 
-//
-// ── Triage ────────────────────────────────────────────────────────────────────
+// ── Triage State ──────────────────────────────────────────────────────────────
 let triageEventsCache = [];
+let _triageShowCache = []; // safe index array – avoids passing event objects via onclick attrs
+
+window.triageIgnoreByIdx = function(idx) {
+  const ev = _triageShowCache[Number(idx)];
+  if (ev) ignoreEvent(ev, currentSessionId);
+};
+
+window.triagreCopyByIdx = function(idx) {
+  const ev = _triageShowCache[Number(idx)];
+  if (!ev) return;
+  const d = ev.data || {};
+  const msg = d.message || d.text || d.text_snippet || '';
+  const stack = d.stack || d.stackTrace || '';
+  copyEventText(`[${ev.type}] ${msg} ${stack}`.trim());
+};
+
+// ── Ignored Errors ────────────────────────────────────────────────────────────
+async function refreshIgnoredSignatures() {
+  try {
+    const res = await fetch(`${API}/ignored-errors`);
+    const { ignored } = await res.json();
+    ignoredSignatures = new Set(ignored.map(e => e.signature));
+    return ignored;
+  } catch {
+    return [];
+  }
+}
+
+function eventSignature(ev) {
+  const d = ev.data || {};
+  if (ev.type === 'network.failure') {
+    const url = d.url_sanitized || d.url_full || 'unknown_url';
+    return `network.failure::${url}`;
+  }
+  const msg = d.message || d.text || '';
+  return `${ev.type}::${msg.slice(0, 120)}`;
+}
+
+async function ignoreEvent(ev, sessionId) {
+  const sig = eventSignature(ev);
+  const d = ev.data || {};
+  const label = `[${ev.type}] ${(d.message || d.text || d.url_sanitized || '').slice(0, 80)}`;
+  try {
+    await fetch(`${API}/ignored-errors`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ signature: sig, label, source_session_id: sessionId }),
+    });
+    ignoredSignatures.add(sig);
+    showToast('Error muted globally 🙈', 'success');
+    renderTriage(triageEventsCache);  // re-render in-place with greyed-out state
+    loadDashboardIgnored();           // refresh the dashboard panel
+  } catch {
+    showToast('Failed to mute error', 'error');
+  }
+}
+
+async function restoreIgnored(id) {
+  try {
+    await fetch(`${API}/ignored-errors/${id}`, { method: 'DELETE' });
+    await refreshIgnoredSignatures();
+    renderTriage(triageEventsCache);
+    loadDashboardIgnored();
+    showToast('Error restored ✅', 'success');
+  } catch {
+    showToast('Failed to restore error', 'error');
+  }
+}
+
+async function loadDashboardIgnored() {
+  const panel = document.getElementById('dashboard-ignored-panel');
+  if (!panel) return;
+  const list = document.getElementById('dashboard-ignored-list');
+  const ignored = await refreshIgnoredSignatures();
+  const countEl = document.getElementById('dashboard-ignored-count');
+  if (countEl) countEl.textContent = ignored.length || '';
+
+  if (!ignored.length) {
+    list.innerHTML = '<div class="empty-list" style="padding:20px;text-align:center;color:var(--text-dim);">No muted errors — all issues are active.</div>';
+    return;
+  }
+  list.innerHTML = ignored.map(e => `
+    <div style="display:flex; align-items:flex-start; gap:12px; padding:12px 16px; border-bottom:1px solid var(--border);">
+      <div style="flex:1; min-width:0;">
+        <div style="font-size:12px; font-weight:600; color:var(--text); word-break:break-all; margin-bottom:4px;">${esc(e.label)}</div>
+        <div style="font-size:10px; color:var(--text-dim);">Muted ${formatDate(e.ignored_at)}${e.source_session_id ? ` · from session <code>${e.source_session_id.slice(0,8)}</code>` : ''}</div>
+      </div>
+      <button onclick="restoreIgnored('${esc(e.id)}')" style="flex-shrink:0; background:none; border:1px solid var(--border); color:var(--text-muted); border-radius:5px; padding:4px 10px; font-size:11px; cursor:pointer;" title="Restore this error">👁️ Restore</button>
+    </div>`);
+    list.innerHTML += ignored.length > 0 ? '' : '';
+}
 
 async function loadTriage() {
   if (!currentSessionId) return;
   const listEl = document.getElementById('triage-list');
   listEl.innerHTML = '<div class="loading-row"><span class="spinner"></span> Loading triage…</div>';
+
+  // Pre-load ignored signatures so rendering is synchronous
+  await refreshIgnoredSignatures();
 
   const res = await fetch(`${API}/sessions/${currentSessionId}/triage`);
   const { events } = await res.json();
@@ -921,33 +1158,48 @@ function renderTriage(events) {
     ? events.filter(ev => ['console.error', 'runtime.exception', 'network.failure'].includes(ev.type))
     : events;
 
+  _triageShowCache = show; // update safe index reference
+
   listEl.innerHTML = show.map((ev, i) => {
     const d = ev.data || {};
+    const sig = eventSignature(ev);
+    const isIgnored = ignoredSignatures.has(sig);
+    const isCritical = ['console.error', 'runtime.exception', 'network.failure'].includes(ev.type);
     let msg = d.message || d.text || d.text_snippet || '';
     const stack = d.stack || d.stackTrace || null;
     const dedup = ev._triage?.dedup_count > 1 ? `<span class="dedup-badge">×${ev._triage.dedup_count}</span>` : '';
     const diagnosis = analyzeTriageEvent(ev);
-    const rawText = `[${ev.type}] ${msg} ${stack || ''}`.trim();
 
     if (!msg) msg = summarizeEvent(ev);
     const isHtml = typeof msg === 'string' && msg.includes('<details');
     if (!isHtml) msg = esc(msg.slice(0, 300));
 
-    const diagHtml = diagnosis
+    const diagHtml = diagnosis && !isIgnored
       ? `<div class="triage-diagnosis ${diagnosis.cls}">${diagnosis.msg}</div>`
       : '';
 
+    const ignoredBadge = isIgnored
+      ? `<span style="font-size:10px;background:var(--surface3);color:var(--text-dim);border-radius:99px;padding:1px 8px;font-weight:600;">🙈 Muted</span>`
+      : '';
+
+    // Use data-idx to avoid embedding event JSON in onclick attrs (breaks on special chars)
+    const ignoreBtn = isCritical && !isIgnored
+      ? `<button class="copy-btn" data-idx="${i}" onclick="triageIgnoreByIdx(this.dataset.idx)" title="Mute this error globally">🙈 Ignore</button>`
+      : '';
+    const copyBtn = `<button class="copy-btn" data-idx="${i}" onclick="triagreCopyByIdx(this.dataset.idx)" title="Copy">📋</button>`;
+
     return `
-      <div class="triage-event ${getTriageClass(ev.type)}" id="trev-${i}">
+      <div class="triage-event ${isIgnored ? '' : getTriageClass(ev.type)}" id="trev-${i}" style="${isIgnored ? 'opacity:0.45;' : ''}">
         <span class="type-chip ${getTypeClass(ev.type)}">${esc(ev.type)}</span>
         <div class="triage-event-body">
-          <div class="triage-ts">${formatTs(ev.ts_epoch_ms, sessionStartMs)}</div>
+          <div class="triage-ts">${formatTs(ev.ts_epoch_ms, sessionStartMs)} ${ignoredBadge}</div>
           <div class="triage-msg">${msg}${dedup}</div>
           ${diagHtml}
           ${stack ? `<pre class="triage-stack">${esc(String(stack).slice(0, 500))}</pre>` : ''}
         </div>
         <div class="triage-actions">
-          <button class="copy-btn" onclick="copyEventText(${JSON.stringify(rawText)})" title="Copy">📋</button>
+          ${ignoreBtn}
+          ${copyBtn}
         </div>
       </div>`;
   }).join('');
@@ -1455,26 +1707,45 @@ async function loadRuns() {
     const res = await fetch(`${API}/sessions/${currentSessionId}/replays`);
     const { replays } = await res.json();
     if (!replays || !replays.length) {
-      listEl.innerHTML = '<div class="empty-list">No sanity runs executed yet for this flow.</div>';
+      listEl.innerHTML = '<div class="empty-list">No execution history found.</div>';
       return;
     }
     
     listEl.innerHTML = replays.map(r => {
-      const errCount = (r.failures?.ui?.length || 0) + (r.failures?.js_errors?.length || 0);
-      const isClean = errCount === 0 && (r.failures?.network?.length || 0) === 0;
-      return `
-      <details class="cluster-item" style="display:block; cursor:pointer;">
-          <summary style="display:flex; gap:10px; align-items:center; list-style:none;">
-              <span style="font-weight:600; font-size:12px;">${formatDate(r.timestamp)}</span>
-              ${isClean ? '<span class="badge badge-success">✓ Clean</span>' : `<span class="badge badge-error">⚠ ${errCount} Issues</span>`}
-              <span style="margin-left:auto; font-size:11px; color:var(--text-muted)">Passed: ${r.summary?.passed || 0}/${r.summary?.total_steps || 0}</span>
-          </summary>
-          <div style="margin-top:10px; padding-top:10px; border-top:1px solid var(--border);">
-              <div style="font-size:11px; margin-bottom:6px;"><strong>Report Summary:</strong></div>
-              <pre style="font-size:10px; background:var(--surface); padding:8px; border-radius:4px; max-height:200px; overflow:auto; color:var(--text); white-space:pre-wrap;">${esc(JSON.stringify(r, null, 2))}</pre>
-          </div>
-      </details>
-      `;
+      if (r.type === 'manual_recording') {
+        const isClean = r.error_count === 0 && r.network_failure_count === 0;
+        return `
+        <div class="cluster-item" style="display:flex; gap:10px; align-items:center; border-left: 3px solid var(--accent); background: var(--surface2);">
+            <span style="font-size:16px;">🎥</span>
+            <span style="font-weight:600; font-size:12px;">Manual Recording</span>
+            <span style="font-size:11px; color:var(--text-dim);">${formatDate(r.timestamp)}</span>
+            <div style="margin-left:auto; display:flex; gap:6px; align-items:center;">
+               ${!isClean ? `<span class="badge badge-warn">⚠ ${r.error_count + r.network_failure_count} initial issues</span>` : '<span class="badge badge-success">✓ Clean record</span>'}
+               <span style="font-size:10px; color:var(--text-muted); font-family:monospace;" title="Version UUID">v_${esc(r.session_id).slice(0, 8)}</span>
+            </div>
+        </div>`;
+      } else {
+        const errCount = (r.failures?.ui?.length || 0) + (r.failures?.js_errors?.length || 0);
+        const isClean = errCount === 0 && (r.failures?.network?.length || 0) === 0;
+        return `
+        <details class="cluster-item" style="display:block; cursor:pointer;">
+            <summary style="display:flex; gap:10px; align-items:center; list-style:none;">
+                <span style="font-size:16px;">🤖</span>
+                <span style="font-weight:600; font-size:12px;">Automated Replay</span>
+                <span style="font-size:11px; color:var(--text-dim);">${formatDate(r.timestamp)}</span>
+                ${isClean ? '<span class="badge badge-success">✓ Passed</span>' : `<span class="badge badge-error">⚠ ${errCount} Issues</span>`}
+                <div style="margin-left:auto; display:flex; gap:10px; align-items:center;">
+                  <span style="font-size:11px; color:var(--text-muted)">Pass rate: ${r.summary?.passed || 0}/${r.summary?.total_steps || 0}</span>
+                  <span style="font-size:10px; color:var(--text-muted); opacity:0.6; font-family:monospace;" title="Replayed against version">src: v_${esc(r.source_session_id || '').slice(0, 8)}</span>
+                </div>
+            </summary>
+            <div style="margin-top:10px; padding-top:10px; border-top:1px solid var(--border);">
+                <div style="font-size:11px; margin-bottom:6px;"><strong>Execution Report:</strong></div>
+                <pre style="font-size:10px; background:var(--surface); padding:8px; border-radius:4px; max-height:200px; overflow:auto; color:var(--text); white-space:pre-wrap;">${esc(JSON.stringify(r, null, 2))}</pre>
+            </div>
+        </details>
+        `;
+      }
     }).join('');
   } catch {
     listEl.innerHTML = '<div class="empty-list" style="color:var(--danger)">Failed to load runs</div>';
