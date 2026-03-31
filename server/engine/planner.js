@@ -82,6 +82,29 @@ function _waitStrategyFor(step, meta) {
     }
 }
 
+// Build wait layers (multi-layer waiting) for resilience
+function _waitLayers(step, selectorChain, waitStrategy) {
+    const layers = [];
+    // 1) DOM ready
+    layers.push({ type: 'dom_ready', timeout_ms: 5000 });
+
+    // 2) Element visible (when we have a selector)
+    const primarySelector = (selectorChain || []).find(s => s.strategy !== 'coordinates');
+    if (primarySelector && primarySelector.value) {
+        layers.push({ type: 'element_visible', selector: primarySelector.value, timeout_ms: waitStrategy?.max_ms || 5000 });
+    }
+
+    // 3) Network idle / settle depending on waitStrategy
+    if (waitStrategy?.type === WAIT_STRATEGIES.NETWORK_IDLE || waitStrategy?.type === WAIT_STRATEGIES.NETWORK_SETTLE) {
+        layers.push({ type: 'network_idle', max_ms: waitStrategy.max_ms || 10000, idle_ms: waitStrategy.idle_ms || 300 });
+    }
+
+    // 4) Timeout fallback
+    layers.push({ type: 'timeout_fallback', timeout_ms: waitStrategy?.max_ms || 3000 });
+
+    return layers;
+}
+
 // ── Implicit assertions ────────────────────────────────────────────────────────
 /**
  * Add implicit assertions that should always be checked, not present in flow step.
@@ -150,6 +173,8 @@ function createPlan(flow, steps) {
                 ? (typeof step.wait_strategy === 'string' ? JSON.parse(step.wait_strategy) : step.wait_strategy)
                 : _waitStrategyFor(step, meta);
 
+            const waitLayers = _waitLayers(step, selectorChain, waitStrategy);
+
             // Retry config
             const retryConfig = { ...(RETRY_CONFIG[step.step_type] || RETRY_CONFIG.raw_action) };
 
@@ -170,6 +195,7 @@ function createPlan(flow, steps) {
 
                 // Selector resolution
                 selector_chain: selectorChain,
+                wait_layers:    waitLayers,
 
                 // Timing & synchronization
                 wait_strategy:  waitStrategy,

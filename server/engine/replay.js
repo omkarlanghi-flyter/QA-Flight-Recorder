@@ -2,6 +2,7 @@ const { chromium } = require('playwright');
 const { spawn } = require('child_process');
 const path = require('path');
 const os = require('os');
+const { evaluateAssertions } = require('./assertions');
 
 class ReplayEngine {
   constructor(events, options = {}) {
@@ -180,6 +181,89 @@ class ReplayEngine {
       } else {
         this.report.failures.ui.push({ step_index: this.activeStepIndex, type: 'engine_crash', message: err.message });
       }
+    } finally {
+      if (this.page && !this.page.isClosed()) {
+        try { await this.page.close({ runBeforeUnload: false }); } catch (e) {}
+      }
+      if (this.browser) {
+        try { await this.browser.disconnect(); } catch (e) {}
+      }
+    }
+    return this.report;
+  }
+
+  /**
+   * Execute an ExecutionPlan (planner output) instead of raw events.
+   */
+  async runPlan(plan) {
+    if (!plan || !Array.isArray(plan.steps)) throw new Error('Invalid plan');
+
+    // reset report for plan run
+    this.report = {
+      summary: { total_steps: plan.steps.length, passed: 0, failed: 0 },
+      failures: { ui: [], network: [], js_errors: [] },
+      steps: [],
+    };
+
+    try {
+      await this._ensureBrowser();
+      const contexts = this.browser.contexts();
+      const context = contexts.length > 0 ? contexts[0] : await this.browser.newContext();
+      this.page = await context.newPage();
+
+      // Clean up stray pages
+      for (const p of context.pages()) {
+        if (p !== this.page) {
+          try { await p.close({ runBeforeUnload: false }); } catch (e) {}
+        }
+      }
+
+      this._attachListeners(this.page);
+
+      for (let i = 0; i < plan.steps.length; i++) {
+        const pStep = plan.steps[i];
+        if (this.aborted) break;
+        const stepReport = {
+          index: i + 1,
+          step_type: pStep.step_type,
+          label: pStep.label,
+          status: 'failed',
+          duration_ms: 0,
+          attempts: 0,
+        };
+        this.report.steps.push(stepReport);
+
+        const start = Date.now();
+        const outcome = await this._runPlanStepWithRetry(pStep, this.page);
+        stepReport.duration_ms = Date.now() - start;
+        stepReport.attempts = outcome.attempts;
+
+        if (outcome.ok) {
+          stepReport.status = 'passed';
+          this.report.summary.passed++;
+        } else {
+          stepReport.status = 'failed';
+          stepReport.error = outcome.error?.message || 'step failed';
+          this.report.summary.failed++;
+          this.report.failures.ui.push({ step_index: i + 1, type: pStep.step_type, message: stepReport.error });
+          if (this.abortOnFailure) break;
+        }
+
+        // Evaluate assertions after action completes
+        if (Array.isArray(pStep.assertions) && pStep.assertions.length > 0) {
+          const assertResult = await evaluateAssertions(pStep.assertions, { page: this.page, report: this.report });
+          stepReport.assertions = assertResult.results;
+          const hardFailures = assertResult.failed.filter(f => !f.soft);
+          if (hardFailures.length > 0 && stepReport.status === 'passed') {
+            stepReport.status = 'failed';
+            this.report.summary.failed++;
+            this.report.summary.passed = Math.max(0, this.report.summary.passed - 1);
+            this.report.failures.ui.push({ step_index: i + 1, type: pStep.step_type, message: 'assertion failed' });
+          }
+        }
+      }
+    } catch (err) {
+      this.report.failures.ui.push({ step_index: this.report.steps.length + 1, type: 'engine_crash', message: err.message });
     } finally {
       if (this.page && !this.page.isClosed()) {
         try { await this.page.close({ runBeforeUnload: false }); } catch (e) {}
@@ -516,6 +600,215 @@ class ReplayEngine {
       }
     }
     return { ok: false, error: lastError };
+  }
+
+  async _runPlanStepWithRetry(planStep, page) {
+    const retryCfg = planStep.retry_config || { max_attempts: 1, backoff_ms: 0 };
+    let attempt = 0;
+    let lastError = null;
+    const maxAttempts = Math.max(1, retryCfg.max_attempts || 1);
+    while (attempt < maxAttempts) {
+      try {
+        await this._withStepTimeout(() => this._executePlanStep(planStep, page));
+        return { ok: true, attempts: attempt + 1 };
+      } catch (err) {
+        lastError = err;
+        attempt++;
+        if (attempt >= maxAttempts) break;
+        // Optional recovery: page reload between attempts
+        if (planStep.recovery?.reload_on_fail) {
+          try { await page.reload({ waitUntil: 'domcontentloaded' }); } catch (e) {}
+        }
+        const backoff = retryCfg.backoff_ms || 0;
+        if (backoff > 0) { try { await page.waitForTimeout(backoff); } catch (e) {} }
+      }
+    }
+    return { ok: false, attempts: attempt, error: lastError };
+  }
+
+  async _executePlanStep(step, page) {
+    const waitStrategy = step.wait_strategy || { type: 'none' };
+    const selectorChain = step.selector_chain || [];
+    const meta = step;
+
+    switch (step.step_type) {
+      case 'navigate': {
+        if (meta.url) {
+          await page.goto(meta.url, { waitUntil: 'domcontentloaded', timeout: waitStrategy.max_ms || this.timeouts.navigation });
+        }
+        await this._waitLayers(page, step.wait_layers || [], waitStrategy);
+        return;
+      }
+      case 'click': {
+        const locator = await this._resolveLocatorFromChain(page, selectorChain, meta);
+        if (locator) {
+          await locator.click({ timeout: this.timeouts.click });
+        } else if (this._hasCoordinates(selectorChain)) {
+          const { x, y } = this._coordsFromChain(selectorChain);
+          await page.mouse.click(x, y, { timeout: this.timeouts.click });
+        } else {
+          throw new Error('No clickable element found');
+        }
+        await this._waitLayers(page, step.wait_layers || [], waitStrategy);
+        return;
+      }
+      case 'fill_field': {
+        const locator = await this._resolveLocatorFromChain(page, selectorChain, meta);
+        if (!locator) throw new Error('Field not found');
+        await locator.fill(meta.value ?? '', { timeout: this.timeouts.elementVisible });
+        await this._waitLayers(page, step.wait_layers || [], waitStrategy);
+        return;
+      }
+      case 'select_option': {
+        const locator = await this._resolveLocatorFromChain(page, selectorChain, meta);
+        if (!locator) throw new Error('Select element not found');
+        if (meta.selected_value) {
+          await locator.selectOption({ value: meta.selected_value });
+        } else if (meta.selected_text) {
+          await locator.selectOption({ label: meta.selected_text });
+        }
+        await this._waitLayers(page, step.wait_layers || [], waitStrategy);
+        return;
+      }
+      case 'submit_form': {
+        const locator = await this._resolveLocatorFromChain(page, selectorChain, meta);
+        if (locator) {
+          await locator.click({ timeout: this.timeouts.click });
+        } else if (this._hasCoordinates(selectorChain)) {
+          const { x, y } = this._coordsFromChain(selectorChain);
+          await page.mouse.click(x, y, { timeout: this.timeouts.click });
+        } else {
+          await page.keyboard.press('Enter');
+        }
+        await this._waitLayers(page, step.wait_layers || [], waitStrategy);
+        return;
+      }
+      case 'press_key': {
+        if (!meta.key) throw new Error('key is required');
+        await page.keyboard.press(meta.key);
+        await this._waitLayers(page, step.wait_layers || [], waitStrategy);
+        return;
+      }
+      case 'scroll': {
+        if (typeof meta.scroll_y === 'number' || typeof meta.scroll_x === 'number') {
+          await page.mouse.wheel(meta.scroll_x || 0, meta.scroll_y || 0);
+        } else {
+          await page.mouse.wheel(0, 500);
+        }
+        await this._waitLayers(page, step.wait_layers || [], waitStrategy);
+        return;
+      }
+      case 'observe_toast': {
+        const locator = await this._resolveLocatorFromChain(page, selectorChain, meta);
+        if (locator) {
+          await locator.waitFor({ state: 'visible', timeout: waitStrategy.max_ms || 5000 });
+        } else {
+          await this._waitLayers(page, step.wait_layers || [], waitStrategy);
+        }
+        return;
+      }
+      default:
+        return; // no-op for raw_action or unknown
+    }
+  }
+
+  async _waitStrategy(page, strategy = { type: 'none' }) {
+    switch ((strategy.type || 'none')) {
+      case 'network_idle':
+        return this._waitForNetworkSettled(page, strategy.max_ms || 15000, strategy.idle_ms || 500);
+      case 'network_settle':
+        return this._waitForNetworkSettled(page, strategy.max_ms || 10000, strategy.idle_ms || 300);
+      case 'element_visible':
+        if (strategy.selector) {
+          const loc = page.locator(strategy.selector);
+          return loc.waitFor({ state: 'visible', timeout: strategy.max_ms || 5000 }).catch(() => {});
+        }
+        return page.waitForTimeout(strategy.max_ms || 500);
+      case 'dom_change':
+        return page.waitForTimeout(strategy.max_ms || 5000);
+      case 'none':
+      default:
+        return page.waitForTimeout(strategy.idle_ms || 0).catch(() => {});
+    }
+  }
+
+  async _waitLayers(page, layers = [], fallbackStrategy) {
+    if (!Array.isArray(layers) || layers.length === 0) {
+      return this._waitStrategy(page, fallbackStrategy || { type: 'none' });
+    }
+    for (const layer of layers) {
+      if (!layer || this.aborted) break;
+      switch (layer.type) {
+        case 'dom_ready':
+          try { await page.waitForLoadState('domcontentloaded', { timeout: layer.timeout_ms || 5000 }); } catch (e) {}
+          break;
+        case 'element_visible':
+          if (layer.selector) {
+            const loc = page.locator(layer.selector);
+            await loc.waitFor({ state: 'visible', timeout: layer.timeout_ms || 5000 }).catch(() => {});
+          }
+          break;
+        case 'network_idle':
+          await this._waitForNetworkSettled(page, layer.max_ms || 10000, layer.idle_ms || 300).catch(() => {});
+          break;
+        case 'timeout_fallback':
+          if (layer.timeout_ms) { await page.waitForTimeout(layer.timeout_ms).catch(() => {}); }
+          break;
+        default:
+          break;
+      }
+    }
+  }
+
+  async _resolveLocatorFromChain(page, chain, meta) {
+    if (!Array.isArray(chain)) return null;
+    for (const sel of chain.sort((a, b) => (a.priority || 99) - (b.priority || 99))) {
+      if (!sel || !sel.value) continue;
+      if (sel.strategy === 'text') {
+        const loc = page.getByText(sel.value, { exact: false });
+        if (await loc.count().catch(() => 0) > 0) return loc.first();
+      } else if (sel.strategy === 'label') {
+        try {
+          const loc = page.getByLabel(sel.value);
+          if (await loc.count().catch(() => 0) > 0) return loc.first();
+        } catch (e) {}
+      } else if (sel.strategy === 'role') {
+        try {
+          const loc = page.getByRole(sel.value, sel.options || {});
+          if (await loc.count().catch(() => 0) > 0) return loc.first();
+        } catch (e) {}
+      } else if (sel.strategy === 'data_testid') {
+        try {
+          const loc = page.locator(`[data-testid="${sel.value}"]`);
+          if (await loc.count().catch(() => 0) > 0) return loc.first();
+        } catch (e) {}
+      } else if (sel.strategy === 'coordinates') {
+        continue; // handled by caller
+      } else if (sel.strategy === 'xpath') {
+        try {
+          const loc = page.locator(`xpath=${sel.value}`);
+          if (await loc.count().catch(() => 0) > 0) return loc.first();
+        } catch (e) {}
+      } else {
+        try {
+          const loc = page.locator(sel.value);
+          if (await loc.count().catch(() => 0) > 0) return loc.first();
+        } catch (e) {}
+      }
+    }
+    return null;
+  }
+
+  _hasCoordinates(chain) {
+    if (!Array.isArray(chain)) return false;
+    return chain.some(s => s.strategy === 'coordinates' && typeof s.value === 'string' && s.value.includes(','));
+  }
+
+  _coordsFromChain(chain) {
+    const entry = Array.isArray(chain) ? chain.find(s => s.strategy === 'coordinates') : null;
+    if (!entry) return { x: 0, y: 0 };
+    const [x, y] = entry.value.split(',').map(v => parseFloat(v));
+    return { x: x || 0, y: y || 0 };
   }
 
   async _withStepTimeout(fn) {

@@ -8,9 +8,11 @@ const archiver = require('archiver');
 const multer = require('multer');
 
 const { ReplayEngine } = require('./engine/replay');
+const { createPlan } = require('./engine/planner');
 const db = require('./db');
 const { createIngestionContext, destroyIngestionContext } = require('./ingestion/ingestion');
 const { normalize } = require('./normalization/normalizer');
+const flowStore = require('./flows/flow_store');
 
 const activeReplays = new Map();
 const { generateTriageView, errorSignature } = require('./filter');
@@ -56,6 +58,13 @@ function ensureSessionRawDir(id) {
 
 function getEventsFile(id) {
     return path.join(getSessionDir(id), 'raw', 'events.ndjson');
+}
+
+// Flow plan cache helper
+function getFlowPlanPath(flowId) {
+    const dir = path.join(db.DATA_DIR, 'flows', flowId);
+    fs.mkdirSync(dir, { recursive: true });
+    return path.join(dir, 'latest_plan.json');
 }
 
 function appendEvents(sessionId, events) {
@@ -843,6 +852,170 @@ app.post('/sessions/:id/normalize', (req, res) => {
             group_count: result.group_count,
             step_type_summary: result.step_type_summary,
         });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ── Flow CRUD & Promotion (Step 3) ─────────────────────────────────────────
+
+/**
+ * POST /sessions/:id/promote
+ * Promote a normalized session into a Flow + FlowSteps
+ */
+app.post('/sessions/:id/promote', (req, res) => {
+    const { id } = req.params;
+    const session = db.getSession(id);
+    if (!session) return res.status(404).json({ error: 'Session not found' });
+
+    try {
+        const sessionDir = getSessionDir(id);
+        const { flow, steps } = flowStore.promoteFromSession(id, sessionDir, req.body || {});
+        res.status(201).json({ ok: true, flow, step_count: steps.length });
+    } catch (err) {
+        res.status(400).json({ error: err.message });
+    }
+});
+
+/**
+ * POST /flows
+ */
+app.post('/flows', (req, res) => {
+    try {
+        const payload = req.body || {};
+        const flow = payload.flow || payload;
+        const steps = payload.steps || [];
+        const result = flowStore.createFlow(flow, steps);
+        res.status(201).json({ ok: true, flow: result.flow, steps: result.steps });
+    } catch (err) {
+        res.status(400).json({ error: err.message });
+    }
+});
+
+/**
+ * GET /flows
+ */
+app.get('/flows', (req, res) => {
+    try {
+        const filters = {
+            module: req.query.module,
+            feature: req.query.feature,
+            priority: req.query.priority,
+            criticality: req.query.criticality,
+        };
+        const flows = flowStore.listFlows(filters);
+        res.json({ flows });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+/**
+ * GET /flows/:id
+ */
+app.get('/flows/:id', (req, res) => {
+    const result = flowStore.getFlow(req.params.id, { withSteps: true });
+    if (!result) return res.status(404).json({ error: 'Flow not found' });
+    res.json(result);
+});
+
+/**
+ * PATCH /flows/:id
+ */
+app.patch('/flows/:id', (req, res) => {
+    try {
+        const updated = flowStore.updateFlow(req.params.id, req.body || {});
+        res.json(updated);
+    } catch (err) {
+        res.status(err.message.includes('not found') ? 404 : 400).json({ error: err.message });
+    }
+});
+
+/**
+ * DELETE /flows/:id
+ */
+app.delete('/flows/:id', (req, res) => {
+    try {
+        flowStore.deleteFlow(req.params.id);
+        res.json({ ok: true });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ── Planner & Replay (Step 4) ───────────────────────────────────────────────
+
+/**
+ * POST /flows/:id/plan
+ * Generates and caches an execution plan for a flow
+ */
+app.post('/flows/:id/plan', (req, res) => {
+    const result = flowStore.getFlow(req.params.id, { withSteps: true });
+    if (!result) return res.status(404).json({ error: 'Flow not found' });
+    try {
+        const plan = createPlan(result.flow, result.steps);
+        const planPath = getFlowPlanPath(req.params.id);
+        fs.writeFileSync(planPath, JSON.stringify(plan, null, 2));
+        res.json({ ok: true, plan });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+/**
+ * GET /flows/:id/plan
+ */
+app.get('/flows/:id/plan', (req, res) => {
+    const { id } = req.params;
+    const result = flowStore.getFlow(id, { withSteps: true });
+    if (!result) return res.status(404).json({ error: 'Flow not found' });
+    const planPath = getFlowPlanPath(id);
+    try {
+        if (fs.existsSync(planPath) && !req.query.regenerate) {
+            const plan = JSON.parse(fs.readFileSync(planPath, 'utf8'));
+            return res.json({ plan, cached: true });
+        }
+        const plan = createPlan(result.flow, result.steps);
+        fs.writeFileSync(planPath, JSON.stringify(plan, null, 2));
+        res.json({ plan, cached: false });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+/**
+ * POST /flows/:id/run
+ * Generates plan (if needed) and executes via ReplayEngine
+ */
+app.post('/flows/:id/run', async (req, res) => {
+    const { id } = req.params;
+    const result = flowStore.getFlow(id, { withSteps: true });
+    if (!result) return res.status(404).json({ error: 'Flow not found' });
+
+    const planPath = getFlowPlanPath(id);
+    let plan;
+    try {
+        if (req.body?.regenerate || !fs.existsSync(planPath)) {
+            plan = createPlan(result.flow, result.steps);
+            fs.writeFileSync(planPath, JSON.stringify(plan, null, 2));
+        } else {
+            plan = JSON.parse(fs.readFileSync(planPath, 'utf8'));
+        }
+    } catch (err) {
+        return res.status(500).json({ error: err.message });
+    }
+
+    try {
+        const options = { startUrl: result.flow?.module_start_url, ...req.body };
+        const engine = new ReplayEngine([], options);
+        const report = await engine.runPlan(plan);
+
+        const runsDir = path.join(db.DATA_DIR, 'flows', id, 'runs');
+        fs.mkdirSync(runsDir, { recursive: true });
+        const ts = Date.now();
+        fs.writeFileSync(path.join(runsDir, `${ts}.json`), JSON.stringify(report, null, 2));
+
+        res.json({ report });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }

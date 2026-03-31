@@ -71,6 +71,40 @@ async function initDb() {
     CREATE INDEX IF NOT EXISTS idx_events_session ON events_index(session_id);
     CREATE INDEX IF NOT EXISTS idx_events_type ON events_index(session_id, type);
     CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at);
+
+    -- Flows (Step 3)
+    CREATE TABLE IF NOT EXISTS flows (
+      flow_id           TEXT PRIMARY KEY,
+      flow_name         TEXT NOT NULL,
+      module            TEXT,
+      feature           TEXT,
+      priority          TEXT DEFAULT 'medium',
+      criticality       TEXT DEFAULT 'normal',
+      tags              TEXT DEFAULT '[]',
+      owner             TEXT,
+      version           INTEGER DEFAULT 1,
+      created_at        INTEGER NOT NULL,
+      updated_at        INTEGER NOT NULL,
+      source_session_id TEXT,
+      description       TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS flow_steps (
+      step_id           TEXT PRIMARY KEY,
+      flow_id           TEXT NOT NULL REFERENCES flows(flow_id) ON DELETE CASCADE,
+      step_index        INTEGER NOT NULL,
+      step_name         TEXT,
+      intent            TEXT,
+      step_type         TEXT NOT NULL,
+      selectors         TEXT DEFAULT '[]',
+      expected_outcome  TEXT,
+      assertions        TEXT DEFAULT '[]',
+      fallback_strategy TEXT,
+      wait_strategy     TEXT,
+      meta              TEXT DEFAULT '{}'
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_flow_steps_flow ON flow_steps(flow_id);
   `);
 
   // Migrate existing DB if necessary
@@ -84,6 +118,8 @@ async function initDb() {
   try { db.run("ALTER TABLE events_index ADD COLUMN event_id TEXT"); } catch (e) {}
   try { db.run("ALTER TABLE events_index ADD COLUMN schema_version TEXT"); } catch (e) {}
   try { db.run("ALTER TABLE events_index ADD COLUMN correlation_id TEXT"); } catch (e) {}
+  // Flow schema migrations (idempotent)
+  try { db.run("ALTER TABLE flows ADD COLUMN description TEXT"); } catch (e) {}
 
   persistDb();
   console.log('[DB] SQLite initialized at', DB_PATH);
@@ -112,6 +148,15 @@ function queryAll(sql, params = []) {
 function queryOne(sql, params = []) {
   const rows = queryAll(sql, params);
   return rows[0] || null;
+}
+
+// Safe JSON parse helper with fallback
+function _safeParseJson(str, fallback) {
+  try {
+    return typeof str === 'string' ? JSON.parse(str) : str ?? fallback;
+  } catch {
+    return fallback;
+  }
 }
 
 module.exports = {
@@ -190,6 +235,113 @@ module.exports = {
       WHERE rn = 1
       ORDER BY created_at DESC
     `);
+  },
+
+  // ── Flow CRUD ──────────────────────────────────────────────────────────
+  createFlow(flow, steps = []) {
+    if (!flow || !flow.flow_id) throw new Error('flow.flow_id is required');
+
+    db.run(
+      `INSERT INTO flows (flow_id, flow_name, module, feature, priority, criticality, tags, owner, version, created_at, updated_at, source_session_id, description)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      , [
+        flow.flow_id,
+        flow.flow_name,
+        flow.module || null,
+        flow.feature || null,
+        flow.priority || 'medium',
+        flow.criticality || 'normal',
+        JSON.stringify(flow.tags || []),
+        flow.owner || null,
+        flow.version || 1,
+        flow.created_at || Date.now(),
+        flow.updated_at || Date.now(),
+        flow.source_session_id || null,
+        flow.description || null,
+      ]
+    );
+
+    const stmt = db.prepare(`INSERT INTO flow_steps (step_id, flow_id, step_index, step_name, intent, step_type, selectors, expected_outcome, assertions, fallback_strategy, wait_strategy, meta)
+                              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+    for (const s of steps) {
+      stmt.run([
+        s.step_id,
+        flow.flow_id,
+        s.step_index,
+        s.step_name || null,
+        s.intent || null,
+        s.step_type,
+        JSON.stringify(s.selectors || []),
+        s.expected_outcome || null,
+        JSON.stringify(s.assertions || []),
+        s.fallback_strategy || null,
+        s.wait_strategy ? JSON.stringify(s.wait_strategy) : null,
+        JSON.stringify(s.meta || {}),
+      ]);
+    }
+    stmt.free();
+    persistDb();
+  },
+
+  listFlows(filters = {}) {
+    const clauses = [];
+    const params = [];
+    if (filters.module) { clauses.push('module = ?'); params.push(filters.module); }
+    if (filters.feature) { clauses.push('feature = ?'); params.push(filters.feature); }
+    if (filters.priority) { clauses.push('priority = ?'); params.push(filters.priority); }
+    if (filters.criticality) { clauses.push('criticality = ?'); params.push(filters.criticality); }
+    const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+    return queryAll(`SELECT * FROM flows ${where} ORDER BY updated_at DESC`, params)
+      .map(f => ({ ...f, tags: _safeParseJson(f.tags, []) }));
+  },
+
+  getFlow(flowId, { withSteps = false } = {}) {
+    const flow = queryOne('SELECT * FROM flows WHERE flow_id = ?', [flowId]);
+    if (!flow) return null;
+    flow.tags = _safeParseJson(flow.tags, []);
+    if (!withSteps) return flow;
+    const steps = queryAll('SELECT * FROM flow_steps WHERE flow_id = ? ORDER BY step_index ASC', [flowId])
+      .map(s => ({
+        ...s,
+        selectors: _safeParseJson(s.selectors, []),
+        assertions: _safeParseJson(s.assertions, []),
+        wait_strategy: _safeParseJson(s.wait_strategy, s.wait_strategy),
+        meta: _safeParseJson(s.meta, {}),
+      }));
+    return { flow, steps };
+  },
+
+  updateFlow(flowId, patch = {}) {
+    const flow = queryOne('SELECT * FROM flows WHERE flow_id = ?', [flowId]);
+    if (!flow) throw new Error('Flow not found');
+    const nextVersion = (flow.version || 1) + 1;
+    const updatedAt = Date.now();
+
+    db.run(
+      `UPDATE flows SET flow_name = ?, module = ?, feature = ?, priority = ?, criticality = ?, tags = ?, owner = ?, version = ?, updated_at = ?, description = ?
+       WHERE flow_id = ?`,
+      [
+        patch.flow_name ?? flow.flow_name,
+        patch.module ?? flow.module,
+        patch.feature ?? flow.feature,
+        patch.priority ?? flow.priority,
+        patch.criticality ?? flow.criticality,
+        JSON.stringify(patch.tags ?? _safeParseJson(flow.tags, [])),
+        patch.owner ?? flow.owner,
+        nextVersion,
+        updatedAt,
+        patch.description ?? flow.description,
+        flowId,
+      ]
+    );
+    persistDb();
+    return nextVersion;
+  },
+
+  deleteFlow(flowId) {
+    db.run('DELETE FROM flow_steps WHERE flow_id = ?', [flowId]);
+    db.run('DELETE FROM flows WHERE flow_id = ?', [flowId]);
+    persistDb();
   },
 
   /**
