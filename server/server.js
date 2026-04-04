@@ -9,6 +9,7 @@ const multer = require('multer');
 
 const { ReplayEngine } = require('./engine/replay');
 const { createPlan } = require('./engine/planner');
+const { attachClusters } = require('./engine/failure_clusterer');
 const db = require('./db');
 const { createIngestionContext, destroyIngestionContext } = require('./ingestion/ingestion');
 const { normalize } = require('./normalization/normalizer');
@@ -983,6 +984,64 @@ app.get('/flows/:id/plan', (req, res) => {
     }
 });
 
+// ── Runs & Failures (Step 7/9) ─────────────────────────────────────────────
+
+app.get('/runs', (req, res) => {
+    try {
+        const runs = db.listRuns({ flow_id: req.query.flow_id, release_id: req.query.release_id, limit: parseInt(req.query.limit) || 50, offset: parseInt(req.query.offset) || 0 });
+        res.json({ runs });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.get('/runs/:id', (req, res) => {
+    const run = db.getRun(req.params.id, { withSteps: true });
+    if (!run) return res.status(404).json({ error: 'Run not found' });
+    res.json(run);
+});
+
+app.get('/failures', (req, res) => {
+    try {
+        const clusters = db.listFailureClusters({ limit: parseInt(req.query.limit) || 50, offset: parseInt(req.query.offset) || 0 });
+        res.json({ clusters });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.get('/failures/:id', (req, res) => {
+    const cluster = db.getFailureCluster(req.params.id);
+    if (!cluster) return res.status(404).json({ error: 'Not found' });
+    res.json({ cluster });
+});
+
+// ── Releases (Step 8) ──────────────────────────────────────────────────────
+
+app.post('/releases', (req, res) => {
+    try {
+        const rid = db.createRelease(req.body || {});
+        res.status(201).json({ release_id: rid });
+    } catch (err) {
+        res.status(400).json({ error: err.message });
+    }
+});
+
+app.get('/releases', (req, res) => {
+    try {
+        const releases = db.listReleases({ limit: parseInt(req.query.limit) || 50, offset: parseInt(req.query.offset) || 0 });
+        res.json({ releases });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.get('/releases/:id', (req, res) => {
+    const release = db.getRelease(req.params.id);
+    if (!release) return res.status(404).json({ error: 'Not found' });
+    res.json({ release });
+});
+
 /**
  * POST /flows/:id/run
  * Generates plan (if needed) and executes via ReplayEngine
@@ -1006,16 +1065,44 @@ app.post('/flows/:id/run', async (req, res) => {
     }
 
     try {
+        const runId = uuidv4();
+        db.createRun({ run_id: runId, flow_id: id, flow_version: result.flow.version, release_id: req.body?.release_id, started_at: Date.now() });
+
         const options = { startUrl: result.flow?.module_start_url, ...req.body };
         const engine = new ReplayEngine([], options);
         const report = await engine.runPlan(plan);
 
+        // Enrich run steps and cluster failures
+        const rawSteps = report.steps || [];
+        const runSteps = rawSteps.map((s, idx) => ({
+            run_step_id: uuidv4(),
+            step_index: s.index || idx + 1,
+            step_type: s.step_type,
+            status: s.status,
+            retry_count: Math.max(0, (s.attempts || 1) - 1),
+            assertion_failures: (s.assertions || []).filter(a => a.status === 'failed'),
+            duration_ms: s.duration_ms,
+            label: s.label || null,
+            associated_network_failures: s.associated_network_failures || [],
+            error: s.error,
+            selector: s.selector,
+        }));
+
+        const { stepReports, clusterCounts } = attachClusters(runSteps, db);
+        db.insertRunSteps(runId, stepReports);
+
+        const passed = report.summary?.passed || 0;
+        const total = report.summary?.total_steps || runSteps.length || 1;
+        const score = total > 0 ? passed / total : 0;
+
+        db.updateRun(runId, { status: 'done', finished_at: Date.now(), score, cluster_counts: clusterCounts });
+
         const runsDir = path.join(db.DATA_DIR, 'flows', id, 'runs');
         fs.mkdirSync(runsDir, { recursive: true });
         const ts = Date.now();
-        fs.writeFileSync(path.join(runsDir, `${ts}.json`), JSON.stringify(report, null, 2));
+        fs.writeFileSync(path.join(runsDir, `${ts}.json`), JSON.stringify({ run_id: runId, report }, null, 2));
 
-        res.json({ report });
+        res.json({ run_id: runId, report, cluster_counts: clusterCounts });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }

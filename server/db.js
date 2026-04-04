@@ -3,6 +3,7 @@
  * Persists to disk manually after each write.
  */
 const initSqlJs = require('sql.js');
+const { v4: uuidv4 } = require('uuid');
 const path = require('path');
 const os = require('os');
 const fs = require('fs');
@@ -105,6 +106,62 @@ async function initDb() {
     );
 
     CREATE INDEX IF NOT EXISTS idx_flow_steps_flow ON flow_steps(flow_id);
+
+    -- Runs & failure intelligence (Step 7/8/9)
+    CREATE TABLE IF NOT EXISTS runs (
+      run_id        TEXT PRIMARY KEY,
+      flow_id       TEXT NOT NULL,
+      flow_version  INTEGER,
+      release_id    TEXT,
+      started_at    INTEGER NOT NULL,
+      finished_at   INTEGER,
+      status        TEXT DEFAULT 'running',
+      score         REAL,
+      cluster_counts TEXT DEFAULT '{}'
+    );
+
+    CREATE TABLE IF NOT EXISTS run_steps (
+      run_step_id   TEXT PRIMARY KEY,
+      run_id        TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+      step_index    INTEGER NOT NULL,
+      step_type     TEXT,
+      status        TEXT,
+      retry_count   INTEGER DEFAULT 0,
+      assertion_failures TEXT DEFAULT '[]',
+      evidence_path TEXT,
+      cluster_id    TEXT,
+      duration_ms   INTEGER,
+      label         TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS failure_clusters (
+      cluster_id    TEXT PRIMARY KEY,
+      signature     TEXT NOT NULL UNIQUE,
+      failure_class TEXT,
+      count         INTEGER DEFAULT 1,
+      first_seen    INTEGER NOT NULL,
+      last_seen     INTEGER NOT NULL,
+      exemplar_run_step_id TEXT,
+      label         TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS modules (
+      module_id TEXT PRIMARY KEY,
+      name      TEXT UNIQUE
+    );
+
+    CREATE TABLE IF NOT EXISTS releases (
+      release_id   TEXT PRIMARY KEY,
+      version      TEXT,
+      created_at   INTEGER NOT NULL,
+      status       TEXT DEFAULT 'created',
+      modules      TEXT DEFAULT '[]',
+      risk_score   REAL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_runs_flow ON runs(flow_id);
+    CREATE INDEX IF NOT EXISTS idx_runs_release ON runs(release_id);
+    CREATE INDEX IF NOT EXISTS idx_failure_signature ON failure_clusters(signature);
   `);
 
   // Migrate existing DB if necessary
@@ -342,6 +399,141 @@ module.exports = {
     db.run('DELETE FROM flow_steps WHERE flow_id = ?', [flowId]);
     db.run('DELETE FROM flows WHERE flow_id = ?', [flowId]);
     persistDb();
+  },
+
+  // ── Runs & failure clusters ─────────────────────────────────────────────
+  createRun(run) {
+    const id = run.run_id || uuidv4();
+    db.run(
+      `INSERT INTO runs (run_id, flow_id, flow_version, release_id, started_at, status, score, cluster_counts)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      , [
+        id,
+        run.flow_id,
+        run.flow_version || 1,
+        run.release_id || null,
+        run.started_at || Date.now(),
+        run.status || 'running',
+        run.score || null,
+        JSON.stringify(run.cluster_counts || {}),
+      ]
+    );
+    persistDb();
+    return id;
+  },
+
+  updateRun(runId, patch = {}) {
+    const run = queryOne('SELECT * FROM runs WHERE run_id = ?', [runId]);
+    if (!run) throw new Error('Run not found');
+    db.run(
+      `UPDATE runs SET flow_id = ?, flow_version = ?, release_id = ?, started_at = ?, finished_at = ?, status = ?, score = ?, cluster_counts = ?
+       WHERE run_id = ?`,
+      [
+        patch.flow_id ?? run.flow_id,
+        patch.flow_version ?? run.flow_version,
+        patch.release_id ?? run.release_id,
+        patch.started_at ?? run.started_at,
+        patch.finished_at ?? run.finished_at ?? null,
+        patch.status ?? run.status,
+        patch.score ?? run.score,
+        JSON.stringify(patch.cluster_counts ?? _safeParseJson(run.cluster_counts, {})),
+        runId,
+      ]
+    );
+    persistDb();
+  },
+
+  insertRunSteps(runId, steps = []) {
+    const stmt = db.prepare(`INSERT INTO run_steps (run_step_id, run_id, step_index, step_type, status, retry_count, assertion_failures, evidence_path, cluster_id, duration_ms, label)
+                              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+    for (const s of steps) {
+      stmt.run([
+        s.run_step_id || uuidv4(),
+        runId,
+        s.step_index,
+        s.step_type || null,
+        s.status || null,
+        s.retry_count || 0,
+        JSON.stringify(s.assertion_failures || []),
+        s.evidence_path || null,
+        s.cluster_id || null,
+        s.duration_ms || null,
+        s.label || null,
+      ]);
+    }
+    stmt.free();
+    persistDb();
+  },
+
+  listRuns({ flow_id, release_id, limit = 50, offset = 0 } = {}) {
+    const clauses = [];
+    const params = [];
+    if (flow_id) { clauses.push('flow_id = ?'); params.push(flow_id); }
+    if (release_id) { clauses.push('release_id = ?'); params.push(release_id); }
+    const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+    return queryAll(`SELECT * FROM runs ${where} ORDER BY started_at DESC LIMIT ? OFFSET ?`, [...params, limit, offset])
+      .map(r => ({ ...r, cluster_counts: _safeParseJson(r.cluster_counts, {}) }));
+  },
+
+  getRun(runId, { withSteps = false } = {}) {
+    const run = queryOne('SELECT * FROM runs WHERE run_id = ?', [runId]);
+    if (!run) return null;
+    run.cluster_counts = _safeParseJson(run.cluster_counts, {});
+    if (!withSteps) return run;
+    const steps = queryAll('SELECT * FROM run_steps WHERE run_id = ? ORDER BY step_index ASC', [runId])
+      .map(s => ({ ...s, assertion_failures: _safeParseJson(s.assertion_failures, []) }));
+    return { run, steps };
+  },
+
+  upsertFailureCluster({ signature, failure_class, exemplar_run_step_id, label }) {
+    let cluster = queryOne('SELECT * FROM failure_clusters WHERE signature = ?', [signature]);
+    const now = Date.now();
+    if (cluster) {
+      db.run('UPDATE failure_clusters SET count = ?, last_seen = ?, failure_class = COALESCE(?, failure_class), exemplar_run_step_id = COALESCE(?, exemplar_run_step_id) WHERE signature = ?',
+        [cluster.count + 1, now, failure_class || null, exemplar_run_step_id || null, signature]);
+      cluster = queryOne('SELECT * FROM failure_clusters WHERE signature = ?', [signature]);
+    } else {
+      const id = uuidv4();
+      db.run(
+        `INSERT INTO failure_clusters (cluster_id, signature, failure_class, count, first_seen, last_seen, exemplar_run_step_id, label)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+        , [id, signature, failure_class || null, 1, now, now, exemplar_run_step_id || null, label || null]);
+      cluster = queryOne('SELECT * FROM failure_clusters WHERE cluster_id = ?', [id]);
+    }
+    persistDb();
+    return cluster;
+  },
+
+  listFailureClusters({ limit = 50, offset = 0 } = {}) {
+    return queryAll('SELECT * FROM failure_clusters ORDER BY last_seen DESC LIMIT ? OFFSET ?', [limit, offset]);
+  },
+
+  getFailureCluster(id) {
+    return queryOne('SELECT * FROM failure_clusters WHERE cluster_id = ? OR signature = ?', [id, id]);
+  },
+
+  // ── Releases / modules ───────────────────────────────────────────────────
+  createRelease(release) {
+    const rid = release.release_id || uuidv4();
+    db.run(
+      `INSERT INTO releases (release_id, version, created_at, status, modules, risk_score)
+       VALUES (?, ?, ?, ?, ?, ?)`
+      , [rid, release.version || null, release.created_at || Date.now(), release.status || 'created', JSON.stringify(release.modules || []), release.risk_score || null]
+    );
+    persistDb();
+    return rid;
+  },
+
+  listReleases({ limit = 50, offset = 0 } = {}) {
+    return queryAll('SELECT * FROM releases ORDER BY created_at DESC LIMIT ? OFFSET ?', [limit, offset])
+      .map(r => ({ ...r, modules: _safeParseJson(r.modules, []) }));
+  },
+
+  getRelease(releaseId) {
+    const r = queryOne('SELECT * FROM releases WHERE release_id = ?', [releaseId]);
+    if (!r) return null;
+    r.modules = _safeParseJson(r.modules, []);
+    return r;
   },
 
   /**

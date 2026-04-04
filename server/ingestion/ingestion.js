@@ -36,6 +36,7 @@ class IngestionContext {
         this.eventsFile = path.join(sessionDir, 'raw', 'events.ndjson');
         this.db         = db;
         this.seenIds    = new Set(); // per-session dedup set
+        this.lastEventTs = {}; // per-type throttle (noise filter)
         this._ensureRawDir(sessionDir);
     }
 
@@ -71,7 +72,19 @@ class IngestionContext {
                 continue;
             }
 
-            // 3. Dedup by event_id
+            // 3a. Noise filter for high-chatter events (mousemove/scroll within 200ms)
+            const evtType = enriched.event_type || enriched.type;
+            const ts = enriched.timestamp || enriched.ts_epoch_ms || Date.now();
+            if (evtType && (evtType === 'action.mousemove' || evtType === 'action.scroll')) {
+                const lastTs = this.lastEventTs[evtType] || 0;
+                if (ts - lastTs < 200) {
+                    result.rejected++;
+                    continue;
+                }
+                this.lastEventTs[evtType] = ts;
+            }
+
+            // 3b. Dedup by event_id
             if (this.seenIds.has(enriched.event_id)) {
                 result.duplicates++;
                 continue;

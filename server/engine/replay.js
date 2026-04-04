@@ -227,9 +227,12 @@ class ReplayEngine {
           index: i + 1,
           step_type: pStep.step_type,
           label: pStep.label,
+          selector: (pStep.selector_chain || [])[0]?.value || null,
           status: 'failed',
           duration_ms: 0,
           attempts: 0,
+          associated_logs: [],
+          associated_network_failures: [],
         };
         this.report.steps.push(stepReport);
 
