@@ -9,7 +9,7 @@ class ReplayEngine {
     this.events = events || [];
     this.options = options;
     this.profileDir = options.profileDir || path.join(os.homedir(), '.qa-automation-profile');
-    this.cdpUrl = 'http://localhost:9223';
+    this.cdpUrl = options.cdpUrl || 'http://127.0.0.1:9223';
     this.retries = options.retries || 2;
     this.timeouts = {
       elementVisible: 5000,
@@ -31,7 +31,18 @@ class ReplayEngine {
     this.report = {
       summary: { total_steps: 0, passed: 0, failed: 0 },
       failures: { ui: [], network: [], js_errors: [] },
-      steps: []
+      steps: [],
+      timings: {
+        browser_start_time_ms: 0,
+        profile_load_time_ms: 0,
+        navigation_time_ms: 0,
+        selector_resolution_time_ms: 0,
+        wait_time_ms: 0,
+        assertion_time_ms: 0,
+        artifact_capture_time_ms: 0,
+        report_generation_time_ms: 0,
+        total_run_time_ms: 0,
+      },
     };
   }
 
@@ -46,30 +57,99 @@ class ReplayEngine {
   }
 
   async _ensureBrowser() {
+    const cdpUrls = [
+      this.cdpUrl,
+      this.cdpUrl.includes('127.0.0.1') ? 'http://localhost:9223' : 'http://127.0.0.1:9223',
+    ];
+
+    const tryConnect = async () => {
+      let lastErr = null;
+      for (const url of cdpUrls) {
+        try {
+          this.browser = await chromium.connectOverCDP(url);
+          this.cdpUrl = url;
+          return true;
+        } catch (err) {
+          lastErr = err;
+        }
+      }
+      throw lastErr || new Error('CDP connection failed');
+    };
+
     try {
-      this.browser = await chromium.connectOverCDP(this.cdpUrl);
+      await tryConnect();
       return;
     } catch (e) {
       const chromeArgs = [
         `--user-data-dir=${this.profileDir}`,
-        `--remote-debugging-port=9223`,
+        '--remote-debugging-address=127.0.0.1',
+        '--remote-debugging-port=9223',
         '--no-first-run',
         '--no-default-browser-check',
         'about:blank'
       ];
-      const chromeProcess = spawn('google-chrome', chromeArgs, { detached: true, stdio: 'ignore' });
-      chromeProcess.unref();
-      await new Promise(r => setTimeout(r, 2000));
-      this.browser = await chromium.connectOverCDP(this.cdpUrl);
+      const candidates = [
+        this.options.chromeExecutablePath,
+        '/opt/google/chrome/chrome',
+        '/usr/bin/google-chrome',
+        '/usr/bin/google-chrome-stable',
+        '/usr/bin/chromium',
+        '/usr/bin/chromium-browser',
+        'google-chrome',
+        'google-chrome-stable',
+        'chromium',
+        'chromium-browser',
+      ].filter(Boolean);
+
+      let launched = false;
+      let launchError = null;
+      for (const bin of candidates) {
+        try {
+          await new Promise((resolve, reject) => {
+            const proc = spawn(bin, chromeArgs, { detached: true, stdio: 'ignore' });
+            proc.once('error', reject);
+            proc.once('spawn', () => {
+              proc.unref();
+              resolve();
+            });
+          });
+          launched = true;
+          break;
+        } catch (err) {
+          launchError = err;
+        }
+      }
+
+      if (!launched) {
+        throw new Error(`Unable to launch Chrome for replay: ${launchError ? launchError.message : 'no executable found'}`);
+      }
+
+      let lastConnectError = null;
+      for (let i = 0; i < 12; i++) {
+        try {
+          await tryConnect();
+          return;
+        } catch (err) {
+          lastConnectError = err;
+          await new Promise(r => setTimeout(r, 1000));
+        }
+      }
+
+      throw new Error(`Chrome started but CDP connect failed on ${this.cdpUrl}: ${lastConnectError ? lastConnectError.message : 'unknown error'}`);
     }
   }
 
   async run() {
+    const runStart = Date.now();
     try {
+      const tBrowser = Date.now();
       await this._ensureBrowser();
+      this.report.timings.browser_start_time_ms = Date.now() - tBrowser;
       const contexts = this.browser.contexts();
       const context = contexts.length > 0 ? contexts[0] : await this.browser.newContext();
+      const tProfile = Date.now();
       this.page = await context.newPage();
+      this.report.timings.profile_load_time_ms = Date.now() - tProfile;
 
       // Kill any rogue pages left over from previous aborted replays in the persistent Chrome process
       for (const p of context.pages()) {
@@ -126,8 +206,10 @@ class ReplayEngine {
       // Handle missing initial navigation
       if (steps.length > 0 && steps[0].type !== 'action.navigation' && this.options.startUrl) {
         try { 
+          const tNav = Date.now();
           await this.page.goto(this.options.startUrl, { waitUntil: 'domcontentloaded', timeout: this.timeouts.initialNavigation }); 
           await this._waitForNetworkSettled(this.page, 15000, 500);
+          this.report.timings.navigation_time_ms += Date.now() - tNav;
         } catch (e) {}
       }
 
@@ -141,6 +223,16 @@ class ReplayEngine {
         status: 'failed',
         duration_ms: 0,
         attempts: 0,
+        retry_count: 0,
+        step_start_at: null,
+        step_end_at: null,
+        step_duration_ms: 0,
+        selector_attempt_count: 0,
+        selector_resolution_time_ms: 0,
+        wait_reason: null,
+        wait_duration_ms: 0,
+        assertion_duration_ms: 0,
+        artifact_duration_ms: 0,
         associated_logs: [],
         associated_network_failures: []
       };
@@ -154,8 +246,13 @@ class ReplayEngine {
 
       const startTime = Date.now();
       const outcome = await this._runStepWithRetry(steps[i], this.page, i + 1, i);
-      stepReport.duration_ms = Date.now() - startTime;
+      const endTime = Date.now();
+      stepReport.step_start_at = startTime;
+      stepReport.step_end_at = endTime;
+      stepReport.step_duration_ms = endTime - startTime;
+      stepReport.duration_ms = endTime - startTime;
       stepReport.attempts = outcome.attempts || (outcome.ok ? 1 : this.retries + 1);
+      stepReport.retry_count = Math.max(0, stepReport.attempts - 1);
 
       if (outcome.ok) {
         this.report.summary.passed++;
@@ -182,6 +279,9 @@ class ReplayEngine {
         this.report.failures.ui.push({ step_index: this.activeStepIndex, type: 'engine_crash', message: err.message });
       }
     } finally {
+      const finalizeStart = Date.now();
+      this.report.timings.total_run_time_ms = finalizeStart - runStart;
+      this.report.timings.report_generation_time_ms = Date.now() - finalizeStart;
       if (this.page && !this.page.isClosed()) {
         try { await this.page.close({ runBeforeUnload: false }); } catch (e) {}
       }
@@ -203,13 +303,30 @@ class ReplayEngine {
       summary: { total_steps: plan.steps.length, passed: 0, failed: 0 },
       failures: { ui: [], network: [], js_errors: [] },
       steps: [],
+      timings: {
+        browser_start_time_ms: 0,
+        profile_load_time_ms: 0,
+        navigation_time_ms: 0,
+        selector_resolution_time_ms: 0,
+        wait_time_ms: 0,
+        assertion_time_ms: 0,
+        artifact_capture_time_ms: 0,
+        report_generation_time_ms: 0,
+        total_run_time_ms: 0,
+      },
     };
 
+    const runStart = Date.now();
     try {
+      const tBrowser = Date.now();
       await this._ensureBrowser();
+      this.report.timings.browser_start_time_ms = Date.now() - tBrowser;
+
       const contexts = this.browser.contexts();
       const context = contexts.length > 0 ? contexts[0] : await this.browser.newContext();
+      const tProfile = Date.now();
       this.page = await context.newPage();
+      this.report.timings.profile_load_time_ms = Date.now() - tProfile;
 
       // Clean up stray pages
       for (const p of context.pages()) {
@@ -231,15 +348,34 @@ class ReplayEngine {
           status: 'failed',
           duration_ms: 0,
           attempts: 0,
+          retry_count: 0,
+          step_start_at: null,
+          step_end_at: null,
+          step_duration_ms: 0,
+          selector_attempt_count: 0,
+          selector_resolution_time_ms: 0,
+          wait_reason: null,
+          wait_duration_ms: 0,
+          assertion_duration_ms: 0,
+          artifact_duration_ms: 0,
           associated_logs: [],
           associated_network_failures: [],
         };
         this.report.steps.push(stepReport);
 
         const start = Date.now();
+        stepReport.step_start_at = start;
         const outcome = await this._runPlanStepWithRetry(pStep, this.page);
-        stepReport.duration_ms = Date.now() - start;
+        const end = Date.now();
+        stepReport.step_end_at = end;
+        stepReport.duration_ms = end - start;
         stepReport.attempts = outcome.attempts;
+        stepReport.selector_attempt_count = outcome.selector_attempt_count || stepReport.selector_attempt_count || 0;
+        stepReport.selector_resolution_time_ms = outcome.selector_resolution_time_ms || 0;
+        stepReport.wait_duration_ms = outcome.wait_duration_ms || 0;
+        stepReport.wait_reason = outcome.wait_reason || stepReport.wait_reason;
+        stepReport.retry_count = Math.max(0, stepReport.attempts - 1);
+        stepReport.step_duration_ms = stepReport.duration_ms;
 
         if (outcome.ok) {
           stepReport.status = 'passed';
@@ -254,7 +390,11 @@ class ReplayEngine {
 
         // Evaluate assertions after action completes
         if (Array.isArray(pStep.assertions) && pStep.assertions.length > 0) {
+          const tAssert = Date.now();
           const assertResult = await evaluateAssertions(pStep.assertions, { page: this.page, report: this.report });
+          const assertDur = Date.now() - tAssert;
+          stepReport.assertion_duration_ms = assertDur;
+          this.report.timings.assertion_time_ms += assertDur;
           stepReport.assertions = assertResult.results;
           const hardFailures = assertResult.failed.filter(f => !f.soft);
           if (hardFailures.length > 0 && stepReport.status === 'passed') {
@@ -268,6 +408,9 @@ class ReplayEngine {
     } catch (err) {
       this.report.failures.ui.push({ step_index: this.report.steps.length + 1, type: 'engine_crash', message: err.message });
     } finally {
+      const finalizeStart = Date.now();
+      this.report.timings.total_run_time_ms = finalizeStart - runStart;
+      this.report.timings.report_generation_time_ms = Date.now() - finalizeStart;
       if (this.page && !this.page.isClosed()) {
         try { await this.page.close({ runBeforeUnload: false }); } catch (e) {}
       }
@@ -518,10 +661,11 @@ class ReplayEngine {
    * For steps without correlated calls, we use a short load-state wait instead.
    */
   async _awaitNetworkPromises(page, stepIdx, networkPromises) {
+    const started = Date.now();
     if (!networkPromises || networkPromises.length === 0) {
       // No correlated network calls — ultra-short settle only
       try { await page.waitForTimeout(120); } catch (e) {}
-      return { matched: true, reason: 'no_network_expected' };
+      return { matched: true, reason: 'no_network_expected', duration_ms: Date.now() - started };
     }
 
     // Await all pre-registered response promises with a single overall timeout
@@ -533,14 +677,14 @@ class ReplayEngine {
     ]);
 
     if (results === null) {
-      return { matched: false, reason: 'network_timeout' };
+      return { matched: false, reason: 'network_timeout', duration_ms: Date.now() - started };
     }
 
     const anyMatched = Array.isArray(results) ? results.some(Boolean) : Boolean(results);
     if (!anyMatched) {
-      return { matched: false, reason: 'network_timeout' };
+      return { matched: false, reason: 'network_timeout', duration_ms: Date.now() - started };
     }
-    return { matched: true, reason: 'network_ok' };
+    return { matched: true, reason: 'network_ok', duration_ms: Date.now() - started };
   }
 
   /**
@@ -567,6 +711,7 @@ class ReplayEngine {
   }
 
   async _postActionSettle(page, opts = {}) {
+    const start = Date.now();
     if (opts.navigation) {
       try { await page.waitForLoadState('domcontentloaded'); } catch (e) {}
     }
@@ -579,6 +724,7 @@ class ReplayEngine {
     if (delay > 0) {
       try { await page.waitForTimeout(delay); } catch (e) {}
     }
+    return Date.now() - start;
   }
 
   _retriesForStep(step) {
@@ -610,10 +756,18 @@ class ReplayEngine {
     let attempt = 0;
     let lastError = null;
     const maxAttempts = Math.max(1, retryCfg.max_attempts || 1);
+    let selectorAttemptsAgg = 0;
+    let selectorResolutionMsAgg = 0;
+    let waitDurationAgg = 0;
+    let waitReasonFinal = (planStep.wait_layers || [])[0]?.type || planStep.wait_strategy?.type || 'none';
     while (attempt < maxAttempts) {
       try {
-        await this._withStepTimeout(() => this._executePlanStep(planStep, page));
-        return { ok: true, attempts: attempt + 1 };
+        const result = await this._withStepTimeout(() => this._executePlanStep(planStep, page));
+        selectorAttemptsAgg += result?.selector_attempt_count || 0;
+        selectorResolutionMsAgg += result?.selector_resolution_time_ms || 0;
+        waitDurationAgg += result?.wait_duration_ms || 0;
+        waitReasonFinal = result?.wait_reason || waitReasonFinal;
+        return { ok: true, attempts: attempt + 1, selector_attempt_count: selectorAttemptsAgg, selector_resolution_time_ms: selectorResolutionMsAgg, wait_duration_ms: waitDurationAgg, wait_reason: waitReasonFinal };
       } catch (err) {
         lastError = err;
         attempt++;
@@ -630,20 +784,63 @@ class ReplayEngine {
   }
 
   async _executePlanStep(step, page) {
-    const waitStrategy = step.wait_strategy || { type: 'none' };
     const selectorChain = step.selector_chain || [];
-    const meta = step;
+    const baseMeta = (step.meta && typeof step.meta === 'object') ? step.meta : {};
+    const meta = {
+      ...baseMeta,
+      url: step.url !== undefined ? step.url : baseMeta.url,
+      value: step.value !== undefined ? step.value : baseMeta.value,
+      key: step.key !== undefined ? step.key : baseMeta.key,
+      selected_value: step.selected_value !== undefined ? step.selected_value : baseMeta.selected_value,
+      selected_text: step.selected_text !== undefined ? step.selected_text : baseMeta.selected_text,
+      scroll_x: step.scroll_x !== undefined ? step.scroll_x : baseMeta.scroll_x,
+      scroll_y: step.scroll_y !== undefined ? step.scroll_y : baseMeta.scroll_y,
+    };
+    const waitStrategy = step.wait_strategy || { type: 'none' };
+    const stepTiming = {
+      selector_resolution_time_ms: 0,
+      wait_duration_ms: 0,
+      wait_reason: (step.wait_layers || [])[0]?.type || waitStrategy.type || 'none',
+      selector_attempt_count: 0,
+      wait_breakdown: [],
+      artifact_duration_ms: 0,
+    };
+
+    const addNavFromBreakdown = (breakdown = []) => {
+      const nav = Array.isArray(breakdown) ? breakdown.find(b => b.type === 'network_idle') : null;
+      if (nav && typeof nav.duration_ms === 'number') {
+        this.report.timings.navigation_time_ms += nav.duration_ms;
+      }
+    };
+
+    // Resolve locator once (timed) and get attempts
+    const resolved = await this._resolveLocatorTimed(page, selectorChain, meta);
+    stepTiming.selector_attempt_count = resolved.attempts;
+    stepTiming.selector_resolution_time_ms += resolved.duration_ms;
+    this.report.timings.selector_resolution_time_ms += resolved.duration_ms;
+
+    const recordWait = (dur, reason, breakdown = []) => {
+      stepTiming.wait_duration_ms += dur;
+      this.report.timings.wait_time_ms += dur;
+      if (reason) stepTiming.wait_reason = reason;
+      if (breakdown.length) stepTiming.wait_breakdown = breakdown;
+      addNavFromBreakdown(breakdown);
+    };
 
     switch (step.step_type) {
       case 'navigate': {
         if (meta.url) {
+          const tNav = Date.now();
           await page.goto(meta.url, { waitUntil: 'domcontentloaded', timeout: waitStrategy.max_ms || this.timeouts.navigation });
+          this.report.timings.navigation_time_ms += Date.now() - tNav;
         }
+        const tWait = Date.now();
         await this._waitLayers(page, step.wait_layers || [], waitStrategy);
-        return;
+        recordWait(Date.now() - tWait);
+        return stepTiming;
       }
       case 'click': {
-        const locator = await this._resolveLocatorFromChain(page, selectorChain, meta);
+        const locator = resolved.locator;
         if (locator) {
           await locator.click({ timeout: this.timeouts.click });
         } else if (this._hasCoordinates(selectorChain)) {
@@ -652,29 +849,38 @@ class ReplayEngine {
         } else {
           throw new Error('No clickable element found');
         }
-        await this._waitLayers(page, step.wait_layers || [], waitStrategy);
-        return;
+        const waitRes = await this._waitLayers(page, step.wait_layers || [], waitStrategy);
+        recordWait(waitRes.total, waitRes.dominant, waitRes.breakdown);
+        const net = waitRes.breakdown.find(b => b.type === 'network_idle');
+        if (net) this.report.timings.navigation_time_ms += net.duration_ms;
+        return stepTiming;
       }
       case 'fill_field': {
-        const locator = await this._resolveLocatorFromChain(page, selectorChain, meta);
+        const locator = resolved.locator;
         if (!locator) throw new Error('Field not found');
         await locator.fill(meta.value ?? '', { timeout: this.timeouts.elementVisible });
-        await this._waitLayers(page, step.wait_layers || [], waitStrategy);
-        return;
+        const waitRes = await this._waitLayers(page, step.wait_layers || [], waitStrategy);
+        recordWait(waitRes.total, waitRes.dominant, waitRes.breakdown);
+        return stepTiming;
       }
       case 'select_option': {
-        const locator = await this._resolveLocatorFromChain(page, selectorChain, meta);
+        const locator = resolved.locator;
         if (!locator) throw new Error('Select element not found');
         if (meta.selected_value) {
           await locator.selectOption({ value: meta.selected_value });
         } else if (meta.selected_text) {
           await locator.selectOption({ label: meta.selected_text });
         }
-        await this._waitLayers(page, step.wait_layers || [], waitStrategy);
-        return;
+        const waitRes = await this._waitLayers(page, step.wait_layers || [], waitStrategy);
+        recordWait(waitRes.total, waitRes.dominant, waitRes.breakdown);
+        return stepTiming;
       }
       case 'submit_form': {
+        const tSel = Date.now();
         const locator = await this._resolveLocatorFromChain(page, selectorChain, meta);
+        const selDur = Date.now() - tSel;
+        stepTiming.selector_resolution_time_ms += selDur;
+        this.report.timings.selector_resolution_time_ms += selDur;
         if (locator) {
           await locator.click({ timeout: this.timeouts.click });
         } else if (this._hasCoordinates(selectorChain)) {
@@ -683,14 +889,18 @@ class ReplayEngine {
         } else {
           await page.keyboard.press('Enter');
         }
+        const tWait = Date.now();
         await this._waitLayers(page, step.wait_layers || [], waitStrategy);
-        return;
+        recordWait(Date.now() - tWait);
+        return stepTiming;
       }
       case 'press_key': {
         if (!meta.key) throw new Error('key is required');
         await page.keyboard.press(meta.key);
+        const tWait = Date.now();
         await this._waitLayers(page, step.wait_layers || [], waitStrategy);
-        return;
+        recordWait(Date.now() - tWait);
+        return stepTiming;
       }
       case 'scroll': {
         if (typeof meta.scroll_y === 'number' || typeof meta.scroll_x === 'number') {
@@ -698,20 +908,24 @@ class ReplayEngine {
         } else {
           await page.mouse.wheel(0, 500);
         }
+        const tWait = Date.now();
         await this._waitLayers(page, step.wait_layers || [], waitStrategy);
-        return;
+        recordWait(Date.now() - tWait);
+        return stepTiming;
       }
       case 'observe_toast': {
         const locator = await this._resolveLocatorFromChain(page, selectorChain, meta);
         if (locator) {
           await locator.waitFor({ state: 'visible', timeout: waitStrategy.max_ms || 5000 });
         } else {
+          const tWait = Date.now();
           await this._waitLayers(page, step.wait_layers || [], waitStrategy);
+          recordWait(Date.now() - tWait);
         }
-        return;
+        return stepTiming;
       }
       default:
-        return; // no-op for raw_action or unknown
+        return stepTiming; // no-op for raw_action or unknown
     }
   }
 
@@ -736,11 +950,17 @@ class ReplayEngine {
   }
 
   async _waitLayers(page, layers = [], fallbackStrategy) {
+    const breakdown = [];
     if (!Array.isArray(layers) || layers.length === 0) {
-      return this._waitStrategy(page, fallbackStrategy || { type: 'none' });
+      const start = Date.now();
+      await this._waitStrategy(page, fallbackStrategy || { type: 'none' });
+      const dur = Date.now() - start;
+      breakdown.push({ type: fallbackStrategy?.type || 'none', duration_ms: dur });
+      return { total: dur, dominant: breakdown[0].type, breakdown };
     }
     for (const layer of layers) {
       if (!layer || this.aborted) break;
+      const start = Date.now();
       switch (layer.type) {
         case 'dom_ready':
           try { await page.waitForLoadState('domcontentloaded', { timeout: layer.timeout_ms || 5000 }); } catch (e) {}
@@ -760,13 +980,36 @@ class ReplayEngine {
         default:
           break;
       }
+      breakdown.push({ type: layer.type || 'unknown', duration_ms: Date.now() - start });
     }
+    const total = breakdown.reduce((s, b) => s + b.duration_ms, 0);
+    const dominant = breakdown.reduce((max, b) => b.duration_ms > (max?.duration_ms || 0) ? b : max, null)?.type || (fallbackStrategy?.type || 'none');
+    return { total, dominant, breakdown };
   }
 
-  async _resolveLocatorFromChain(page, chain, meta) {
+  async _resolveLocatorTimed(page, chain, meta) {
+    const attempts = await this._resolveLocatorFromChain(page, chain, meta, { countOnly: true, returnAttempts: true }) || 0;
+    const start = Date.now();
+    const locator = await this._resolveLocatorFromChain(page, chain, meta);
+    const duration_ms = Date.now() - start;
+    return { locator, attempts, duration_ms };
+  }
+
+  _countSelectorStrategies(data) {
+    const strategies = Array.isArray(data?.selector_strategies) && data.selector_strategies.length > 0
+      ? data.selector_strategies
+      : data?.selector ? [data.selector] : [];
+    return strategies.filter(s => s && s !== 'body').length;
+  }
+
+  async _resolveLocatorFromChain(page, chain, meta, options = {}) {
     if (!Array.isArray(chain)) return null;
-    for (const sel of chain.sort((a, b) => (a.priority || 99) - (b.priority || 99))) {
+    let attempts = 0;
+    const sorted = chain.sort((a, b) => (a.priority || 99) - (b.priority || 99));
+    for (const sel of sorted) {
       if (!sel || !sel.value) continue;
+      attempts++;
+      if (options.countOnly) continue;
       if (sel.strategy === 'text') {
         const loc = page.getByText(sel.value, { exact: false });
         if (await loc.count().catch(() => 0) > 0) return loc.first();
@@ -799,6 +1042,7 @@ class ReplayEngine {
         } catch (e) {}
       }
     }
+    if (options.returnAttempts) return attempts;
     return null;
   }
 
@@ -830,6 +1074,22 @@ class ReplayEngine {
 
   async _executeStep(step, page, stepIndex, stepArrayIndex) {
     const data = step.data || {};
+    const stepReport = this.report.steps[stepIndex - 1] || null;
+    const recordSelector = (attempts, dur) => {
+      if (!stepReport) return;
+      stepReport.selector_attempt_count += attempts;
+      stepReport.selector_resolution_time_ms += dur;
+      this.report.timings.selector_resolution_time_ms += dur;
+    };
+    const recordWait = (dur, reason) => {
+      if (!stepReport) return;
+      stepReport.wait_duration_ms += dur;
+      if (!stepReport.wait_reason && reason) stepReport.wait_reason = reason;
+      this.report.timings.wait_time_ms += dur;
+      if (reason && reason.startsWith('network')) {
+        this.report.timings.navigation_time_ms += dur;
+      }
+    };
     try {
       // ── Navigation ─────────────────────────────────────────────────────────
       if (step.type === 'action.navigation') {
@@ -843,11 +1103,15 @@ class ReplayEngine {
 
           if (stepIndex === 1) {
             try {
+              const tNav = Date.now();
               await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: this.timeouts.initialNavigation });
               await this._waitForNetworkSettled(page, 15000, 500);
+              this.report.timings.navigation_time_ms += Date.now() - tNav;
             } catch (e) {}
         const netResult = await this._awaitNetworkPromises(page, stepArrayIndex, netPromises);
-        await this._postActionSettle(page, { navigation: true, hasNetwork: (netPromises?.length || 0) > 0 });
+        if (netResult?.duration_ms) recordWait(netResult.duration_ms, netResult.reason);
+        const settleDur = await this._postActionSettle(page, { navigation: true, hasNetwork: (netPromises?.length || 0) > 0 });
+        recordWait(settleDur, netResult?.reason || 'post_action_settle');
         if (netPromises.length > 0 && !netResult?.matched) {
           if (this.strictNetworkWait) {
             throw new Error(netResult?.reason || 'network wait failed');
@@ -860,7 +1124,9 @@ class ReplayEngine {
             // Let the click naturally navigate exactly as the user experienced it.
             try { await page.waitForTimeout(100); } catch(e){}
             const netResult = await this._awaitNetworkPromises(page, stepArrayIndex, netPromises);
-            await this._postActionSettle(page, { navigation: true, hasNetwork: (netPromises?.length || 0) > 0 });
+            if (netResult?.duration_ms) recordWait(netResult.duration_ms, netResult.reason);
+            const settleDur = await this._postActionSettle(page, { navigation: true, hasNetwork: (netPromises?.length || 0) > 0 });
+            recordWait(settleDur, netResult?.reason || 'post_action_settle');
             if (netPromises.length > 0 && !netResult?.matched) {
               if (this.strictNetworkWait) {
                 throw new Error(netResult?.reason || 'network wait failed');
@@ -876,7 +1142,9 @@ class ReplayEngine {
         // FIX: Set up response promises BEFORE clicking so we don't miss them
         const netPromises = this._buildResponsePromises(page, stepArrayIndex);
 
+        const selStart = Date.now();
         const locator = await this._resolveLocator(page, data);
+        recordSelector(this._countSelectorStrategies(data), Date.now() - selStart);
         if (locator) {
           try {
             await locator.waitFor({ state: 'visible', timeout: this.timeouts.elementVisible });
@@ -903,7 +1171,9 @@ class ReplayEngine {
         }
 
         const netResult = await this._awaitNetworkPromises(page, stepArrayIndex, netPromises);
-        await this._postActionSettle(page, { hasNetwork: (netPromises?.length || 0) > 0 });
+        if (netResult?.duration_ms) recordWait(netResult.duration_ms, netResult.reason);
+        const settleDur = await this._postActionSettle(page, { hasNetwork: (netPromises?.length || 0) > 0 });
+        recordWait(settleDur, netResult?.reason || 'post_action_settle');
         if (netPromises.length > 0 && !netResult?.matched) {
           if (this.strictNetworkWait) {
             throw new Error(netResult?.reason || 'network wait failed');
@@ -914,7 +1184,9 @@ class ReplayEngine {
 
       // ── Input ───────────────────────────────────────────────────────────────
       } else if (step.type === 'action.input') {
+        const selStart = Date.now();
         const locator = await this._resolveLocator(page, data);
+        recordSelector(this._countSelectorStrategies(data), Date.now() - selStart);
         if (locator) {
           await locator.waitFor({ state: 'visible', timeout: this.timeouts.elementVisible });
           // Clear field first, then fill with final value
@@ -924,12 +1196,15 @@ class ReplayEngine {
           const tried = (data.selector_strategies || (data.selector ? [data.selector] : [])).join(' | ');
           throw new Error(`Input element not found. Tried: ${tried || 'no selectors'}`);
         }
-        await this._postActionSettle(page, { hasNetwork: false });
+        const settleDur = await this._postActionSettle(page, { hasNetwork: false });
+        recordWait(settleDur, 'post_action_settle');
 
       // ── Select Dropdown ─────────────────────────────────────────────────────
       } else if (step.type === 'action.select') {
         const netPromises = this._buildResponsePromises(page, stepArrayIndex);
+        const selStart = Date.now();
         const locator = await this._resolveLocator(page, data);
+        recordSelector(this._countSelectorStrategies(data), Date.now() - selStart);
         if (locator) {
           await locator.waitFor({ state: 'visible', timeout: this.timeouts.elementVisible });
           try {
@@ -943,7 +1218,9 @@ class ReplayEngine {
           }
         }
         const netResult = await this._awaitNetworkPromises(page, stepArrayIndex, netPromises);
-        await this._postActionSettle(page, { hasNetwork: (netPromises?.length || 0) > 0 });
+        if (netResult?.duration_ms) recordWait(netResult.duration_ms, netResult.reason);
+        const settleDur = await this._postActionSettle(page, { hasNetwork: (netPromises?.length || 0) > 0 });
+        recordWait(settleDur, netResult?.reason || 'post_action_settle');
         if (netPromises.length > 0 && !netResult?.matched) {
           if (this.strictNetworkWait) {
             throw new Error(netResult?.reason || 'network wait failed');
@@ -960,7 +1237,9 @@ class ReplayEngine {
           const netPromises = this._buildResponsePromises(page, stepArrayIndex);
 
           if (data.selector || data.selector_strategies) {
+            const selStart = Date.now();
             const locator = await this._resolveLocator(page, data);
+            recordSelector(this._countSelectorStrategies(data), Date.now() - selStart);
             if (locator) {
               try {
                 await locator.waitFor({ state: 'visible', timeout: this.timeouts.elementVisible });
@@ -976,7 +1255,9 @@ class ReplayEngine {
           }
 
           const netResult = await this._awaitNetworkPromises(page, stepArrayIndex, netPromises);
-          await this._postActionSettle(page, { hasNetwork: (netPromises?.length || 0) > 0 });
+          if (netResult?.duration_ms) recordWait(netResult.duration_ms, netResult.reason);
+          const settleDur = await this._postActionSettle(page, { hasNetwork: (netPromises?.length || 0) > 0 });
+          recordWait(settleDur, netResult?.reason || 'post_action_settle');
           if (netPromises.length > 0 && !netResult?.matched) {
             if (this.strictNetworkWait) {
               throw new Error(netResult?.reason || 'network wait failed');
@@ -997,17 +1278,15 @@ class ReplayEngine {
           const deltaX = data.deltaX ?? 0;
           await page.evaluate(({ dx, dy }) => window.scrollBy(dx, dy), { dx: deltaX, dy: deltaY });
         }
+        const settleDur = await this._postActionSettle(page, { hasNetwork: false });
+        recordWait(settleDur, 'post_action_settle');
         }
 
     } catch (err) {
       throw err;
     }
 
-    // ── Step passed ─────────────────────────────────────────────────────────
-    this.report.summary.passed++;
-    if (this.report.steps[stepIndex - 1]) {
-      this.report.steps[stepIndex - 1].status = 'passed';
-    }
+    // Step pass/fail accounting is handled by caller loops.
   }
 }
 

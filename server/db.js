@@ -117,7 +117,8 @@ async function initDb() {
       finished_at   INTEGER,
       status        TEXT DEFAULT 'running',
       score         REAL,
-      cluster_counts TEXT DEFAULT '{}'
+      cluster_counts TEXT DEFAULT '{}',
+      timings        TEXT DEFAULT '{}'
     );
 
     CREATE TABLE IF NOT EXISTS run_steps (
@@ -131,7 +132,8 @@ async function initDb() {
       evidence_path TEXT,
       cluster_id    TEXT,
       duration_ms   INTEGER,
-      label         TEXT
+      label         TEXT,
+      timings       TEXT DEFAULT '{}'
     );
 
     CREATE TABLE IF NOT EXISTS failure_clusters (
@@ -177,6 +179,9 @@ async function initDb() {
   try { db.run("ALTER TABLE events_index ADD COLUMN correlation_id TEXT"); } catch (e) {}
   // Flow schema migrations (idempotent)
   try { db.run("ALTER TABLE flows ADD COLUMN description TEXT"); } catch (e) {}
+  // Profiling migrations
+  try { db.run("ALTER TABLE runs ADD COLUMN timings TEXT"); } catch (e) {}
+  try { db.run("ALTER TABLE run_steps ADD COLUMN timings TEXT"); } catch (e) {}
 
   persistDb();
   console.log('[DB] SQLite initialized at', DB_PATH);
@@ -426,7 +431,7 @@ module.exports = {
     const run = queryOne('SELECT * FROM runs WHERE run_id = ?', [runId]);
     if (!run) throw new Error('Run not found');
     db.run(
-      `UPDATE runs SET flow_id = ?, flow_version = ?, release_id = ?, started_at = ?, finished_at = ?, status = ?, score = ?, cluster_counts = ?
+      `UPDATE runs SET flow_id = ?, flow_version = ?, release_id = ?, started_at = ?, finished_at = ?, status = ?, score = ?, cluster_counts = ?, timings = ?
        WHERE run_id = ?`,
       [
         patch.flow_id ?? run.flow_id,
@@ -437,6 +442,7 @@ module.exports = {
         patch.status ?? run.status,
         patch.score ?? run.score,
         JSON.stringify(patch.cluster_counts ?? _safeParseJson(run.cluster_counts, {})),
+        JSON.stringify(patch.timings ?? _safeParseJson(run.timings, {})),
         runId,
       ]
     );
@@ -444,8 +450,8 @@ module.exports = {
   },
 
   insertRunSteps(runId, steps = []) {
-    const stmt = db.prepare(`INSERT INTO run_steps (run_step_id, run_id, step_index, step_type, status, retry_count, assertion_failures, evidence_path, cluster_id, duration_ms, label)
-                              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+    const stmt = db.prepare(`INSERT INTO run_steps (run_step_id, run_id, step_index, step_type, status, retry_count, assertion_failures, evidence_path, cluster_id, duration_ms, label, timings)
+                              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
     for (const s of steps) {
       stmt.run([
         s.run_step_id || uuidv4(),
@@ -459,6 +465,7 @@ module.exports = {
         s.cluster_id || null,
         s.duration_ms || null,
         s.label || null,
+        JSON.stringify(s.timings || {}),
       ]);
     }
     stmt.free();
@@ -472,16 +479,17 @@ module.exports = {
     if (release_id) { clauses.push('release_id = ?'); params.push(release_id); }
     const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
     return queryAll(`SELECT * FROM runs ${where} ORDER BY started_at DESC LIMIT ? OFFSET ?`, [...params, limit, offset])
-      .map(r => ({ ...r, cluster_counts: _safeParseJson(r.cluster_counts, {}) }));
+      .map(r => ({ ...r, cluster_counts: _safeParseJson(r.cluster_counts, {}), timings: _safeParseJson(r.timings, {}) }));
   },
 
   getRun(runId, { withSteps = false } = {}) {
     const run = queryOne('SELECT * FROM runs WHERE run_id = ?', [runId]);
     if (!run) return null;
     run.cluster_counts = _safeParseJson(run.cluster_counts, {});
+    run.timings = _safeParseJson(run.timings, {});
     if (!withSteps) return run;
     const steps = queryAll('SELECT * FROM run_steps WHERE run_id = ? ORDER BY step_index ASC', [runId])
-      .map(s => ({ ...s, assertion_failures: _safeParseJson(s.assertion_failures, []) }));
+      .map(s => ({ ...s, assertion_failures: _safeParseJson(s.assertion_failures, []), timings: _safeParseJson(s.timings, {}) }));
     return { run, steps };
   },
 

@@ -1068,7 +1068,12 @@ app.post('/flows/:id/run', async (req, res) => {
         const runId = uuidv4();
         db.createRun({ run_id: runId, flow_id: id, flow_version: result.flow.version, release_id: req.body?.release_id, started_at: Date.now() });
 
-        const options = { startUrl: result.flow?.module_start_url, ...req.body };
+        const firstNavigateStep = (plan.steps || []).find(s => s.step_type === 'navigate');
+        const inferredStartUrl = firstNavigateStep?.url || firstNavigateStep?.meta?.url || null;
+        const options = {
+            startUrl: result.flow?.module_start_url || result.flow?.start_url || inferredStartUrl,
+            ...req.body,
+        };
         const engine = new ReplayEngine([], options);
         const report = await engine.runPlan(plan);
 
@@ -1086,6 +1091,13 @@ app.post('/flows/:id/run', async (req, res) => {
             associated_network_failures: s.associated_network_failures || [],
             error: s.error,
             selector: s.selector,
+            timings: {
+                wait_duration_ms: s.wait_duration_ms || 0,
+                selector_resolution_time_ms: s.selector_resolution_time_ms || 0,
+                assertion_duration_ms: s.assertion_duration_ms || 0,
+                wait_reason: s.wait_reason || null,
+                selector_attempt_count: s.selector_attempt_count || 0,
+            },
         }));
 
         const { stepReports, clusterCounts } = attachClusters(runSteps, db);
@@ -1095,7 +1107,7 @@ app.post('/flows/:id/run', async (req, res) => {
         const total = report.summary?.total_steps || runSteps.length || 1;
         const score = total > 0 ? passed / total : 0;
 
-        db.updateRun(runId, { status: 'done', finished_at: Date.now(), score, cluster_counts: clusterCounts });
+        db.updateRun(runId, { status: 'done', finished_at: Date.now(), score, cluster_counts: clusterCounts, timings: report.timings || {} });
 
         const runsDir = path.join(db.DATA_DIR, 'flows', id, 'runs');
         fs.mkdirSync(runsDir, { recursive: true });
