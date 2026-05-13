@@ -139,23 +139,7 @@ function summarizeEvent(event) {
 }
 
 function analyzeTriageEvent(ev) {
-  const d = ev.data || {};
-  const critStyle = 'critical';
-  const warnStyle = 'warning';
-
-  if (ev.type === 'network.failure') {
-    return { cls: critStyle, msg: '🚨 CRITICAL: The API endpoint crashed or was blocked by CORS. The server did not respond.' };
-  }
-  if (ev.type.startsWith('network.status_')) {
-    const s = d.status;
-    if (s >= 500) return { cls: critStyle, msg: '🚨 CRITICAL BUG: Backend server crashed (5xx). Check server logs.' };
-    if (s === 401 || s === 403) return { cls: warnStyle, msg: '⚠ AUTHENTICATION BUG: User is not logged in or lacks permissions (40x).' };
-    if (s === 404) return { cls: warnStyle, msg: '⚠ NOT FOUND: The application requested a resource that does not exist (404).' };
-    if (s === 400 || s === 422) return { cls: warnStyle, msg: '⚠ VALIDATION BUG: Frontend sent an invalid request payload (400/422). Check request body.' };
-  }
-  if (ev.type === 'runtime.exception') {
-    return { cls: critStyle, msg: '🚨 CRITICAL APP CRASH: A JavaScript error halted the application thread. See stack trace.' };
-  }
+  if (typeof analyzeTriageEventRule === 'function') return analyzeTriageEventRule(ev);
   return null;
 }
 
