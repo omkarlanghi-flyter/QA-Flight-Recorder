@@ -14,9 +14,20 @@ const db = require('./db');
 const { createIngestionContext, destroyIngestionContext } = require('./ingestion/ingestion');
 const { normalize } = require('./normalization/normalizer');
 const flowStore = require('./flows/flow_store');
+const { getEventType, normalizeEventType } = require('./event_type');
 
 const activeReplays = new Map();
 const { generateTriageView, errorSignature } = require('./filter');
+
+const ingestMetrics = {
+    legacy_calls: 0,
+    legacy_events: 0,
+    v2_calls: 0,
+    v2_accepted: 0,
+    v2_rejected: 0,
+    v2_duplicates: 0,
+    fallback_to_legacy: 0,
+};
 
 // ── Ignored Error Signatures ──────────────────────────────────────────────────
 const IGNORED_FILE = path.join(os.homedir(), '.qa-flight-recorder', 'ignored_errors.json');
@@ -59,6 +70,19 @@ function ensureSessionRawDir(id) {
 
 function getEventsFile(id) {
     return path.join(getSessionDir(id), 'raw', 'events.ndjson');
+}
+
+function parseNdjsonEvents(content) {
+    if (!content) return [];
+    return content
+        .split('\n')
+        .map(l => { try { return normalizeEventType(JSON.parse(l)); } catch { return null; } })
+        .filter(Boolean);
+}
+
+function countIngestPayloadEvents(body) {
+    if (Array.isArray(body)) return body.length;
+    return body ? 1 : 0;
 }
 
 // Flow plan cache helper
@@ -130,6 +154,13 @@ app.post('/session/:id/event', (req, res) => {
     let events = req.body;
     if (!Array.isArray(events)) events = [events];
 
+    ingestMetrics.legacy_calls += 1;
+    ingestMetrics.legacy_events += events.length;
+    if (req.headers['x-ingest-fallback'] === 'v2_failed') {
+        ingestMetrics.fallback_to_legacy += 1;
+        console.warn(`[INGEST] v2->legacy fallback session=${id} batches=${ingestMetrics.fallback_to_legacy}`);
+    }
+
     // Ensure all events have session_id
     events = events.map(e => ({ ...e, session_id: id }));
 
@@ -189,7 +220,7 @@ app.post('/session/:id/stop', async (req, res) => {
     if (fs.existsSync(eventsFile)) {
         const content = fs.readFileSync(eventsFile, 'utf8').trim();
         if (content) {
-            const events = content.split('\n').map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+            const events = parseNdjsonEvents(content);
             eventCount = events.length;
             
             // Get ignored signatures
@@ -199,10 +230,11 @@ app.post('/session/:id/stop', async (req, res) => {
                 const sig = errorSignature(e);
                 if (ignoredSet.has(sig)) continue; // Skip ignored errors from counts
 
-                if (['console.error', 'runtime.exception'].includes(e.type)) errorCount++;
-                if (e.type === 'network.failure') networkFailureCount++;
+                const evtType = getEventType(e);
+                if (['console.error', 'runtime.exception'].includes(evtType)) errorCount++;
+                if (evtType === 'network.failure') networkFailureCount++;
                 // Use timing for slow requests
-                if (e.type === 'network.timing' && e.data?.duration_ms > 2000) slowRequestCount++;
+                if (evtType === 'network.timing' && e.data?.duration_ms > 2000) slowRequestCount++;
             }
         }
     }
@@ -259,7 +291,7 @@ app.post('/sessions/:id/replay', async (req, res) => {
     if (!fs.existsSync(eventsFile)) return res.status(404).json({ error: 'Events not found' });
 
     const content = fs.readFileSync(eventsFile, 'utf8').trim();
-    const events = content ? content.split('\n').map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean) : [];
+    const events = content ? parseNdjsonEvents(content) : [];
 
     const session = db.getSession(req.params.id);
 
@@ -387,7 +419,24 @@ app.get('/stats', (req, res) => {
     const totalNetFailures = sessions.reduce((sum, s) => sum + (s.network_failure_count || 0), 0);
     const totalSlowReqs = sessions.reduce((sum, s) => sum + (s.slow_request_count || 0), 0);
     const clean = sessions.filter(s => (s.error_count || 0) === 0 && (s.network_failure_count || 0) === 0 && s.status === 'done').length;
-    res.json({ total, recording, done, clean, totalErrors, totalNetFailures, totalSlowReqs });
+    res.json({
+        total,
+        recording,
+        done,
+        clean,
+        totalErrors,
+        totalNetFailures,
+        totalSlowReqs,
+        ingest: {
+            legacy_calls: ingestMetrics.legacy_calls,
+            legacy_events: ingestMetrics.legacy_events,
+            v2_calls: ingestMetrics.v2_calls,
+            v2_accepted: ingestMetrics.v2_accepted,
+            v2_rejected: ingestMetrics.v2_rejected,
+            v2_duplicates: ingestMetrics.v2_duplicates,
+            fallback_to_legacy: ingestMetrics.fallback_to_legacy,
+        },
+    });
 });
 
 /**
@@ -464,7 +513,7 @@ app.get('/sessions/:id/triage', (req, res) => {
         return res.json({ events: [], manifest });
     }
     const content = fs.readFileSync(triageFile, 'utf8').trim();
-    const events = content ? content.split('\n').map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean) : [];
+    const events = content ? parseNdjsonEvents(content) : [];
     res.json({ events, manifest });
 });
 
@@ -477,7 +526,7 @@ app.get('/sessions/:id/events', (req, res) => {
     if (!fs.existsSync(eventsFile)) return res.json({ events: [], total: 0 });
 
     const content = fs.readFileSync(eventsFile, 'utf8').trim();
-    const allEvents = content ? content.split('\n').map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean) : [];
+    const allEvents = content ? parseNdjsonEvents(content) : [];
 
     const limit = parseInt(req.query.limit) || 500;
     const offset = parseInt(req.query.offset) || 0;
@@ -486,9 +535,9 @@ app.get('/sessions/:id/events', (req, res) => {
     let filtered = allEvents;
     if (req.query.types) {
         const allowedTypes = new Set(req.query.types.split(','));
-        filtered = allEvents.filter(e => allowedTypes.has(e.type));
+        filtered = allEvents.filter(e => allowedTypes.has(getEventType(e)));
     } else if (req.query.type) {
-        filtered = allEvents.filter(e => e.type === req.query.type);
+        filtered = allEvents.filter(e => getEventType(e) === req.query.type);
     }
 
     res.json({ events: filtered.slice(offset, offset + limit), total: filtered.length });
@@ -611,7 +660,7 @@ app.post('/sessions/:id/regenerate-views', (req, res) => {
         if (fs.existsSync(eventsFile)) {
             const content = fs.readFileSync(eventsFile, 'utf8').trim();
             if (content) {
-                const events = content.split('\n').map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+                const events = parseNdjsonEvents(content);
                 const ignoredSet = new Set(loadIgnored().map(i => i.signature));
                 let errorCount = 0;
                 let networkFailureCount = 0;
@@ -619,9 +668,10 @@ app.post('/sessions/:id/regenerate-views', (req, res) => {
                 for (const e of events) {
                     const sig = errorSignature(e);
                     if (ignoredSet.has(sig)) continue;
-                    if (['console.error', 'runtime.exception'].includes(e.type)) errorCount++;
-                    if (e.type === 'network.failure') networkFailureCount++;
-                    if (e.type === 'network.timing' && e.data?.duration_ms > 2000) slowRequestCount++;
+                    const evtType = getEventType(e);
+                    if (['console.error', 'runtime.exception'].includes(evtType)) errorCount++;
+                    if (evtType === 'network.failure') networkFailureCount++;
+                    if (evtType === 'network.timing' && e.data?.duration_ms > 2000) slowRequestCount++;
                 }
                 const session = db.getSession(req.params.id);
                 db.updateSessionStop(req.params.id, session.stopped_at || Date.now(), {
@@ -741,9 +791,25 @@ app.post('/sessions/:id/events/batch', (req, res) => {
     let events = req.body;
     if (!Array.isArray(events)) events = [events];
 
+    ingestMetrics.v2_calls += 1;
+
     const sessionDir = getSessionDir(id);
     const ctx = createIngestionContext(id, sessionDir, db);
     const result = ctx.ingest(events);
+
+    ingestMetrics.v2_accepted += result.accepted || 0;
+    ingestMetrics.v2_rejected += result.rejected || 0;
+    ingestMetrics.v2_duplicates += result.duplicates || 0;
+
+    const requestEvents = countIngestPayloadEvents(req.body);
+    const missed = Math.max(0, requestEvents - ((result.accepted || 0) + (result.rejected || 0) + (result.duplicates || 0)));
+    if (missed > 0) {
+        console.warn(`[INGEST] Accounting mismatch session=${id} request=${requestEvents} accepted=${result.accepted || 0} rejected=${result.rejected || 0} duplicates=${result.duplicates || 0}`);
+    }
+
+    if (result.fatal) {
+        return res.status(500).json({ ok: false, ...result });
+    }
 
     res.json({ ok: true, ...result });
 });
@@ -789,13 +855,13 @@ app.post('/sessions/:id/finish', async (req, res) => {
     if (fs.existsSync(eventsFile)) {
         const content = fs.readFileSync(eventsFile, 'utf8').trim();
         if (content) {
-            const events = content.split('\n').map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+            const events = parseNdjsonEvents(content);
             eventCount = events.length;
             const ignoredSet = new Set(loadIgnored().map(i => i.signature));
             for (const e of events) {
                 const sig = errorSignature(e);
                 if (ignoredSet.has(sig)) continue;
-                const evtType = e.event_type || e.type;
+                const evtType = getEventType(e);
                 if (['console.error', 'runtime.exception'].includes(evtType)) errorCount++;
                 if (evtType === 'network.failure') networkFailureCount++;
                 if (evtType === 'network.timing' && e.data?.duration_ms > 2000) slowRequestCount++;

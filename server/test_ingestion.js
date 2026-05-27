@@ -116,8 +116,12 @@ const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'qa-ingestion-test-'));
 const rawDir  = path.join(tmpDir, 'raw');
 fs.mkdirSync(rawDir, { recursive: true });
 
-// Minimal mock db (only needs indexEventsBatch)
-const mockDb = { indexEventsBatch: () => {} };
+// Minimal mock db
+const mockDb = {
+    indexEventsBatch: () => {},
+    reserveEventIds: (_sessionId, eventIds) => new Set(eventIds || []),
+    releaseReservedEventIds: () => {},
+};
 
 test('ingest() accepts a valid event and writes to NDJSON', () => {
     const ctx = createIngestionContext('sess-test-1', tmpDir, mockDb);
@@ -158,6 +162,35 @@ test('ingest() deduplicates events with the same event_id', () => {
     const eventsFile = path.join(tmpDir2, 'raw', 'events.ndjson');
     const lines = fs.readFileSync(eventsFile, 'utf8').trim().split('\n').filter(Boolean);
     assert.strictEqual(lines.length, 1, 'Only 1 event written despite 2 ingest calls');
+    ctx.destroy();
+});
+
+test('ingest() deduplicates when DB reservation reports pre-existing ids', () => {
+    const tmpDir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'qa-ingestion-persist-dedup-'));
+    const dbWithExisting = {
+        indexEventsBatch: () => {},
+        reserveEventIds: (_sessionId, eventIds) => {
+            const accepted = new Set();
+            for (const id of eventIds) {
+                if (id !== 'already-seen-event') accepted.add(id);
+            }
+            return accepted;
+        },
+        releaseReservedEventIds: () => {},
+    };
+
+    const ctx = createIngestionContext('sess-db-dedup', tmpDir2, dbWithExisting);
+    const result = ctx.ingest([
+        { event_type: 'action.click', source: 'content', event_id: 'already-seen-event', data: {} },
+        { event_type: 'action.click', source: 'content', event_id: 'new-event-1', data: {} },
+    ]);
+
+    assert.strictEqual(result.accepted, 1, 'Only new event should be accepted');
+    assert.strictEqual(result.duplicates, 1, 'Pre-existing event_id should be counted as duplicate');
+
+    const eventsFile = path.join(tmpDir2, 'raw', 'events.ndjson');
+    const lines = fs.readFileSync(eventsFile, 'utf8').trim().split('\n').filter(Boolean);
+    assert.strictEqual(lines.length, 1, 'Only one event should be written');
     ctx.destroy();
 });
 

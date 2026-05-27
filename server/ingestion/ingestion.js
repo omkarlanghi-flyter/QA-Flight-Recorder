@@ -20,6 +20,7 @@
 const fs   = require('fs');
 const path = require('path');
 const { validate, enrich } = require('./schema');
+const { getEventType } = require('../event_type');
 
 // ── Active session contexts (kept for dedup across multiple flushes) ──────────
 const activeContexts = new Map(); // sessionId → IngestionContext
@@ -51,7 +52,7 @@ class IngestionContext {
      * @returns {{ accepted: number, rejected: number, duplicates: number, errors: string[] }}
      */
     ingest(rawEvents) {
-        const result = { accepted: 0, rejected: 0, duplicates: 0, errors: [] };
+        const result = { accepted: 0, rejected: 0, duplicates: 0, errors: [], fatal: false };
 
         if (!Array.isArray(rawEvents) || rawEvents.length === 0) {
             return result;
@@ -59,6 +60,7 @@ class IngestionContext {
 
         const toWrite   = [];
         const toIndex   = [];
+        const pending   = [];
 
         for (const raw of rawEvents) {
             // 1. Enrich (normalise field names, stamp event_id + schema_version)
@@ -73,7 +75,7 @@ class IngestionContext {
             }
 
             // 3a. Noise filter for high-chatter events (mousemove/scroll within 200ms)
-            const evtType = enriched.event_type || enriched.type;
+            const evtType = getEventType(enriched);
             const ts = enriched.timestamp || enriched.ts_epoch_ms || Date.now();
             if (evtType && (evtType === 'action.mousemove' || evtType === 'action.scroll')) {
                 const lastTs = this.lastEventTs[evtType] || 0;
@@ -84,22 +86,59 @@ class IngestionContext {
                 this.lastEventTs[evtType] = ts;
             }
 
-            // 3b. Dedup by event_id
+            // 3b. Dedup by event_id (in-memory)
             if (this.seenIds.has(enriched.event_id)) {
                 result.duplicates++;
                 continue;
             }
-            this.seenIds.add(enriched.event_id);
 
-            toWrite.push(enriched);
-            toIndex.push(enriched);
-            result.accepted++;
+            pending.push(enriched);
+        }
+
+        // 3c. Persistent dedup reservation (survives server restarts)
+        let reservedIds = null;
+        if (pending.length > 0) {
+            const eventIds = pending.map(e => e.event_id);
+            if (this.db && typeof this.db.reserveEventIds === 'function') {
+                reservedIds = this.db.reserveEventIds(this.sessionId, eventIds);
+            }
+
+            for (const enriched of pending) {
+                if (reservedIds && !reservedIds.has(enriched.event_id)) {
+                    result.duplicates++;
+                    this.seenIds.add(enriched.event_id);
+                    continue;
+                }
+
+                this.seenIds.add(enriched.event_id);
+                toWrite.push(enriched);
+                toIndex.push(enriched);
+                result.accepted++;
+            }
         }
 
         // 4. Atomic NDJSON append
         if (toWrite.length > 0) {
-            const lines = toWrite.map(e => JSON.stringify(e)).join('\n') + '\n';
-            fs.appendFileSync(this.eventsFile, lines, 'utf8');
+            try {
+                const lines = toWrite.map(e => JSON.stringify(e)).join('\n') + '\n';
+                fs.appendFileSync(this.eventsFile, lines, 'utf8');
+            } catch (err) {
+                // Release persistent reservations so this batch can be retried safely.
+                if (this.db && typeof this.db.releaseReservedEventIds === 'function') {
+                    try {
+                        this.db.releaseReservedEventIds(this.sessionId, toWrite.map(e => e.event_id));
+                    } catch (releaseErr) {
+                        result.errors.push(`Reservation rollback error: ${releaseErr.message}`);
+                    }
+                }
+
+                for (const e of toWrite) this.seenIds.delete(e.event_id);
+                result.errors.push(`NDJSON append error: ${err.message}`);
+                result.rejected += toWrite.length;
+                result.accepted = Math.max(0, result.accepted - toWrite.length);
+                result.fatal = true;
+                return result;
+            }
         }
 
         // 5. DB indexing (high-signal types only — db handles filtering internally)
@@ -109,7 +148,7 @@ class IngestionContext {
                 const dbEvents = toIndex.map(e => ({
                     session_id: e.session_id,
                     ts_epoch_ms: e.timestamp ?? e.ts_epoch_ms,
-                    type: e.event_type || e.type,
+                    type: getEventType(e),
                     source: e.source,
                     url: e.url || e.data?.url_sanitized || e.data?.url_full || null,
                     data: e.data || {},

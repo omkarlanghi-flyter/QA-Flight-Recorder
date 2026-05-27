@@ -148,7 +148,10 @@ async function flushEvents() {
         if (!ok) {
             await fetch(legacyUrl, {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                headers: {
+                    'Content-Type': 'application/json',
+                    'x-ingest-fallback': 'v2_failed',
+                },
                 body: JSON.stringify(batch),
             });
         }

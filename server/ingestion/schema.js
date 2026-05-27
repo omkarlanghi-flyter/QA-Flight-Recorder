@@ -21,6 +21,7 @@
 'use strict';
 
 const { v4: uuidv4 } = require('uuid');
+const { getEventType } = require('../event_type');
 
 // ── Schema Version ────────────────────────────────────────────────────────────
 const CURRENT_SCHEMA_VERSION = '2.0';
@@ -78,7 +79,7 @@ function validate(event) {
     }
 
     // event_type must be a known namespace (be lenient — warn only, still accept)
-    const eventType = event.event_type || event.type;
+    const eventType = getEventType(event);
     if (eventType && typeof eventType === 'string') {
         const knownPrefix = VALID_TYPE_PREFIXES.some(p => eventType.startsWith(p));
         if (!knownPrefix) {
@@ -125,7 +126,7 @@ function enrich(rawEvent, sessionId) {
     const now = Date.now();
 
     // Resolve fields with legacy aliases
-    const eventType  = rawEvent.event_type || rawEvent.type || 'system.unknown';
+    const eventType  = getEventType(rawEvent) || 'system.unknown';
     const timestamp  = rawEvent.timestamp  ?? rawEvent.ts_epoch_ms ?? now;
     const source     = rawEvent.source     || 'system';
     const data       = rawEvent.data       || {};

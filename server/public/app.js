@@ -58,6 +58,25 @@ function esc(str) {
   return String(str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
+function getEventType(event) {
+  if (!event || typeof event !== 'object') return '';
+  const t = event.event_type || event.type || '';
+  return typeof t === 'string' ? t : '';
+}
+
+function normalizeEventType(event) {
+  if (!event || typeof event !== 'object') return event;
+  const t = getEventType(event);
+  if (!t) return event;
+  if (event.event_type === t && event.type === t) return event;
+  return { ...event, event_type: t, type: t };
+}
+
+function normalizeEventList(events) {
+  if (!Array.isArray(events)) return [];
+  return events.map(normalizeEventType);
+}
+
 function showToast(msg, type = 'info') {
   const toast = document.getElementById('toast');
   const icon = type === 'error' ? '❌' : type === 'success' ? '✅' : 'ℹ️';
@@ -109,11 +128,12 @@ function makeHeadersAccordion(label, headers) {
 
 function summarizeEvent(event) {
   const d = event.data || {};
+  const type = getEventType(event);
   let summary = '';
-  const isNetworkError = event.type === 'network.failure' ||
-    (event.type === 'network.response' && d.status >= 400);
+  const isNetworkError = type === 'network.failure' ||
+    (type === 'network.response' && d.status >= 400);
 
-  switch (event.type) {
+  switch (type) {
     case 'action.click': summary = `Click: ${d.text_snippet || ''} (${d.selector || ''})`; break;
     case 'action.scroll': summary = `Scroll deltaY=${d.deltaY}`; break;
     case 'action.navigation': summary = `Nav: ${d.from_url || ''} → ${d.to_url || ''}`; break;
@@ -837,7 +857,8 @@ async function drawTimeline(session, summary) {
   const wrap = document.getElementById('timeline-wrap');
   try {
     const res = await fetch(`${API}/sessions/${session.id}/events?types=network.request,console.error,runtime.exception,console.warn,network.failure&limit=5000`);
-    const { events } = await res.json();
+    const { events: rawEvents } = await res.json();
+    const events = normalizeEventList(rawEvents);
     if (!events || !events.length) { wrap.style.display = 'none'; return; }
 
     _tlState.events = events;
@@ -1124,7 +1145,8 @@ async function loadTriage() {
   await refreshIgnoredSignatures();
 
   const res = await fetch(`${API}/sessions/${currentSessionId}/triage`);
-  const { events } = await res.json();
+  const { events: rawEvents } = await res.json();
+  const events = normalizeEventList(rawEvents);
   triageEventsCache = events;
   renderTriage(events);
 }
@@ -1211,7 +1233,8 @@ async function loadEvents() {
   if (type) params.set('type', type);
 
   const res = await fetch(`${API}/sessions/${currentSessionId}/events?${params}`);
-  const { events, total } = await res.json();
+  const { events: rawEvents, total } = await res.json();
+  const events = normalizeEventList(rawEvents);
   allEventsCache = events;
   document.getElementById('events-total').textContent = `${events.length} / ${total} events`;
   renderEventsTable(events);
@@ -1299,7 +1322,8 @@ async function loadInputTrack() {
   }
 
   const res = await fetch(`${API}/sessions/${currentSessionId}/events?${params}`);
-  const { events } = await res.json();
+  const { events: rawEvents } = await res.json();
+  const events = normalizeEventList(rawEvents);
   allInputEventsCache = events;
 
   const clickCount = events.filter(e => e.type === 'action.click').length;
@@ -1582,7 +1606,8 @@ async function loadVideo() {
     // ── Load side events ──────────────────────────────────────────
     const reqTypes = 'action.click,action.scroll,action.navigation,console.warn,console.error,runtime.exception,marker.bug';
     const evRes = await fetch(`${API}/sessions/${currentSessionId}/events?types=${reqTypes}&limit=5000`);
-    const { events: sideEvents } = await evRes.json();
+    const { events: rawSideEvents } = await evRes.json();
+    const sideEvents = normalizeEventList(rawSideEvents);
     _videoSideEvents = sideEvents;
 
     // If metadata already loaded, build the scrubber now

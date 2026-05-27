@@ -7,6 +7,7 @@ const { v4: uuidv4 } = require('uuid');
 const path = require('path');
 const os = require('os');
 const fs = require('fs');
+const { getEventType } = require('./event_type');
 
 const DATA_DIR = path.join(os.homedir(), '.qa-flight-recorder');
 const SESSIONS_DIR = path.join(DATA_DIR, 'sessions');
@@ -69,8 +70,16 @@ async function initDb() {
       summary TEXT
     );
 
+    CREATE TABLE IF NOT EXISTS event_dedup (
+      session_id TEXT NOT NULL,
+      event_id TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      PRIMARY KEY (session_id, event_id)
+    );
+
     CREATE INDEX IF NOT EXISTS idx_events_session ON events_index(session_id);
     CREATE INDEX IF NOT EXISTS idx_events_type ON events_index(session_id, type);
+    CREATE INDEX IF NOT EXISTS idx_event_dedup_session ON event_dedup(session_id);
     CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at);
 
     -- Flows (Step 3)
@@ -177,6 +186,22 @@ async function initDb() {
   try { db.run("ALTER TABLE events_index ADD COLUMN event_id TEXT"); } catch (e) {}
   try { db.run("ALTER TABLE events_index ADD COLUMN schema_version TEXT"); } catch (e) {}
   try { db.run("ALTER TABLE events_index ADD COLUMN correlation_id TEXT"); } catch (e) {}
+  try {
+    db.run(`
+      DELETE FROM events_index
+      WHERE event_id IS NOT NULL
+        AND event_id <> ''
+        AND id NOT IN (
+          SELECT MIN(id)
+          FROM events_index
+          WHERE event_id IS NOT NULL AND event_id <> ''
+          GROUP BY session_id, event_id
+        )
+    `);
+    db.run("CREATE UNIQUE INDEX IF NOT EXISTS idx_events_session_event_id_unique ON events_index(session_id, event_id)");
+  } catch (e) {
+    console.warn('[DB] Unable to apply unique event_id index migration:', e.message);
+  }
   // Flow schema migrations (idempotent)
   try { db.run("ALTER TABLE flows ADD COLUMN description TEXT"); } catch (e) {}
   // Profiling migrations
@@ -569,11 +594,10 @@ module.exports = {
 
   indexEventsBatch(events) {
     for (const event of events) {
-      // Support both legacy 'type' and new canonical 'event_type'
-      const eventType = event.event_type || event.type;
+      const eventType = getEventType(event);
       if (!HIGH_SIGNAL_TYPES.has(eventType)) continue;
       db.run(
-        `INSERT INTO events_index (session_id, ts_epoch_ms, type, source, url, summary, event_id, schema_version, correlation_id)
+        `INSERT OR IGNORE INTO events_index (session_id, ts_epoch_ms, type, source, url, summary, event_id, schema_version, correlation_id)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           event.session_id,
@@ -591,6 +615,54 @@ module.exports = {
     persistDb();
   },
 
+  getExistingEventIds(sessionId, eventIds = []) {
+    if (!sessionId || !Array.isArray(eventIds) || eventIds.length === 0) return [];
+    const filtered = Array.from(new Set(eventIds.filter(id => typeof id === 'string' && id.trim().length > 0)));
+    if (filtered.length === 0) return [];
+
+    const placeholders = filtered.map(() => '?').join(',');
+    const rows = queryAll(
+      `SELECT event_id FROM events_index WHERE session_id = ? AND event_id IN (${placeholders})`,
+      [sessionId, ...filtered]
+    );
+    return rows.map(r => r.event_id).filter(Boolean);
+  },
+
+  reserveEventIds(sessionId, eventIds = []) {
+    if (!sessionId || !Array.isArray(eventIds) || eventIds.length === 0) return new Set();
+    const accepted = new Set();
+    const now = Date.now();
+    const stmt = db.prepare('INSERT OR IGNORE INTO event_dedup (session_id, event_id, created_at) VALUES (?, ?, ?)');
+
+    try {
+      for (const rawId of eventIds) {
+        if (typeof rawId !== 'string') continue;
+        const id = rawId.trim();
+        if (!id) continue;
+        stmt.run([sessionId, id, now]);
+        if (db.getRowsModified() > 0) accepted.add(id);
+      }
+    } finally {
+      stmt.free();
+    }
+
+    if (accepted.size > 0) persistDb();
+    return accepted;
+  },
+
+  releaseReservedEventIds(sessionId, eventIds = []) {
+    if (!sessionId || !Array.isArray(eventIds) || eventIds.length === 0) return;
+    const filtered = Array.from(new Set(eventIds.filter(id => typeof id === 'string' && id.trim().length > 0)));
+    if (filtered.length === 0) return;
+
+    const placeholders = filtered.map(() => '?').join(',');
+    db.run(
+      `DELETE FROM event_dedup WHERE session_id = ? AND event_id IN (${placeholders})`,
+      [sessionId, ...filtered]
+    );
+    persistDb();
+  },
+
   getIndexedEvents(sessionId) {
     return queryAll(
       'SELECT * FROM events_index WHERE session_id = ? ORDER BY ts_epoch_ms ASC',
@@ -601,6 +673,7 @@ module.exports = {
   deleteSession(sessionId) {
     db.run('DELETE FROM sessions WHERE id = ?', [sessionId]);
     db.run('DELETE FROM events_index WHERE session_id = ?', [sessionId]);
+    db.run('DELETE FROM event_dedup WHERE session_id = ?', [sessionId]);
     persistDb();
   },
 
@@ -609,6 +682,7 @@ module.exports = {
     const placeholders = sessionIds.map(() => '?').join(',');
     db.run(`DELETE FROM sessions WHERE id IN (${placeholders})`, sessionIds);
     db.run(`DELETE FROM events_index WHERE session_id IN (${placeholders})`, sessionIds);
+    db.run(`DELETE FROM event_dedup WHERE session_id IN (${placeholders})`, sessionIds);
     persistDb();
   },
 };

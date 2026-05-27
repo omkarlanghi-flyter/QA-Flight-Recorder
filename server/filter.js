@@ -4,6 +4,7 @@
  */
 const fs = require('fs');
 const path = require('path');
+const { getEventType, normalizeEventType } = require('./event_type');
 
 const SLOW_REQUEST_THRESHOLD_MS = 2000;
 const ERROR_STATUS_THRESHOLD = 400;
@@ -57,7 +58,7 @@ function parseEvents(eventsFile) {
     const content = fs.readFileSync(eventsFile, 'utf8').trim();
     if (!content) return [];
     return content.split('\n').map(line => {
-        try { return JSON.parse(line); } catch { return null; }
+        try { return normalizeEventType(JSON.parse(line)); } catch { return null; }
     }).filter(Boolean);
 }
 
@@ -65,14 +66,15 @@ function parseEvents(eventsFile) {
  * Generate a signature for an error event for deduplication
  */
 function errorSignature(event) {
-    if (!event.data) return event.type;
-    if (event.type === 'network.failure') {
+    const type = getEventType(event);
+    if (!event.data) return type;
+    if (type === 'network.failure') {
         const url = event.data.url_sanitized || event.data.url_full || 'unknown_url';
         return `network.failure::${url}`;
     }
     const msg = event.data.message || event.data.text || '';
     // Take first 120 chars of message as signature
-    return `${event.type}::${msg.slice(0, 120)}`;
+    return `${type}::${msg.slice(0, 120)}`;
 }
 
 /**
@@ -93,15 +95,16 @@ function generateTriageView(sessionDir, ignoredSignatures = []) {
 
     // First pass: group network events by request_id
     for (const event of allEvents) {
-        if (event.type === 'network.request' && event.data?.request_id) {
+        const type = getEventType(event);
+        if (type === 'network.request' && event.data?.request_id) {
             networkRequests[event.data.request_id] = { requestEvent: event };
-        } else if (event.type === 'network.response' && event.data?.request_id) {
+        } else if (type === 'network.response' && event.data?.request_id) {
             const r = networkRequests[event.data.request_id];
             if (r) r.responseEvent = event;
-        } else if (event.type === 'network.timing' && event.data?.request_id) {
+        } else if (type === 'network.timing' && event.data?.request_id) {
             const r = networkRequests[event.data.request_id];
             if (r) r.timingEvent = event;
-        } else if (event.type === 'network.failure' && event.data?.request_id) {
+        } else if (type === 'network.failure' && event.data?.request_id) {
             const r = networkRequests[event.data.request_id];
             if (r) r.failureEvent = event;
         }
@@ -111,10 +114,11 @@ function generateTriageView(sessionDir, ignoredSignatures = []) {
 
     // Include all console warn/error + runtime exceptions
     for (const event of allEvents) {
-        if (['console.warn', 'console.error', 'runtime.exception'].includes(event.type)) {
+        const type = getEventType(event);
+        if (['console.warn', 'console.error', 'runtime.exception'].includes(type)) {
             anchorTimestamps.add(event.ts_epoch_ms);
             anchorEventSet.add(event);
-            rulesTriggered.push({ rule: event.type, ts: event.ts_epoch_ms });
+            rulesTriggered.push({ rule: type, ts: event.ts_epoch_ms });
         }
     }
 
@@ -140,7 +144,7 @@ function generateTriageView(sessionDir, ignoredSignatures = []) {
 
     // Include all bug markers
     for (const event of allEvents) {
-        if (event.type === 'marker.bug') {
+        if (getEventType(event) === 'marker.bug') {
             anchorTimestamps.add(event.ts_epoch_ms);
             anchorEventSet.add(event);
             rulesTriggered.push({ rule: 'marker.bug', ts: event.ts_epoch_ms });
@@ -167,7 +171,8 @@ function generateTriageView(sessionDir, ignoredSignatures = []) {
 
     // Collect all action events inside merged windows
     for (const event of allEvents) {
-        if (event.type.startsWith('action.')) {
+        const type = getEventType(event);
+        if (type.startsWith('action.')) {
             for (const w of mergedWindows) {
                 if (event.ts_epoch_ms >= w.from && event.ts_epoch_ms <= w.to) {
                     anchorEventSet.add(event);
@@ -180,10 +185,11 @@ function generateTriageView(sessionDir, ignoredSignatures = []) {
     // --- PASS 3: Collapse repeated console errors ---
     const signatureCounts = {};
     for (const event of anchorEventSet) {
-        if (['console.error', 'console.warn', 'runtime.exception'].includes(event.type)) {
+        const type = getEventType(event);
+        if (['console.error', 'console.warn', 'runtime.exception'].includes(type)) {
             const sig = errorSignature(event);
             if (!signatureCounts[sig]) {
-                signatureCounts[sig] = { first: event, count: 0, type: event.type };
+                signatureCounts[sig] = { first: event, count: 0, type };
             }
             signatureCounts[sig].count++;
         }
@@ -196,7 +202,8 @@ function generateTriageView(sessionDir, ignoredSignatures = []) {
     const sortedAnchorEvents = Array.from(anchorEventSet).sort((a, b) => a.ts_epoch_ms - b.ts_epoch_ms);
 
     for (const event of sortedAnchorEvents) {
-        if (['console.error', 'console.warn', 'runtime.exception'].includes(event.type)) {
+        const type = getEventType(event);
+        if (['console.error', 'console.warn', 'runtime.exception'].includes(type)) {
             const sig = errorSignature(event);
             if (seenErrorSigs.has(sig)) {
                 // Skip duplicates; will annotate count on first occurrence
@@ -292,7 +299,7 @@ function generateTriageView(sessionDir, ignoredSignatures = []) {
     let likelyTrigger = null;
     if (firstAnchorTs) {
         const actionsBefore = allEvents
-            .filter(e => e.type.startsWith('action.') && e.ts_epoch_ms <= firstAnchorTs)
+            .filter(e => getEventType(e).startsWith('action.') && e.ts_epoch_ms <= firstAnchorTs)
             .sort((a, b) => b.ts_epoch_ms - a.ts_epoch_ms);
         likelyTrigger = actionsBefore[0] || null;
     }
