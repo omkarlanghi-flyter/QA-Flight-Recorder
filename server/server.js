@@ -85,6 +85,90 @@ function countIngestPayloadEvents(body) {
     return body ? 1 : 0;
 }
 
+function sendApiError(res, status, code, message, details) {
+    return res.status(status).json({
+        ok: false,
+        code,
+        message,
+        details: details || null,
+    });
+}
+
+function ensureObjectBody(body) {
+    if (body === undefined || body === null) return {};
+    if (typeof body !== 'object' || Array.isArray(body)) return null;
+    return body;
+}
+
+function validateReplayBody(body) {
+    const errors = [];
+    if (body.profileDir !== undefined && typeof body.profileDir !== 'string') {
+        errors.push('profileDir must be a string when provided');
+    }
+    if (body.profileDir !== undefined && typeof body.profileDir === 'string' && body.profileDir.trim().length === 0) {
+        errors.push('profileDir cannot be empty');
+    }
+    if (body.stepDelay !== undefined) {
+        const stepDelay = Number(body.stepDelay);
+        if (!Number.isFinite(stepDelay) || stepDelay < 0 || stepDelay > 60000) {
+            errors.push('stepDelay must be a number between 0 and 60000');
+        }
+    }
+    return errors;
+}
+
+function validateBatchBody(events) {
+    const errs = [];
+    if (!Array.isArray(events)) return ['request body must be an event object or event array'];
+    if (events.length === 0) errs.push('event batch cannot be empty');
+    if (events.length > 5000) errs.push('event batch too large (max 5000 events)');
+    for (let i = 0; i < events.length; i++) {
+        const e = events[i];
+        if (!e || typeof e !== 'object' || Array.isArray(e)) {
+            errs.push(`event at index ${i} must be an object`);
+            continue;
+        }
+        const t = e.event_type || e.type;
+        if (t !== undefined && typeof t !== 'string') {
+            errs.push(`event at index ${i} has invalid type/event_type`);
+        }
+    }
+    return errs;
+}
+
+function validateFlowCreateBody(payload) {
+    const errors = [];
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+        return ['request body must be an object'];
+    }
+    const flow = payload.flow || payload;
+    const steps = payload.steps || [];
+    if (!flow || typeof flow !== 'object' || Array.isArray(flow)) {
+        errors.push('flow must be an object');
+    }
+    if (!Array.isArray(steps)) {
+        errors.push('steps must be an array when provided');
+    }
+    return errors;
+}
+
+function validateFlowRunBody(body) {
+    const errors = [];
+    if (body.regenerate !== undefined && typeof body.regenerate !== 'boolean') {
+        errors.push('regenerate must be boolean when provided');
+    }
+    if (body.release_id !== undefined && typeof body.release_id !== 'string') {
+        errors.push('release_id must be a string when provided');
+    }
+    if (body.stepDelay !== undefined) {
+        const stepDelay = Number(body.stepDelay);
+        if (!Number.isFinite(stepDelay) || stepDelay < 0 || stepDelay > 60000) {
+            errors.push('stepDelay must be a number between 0 and 60000');
+        }
+    }
+    return errors;
+}
+
 // Flow plan cache helper
 function getFlowPlanPath(flowId) {
     const dir = path.join(db.DATA_DIR, 'flows', flowId);
@@ -288,7 +372,18 @@ app.get('/sanity-flows', (req, res) => {
  */
 app.post('/sessions/:id/replay', async (req, res) => {
     const eventsFile = getEventsFile(req.params.id);
-    if (!fs.existsSync(eventsFile)) return res.status(404).json({ error: 'Events not found' });
+    if (!fs.existsSync(eventsFile)) {
+        return sendApiError(res, 404, 'EVENTS_NOT_FOUND', 'Events not found for this session');
+    }
+
+    const body = ensureObjectBody(req.body);
+    if (body === null) {
+        return sendApiError(res, 400, 'INVALID_BODY', 'Request body must be a JSON object');
+    }
+    const replayValidationErrors = validateReplayBody(body);
+    if (replayValidationErrors.length > 0) {
+        return sendApiError(res, 400, 'INVALID_REPLAY_OPTIONS', 'Replay options validation failed', replayValidationErrors);
+    }
 
     const content = fs.readFileSync(eventsFile, 'utf8').trim();
     const events = content ? parseNdjsonEvents(content) : [];
@@ -297,16 +392,16 @@ app.post('/sessions/:id/replay', async (req, res) => {
 
     try {
         const options = { startUrl: session?.url };
-        if (req.body && req.body.profileDir) {
+        if (body.profileDir) {
             // Expand tilde if present
-            let pdir = req.body.profileDir.trim();
+            let pdir = body.profileDir.trim();
             if (pdir.startsWith('~')) {
                 pdir = require('path').join(require('os').homedir(), pdir.slice(1));
             }
             options.profileDir = pdir;
         }
-        if (req.body && req.body.stepDelay !== undefined) {
-            options.stepDelay = Number(req.body.stepDelay);
+        if (body.stepDelay !== undefined) {
+            options.stepDelay = Number(body.stepDelay);
         }
 
         const engine = new ReplayEngine(events, options);
@@ -319,10 +414,10 @@ app.post('/sessions/:id/replay', async (req, res) => {
         fs.mkdirSync(replaysDir, { recursive: true });
         fs.writeFileSync(path.join(replaysDir, `${report.timestamp}.json`), JSON.stringify(report, null, 2));
 
-        res.json({ report });
+        res.json({ ok: true, report });
     } catch (err) {
         activeReplays.delete(req.params.id);
-        res.status(500).json({ error: err.message });
+        return sendApiError(res, 500, 'REPLAY_FAILED', 'Replay execution failed', { reason: err.message });
     }
 });
 
@@ -333,10 +428,14 @@ app.post('/sessions/:id/replay', async (req, res) => {
 app.post('/sessions/:id/replay/stop', async (req, res) => {
     const engine = activeReplays.get(req.params.id);
     if (engine) {
-        await engine.abort();
-        res.json({ ok: true });
+        try {
+            await engine.abort();
+            res.json({ ok: true });
+        } catch (err) {
+            return sendApiError(res, 500, 'REPLAY_STOP_FAILED', 'Failed to stop replay', { reason: err.message });
+        }
     } else {
-        res.status(404).json({ error: 'No active replay for this session' });
+        return sendApiError(res, 404, 'REPLAY_NOT_ACTIVE', 'No active replay for this session');
     }
 });
 
@@ -786,10 +885,15 @@ app.post('/sessions', (req, res) => {
 app.post('/sessions/:id/events/batch', (req, res) => {
     const { id } = req.params;
     const session = db.getSession(id);
-    if (!session) return res.status(404).json({ error: 'Session not found' });
+    if (!session) return sendApiError(res, 404, 'SESSION_NOT_FOUND', 'Session not found');
 
     let events = req.body;
     if (!Array.isArray(events)) events = [events];
+
+    const batchValidationErrors = validateBatchBody(events);
+    if (batchValidationErrors.length > 0) {
+        return sendApiError(res, 400, 'INVALID_EVENT_BATCH', 'Event batch validation failed', batchValidationErrors);
+    }
 
     ingestMetrics.v2_calls += 1;
 
@@ -808,7 +912,7 @@ app.post('/sessions/:id/events/batch', (req, res) => {
     }
 
     if (result.fatal) {
-        return res.status(500).json({ ok: false, ...result });
+        return sendApiError(res, 500, 'INGEST_WRITE_FAILED', 'Failed to persist event batch', result.errors);
     }
 
     res.json({ ok: true, ...result });
@@ -948,14 +1052,23 @@ app.post('/sessions/:id/promote', (req, res) => {
  * POST /flows
  */
 app.post('/flows', (req, res) => {
+    const body = ensureObjectBody(req.body);
+    if (body === null) {
+        return sendApiError(res, 400, 'INVALID_BODY', 'Request body must be a JSON object');
+    }
+    const flowValidationErrors = validateFlowCreateBody(body);
+    if (flowValidationErrors.length > 0) {
+        return sendApiError(res, 400, 'INVALID_FLOW_PAYLOAD', 'Flow payload validation failed', flowValidationErrors);
+    }
+
     try {
-        const payload = req.body || {};
+        const payload = body;
         const flow = payload.flow || payload;
         const steps = payload.steps || [];
         const result = flowStore.createFlow(flow, steps);
         res.status(201).json({ ok: true, flow: result.flow, steps: result.steps });
     } catch (err) {
-        res.status(400).json({ error: err.message });
+        return sendApiError(res, 400, 'FLOW_VALIDATION_FAILED', 'Unable to create flow', { reason: err.message });
     }
 });
 
@@ -990,11 +1103,19 @@ app.get('/flows/:id', (req, res) => {
  * PATCH /flows/:id
  */
 app.patch('/flows/:id', (req, res) => {
+    const body = ensureObjectBody(req.body);
+    if (body === null) {
+        return sendApiError(res, 400, 'INVALID_BODY', 'Request body must be a JSON object');
+    }
+
     try {
-        const updated = flowStore.updateFlow(req.params.id, req.body || {});
+        const updated = flowStore.updateFlow(req.params.id, body);
         res.json(updated);
     } catch (err) {
-        res.status(err.message.includes('not found') ? 404 : 400).json({ error: err.message });
+        const notFound = err.message.toLowerCase().includes('not found');
+        const status = notFound ? 404 : 400;
+        const code = notFound ? 'FLOW_NOT_FOUND' : 'FLOW_UPDATE_FAILED';
+        return sendApiError(res, status, code, 'Unable to update flow', { reason: err.message });
     }
 });
 
@@ -1017,15 +1138,20 @@ app.delete('/flows/:id', (req, res) => {
  * Generates and caches an execution plan for a flow
  */
 app.post('/flows/:id/plan', (req, res) => {
+    const body = ensureObjectBody(req.body);
+    if (body === null) {
+        return sendApiError(res, 400, 'INVALID_BODY', 'Request body must be a JSON object');
+    }
+
     const result = flowStore.getFlow(req.params.id, { withSteps: true });
-    if (!result) return res.status(404).json({ error: 'Flow not found' });
+    if (!result) return sendApiError(res, 404, 'FLOW_NOT_FOUND', 'Flow not found');
     try {
         const plan = createPlan(result.flow, result.steps);
         const planPath = getFlowPlanPath(req.params.id);
         fs.writeFileSync(planPath, JSON.stringify(plan, null, 2));
         res.json({ ok: true, plan });
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        return sendApiError(res, 500, 'PLAN_GENERATION_FAILED', 'Unable to generate execution plan', { reason: err.message });
     }
 });
 
@@ -1035,7 +1161,7 @@ app.post('/flows/:id/plan', (req, res) => {
 app.get('/flows/:id/plan', (req, res) => {
     const { id } = req.params;
     const result = flowStore.getFlow(id, { withSteps: true });
-    if (!result) return res.status(404).json({ error: 'Flow not found' });
+    if (!result) return sendApiError(res, 404, 'FLOW_NOT_FOUND', 'Flow not found');
     const planPath = getFlowPlanPath(id);
     try {
         if (fs.existsSync(planPath) && !req.query.regenerate) {
@@ -1046,7 +1172,7 @@ app.get('/flows/:id/plan', (req, res) => {
         fs.writeFileSync(planPath, JSON.stringify(plan, null, 2));
         res.json({ plan, cached: false });
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        return sendApiError(res, 500, 'PLAN_READ_FAILED', 'Unable to read or generate execution plan', { reason: err.message });
     }
 });
 
@@ -1113,32 +1239,42 @@ app.get('/releases/:id', (req, res) => {
  * Generates plan (if needed) and executes via ReplayEngine
  */
 app.post('/flows/:id/run', async (req, res) => {
+    const body = ensureObjectBody(req.body);
+    if (body === null) {
+        return sendApiError(res, 400, 'INVALID_BODY', 'Request body must be a JSON object');
+    }
+    const flowRunValidationErrors = validateFlowRunBody(body);
+    if (flowRunValidationErrors.length > 0) {
+        return sendApiError(res, 400, 'INVALID_FLOW_RUN_OPTIONS', 'Flow run options validation failed', flowRunValidationErrors);
+    }
+
     const { id } = req.params;
     const result = flowStore.getFlow(id, { withSteps: true });
-    if (!result) return res.status(404).json({ error: 'Flow not found' });
+    if (!result) return sendApiError(res, 404, 'FLOW_NOT_FOUND', 'Flow not found');
 
     const planPath = getFlowPlanPath(id);
     let plan;
     try {
-        if (req.body?.regenerate || !fs.existsSync(planPath)) {
+        if (body.regenerate || !fs.existsSync(planPath)) {
             plan = createPlan(result.flow, result.steps);
             fs.writeFileSync(planPath, JSON.stringify(plan, null, 2));
         } else {
             plan = JSON.parse(fs.readFileSync(planPath, 'utf8'));
         }
     } catch (err) {
-        return res.status(500).json({ error: err.message });
+        return sendApiError(res, 500, 'PLAN_GENERATION_FAILED', 'Unable to prepare flow execution plan', { reason: err.message });
     }
 
+    let runId = null;
     try {
-        const runId = uuidv4();
-        db.createRun({ run_id: runId, flow_id: id, flow_version: result.flow.version, release_id: req.body?.release_id, started_at: Date.now() });
+        runId = uuidv4();
+        db.createRun({ run_id: runId, flow_id: id, flow_version: result.flow.version, release_id: body.release_id, started_at: Date.now() });
 
         const firstNavigateStep = (plan.steps || []).find(s => s.step_type === 'navigate');
         const inferredStartUrl = firstNavigateStep?.url || firstNavigateStep?.meta?.url || null;
         const options = {
             startUrl: result.flow?.module_start_url || result.flow?.start_url || inferredStartUrl,
-            ...req.body,
+            ...body,
         };
         const engine = new ReplayEngine([], options);
         const report = await engine.runPlan(plan);
@@ -1182,7 +1318,12 @@ app.post('/flows/:id/run', async (req, res) => {
 
         res.json({ run_id: runId, report, cluster_counts: clusterCounts });
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        if (runId) {
+            try {
+                db.updateRun(runId, { status: 'failed', finished_at: Date.now(), score: 0 });
+            } catch { }
+        }
+        return sendApiError(res, 500, 'FLOW_RUN_FAILED', 'Flow run execution failed', { reason: err.message, run_id: runId });
     }
 });
 
