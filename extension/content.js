@@ -157,6 +157,7 @@ if (!window.__qaRecorderInjected) {
     function handleInput(e) {
         const el = e.target;
         if (!['INPUT', 'TEXTAREA'].includes(el.tagName)) return;
+        if (el.type === 'checkbox' || el.type === 'radio') return;
 
         // Debounce: wait 600ms after user stops typing before emitting
         if (inputTimers.has(el)) clearTimeout(inputTimers.get(el));

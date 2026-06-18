@@ -218,10 +218,12 @@ class ReplayEngine {
       this._attachListeners(this.page);
 
       // Filter to actionable steps only (ignore stray/duplicate actions outside recorder context)
+      // Only content/user-sourced events are replayed; browser-sourced events are
+      // automatic duplicates from chrome.tabs.onUpdated that include pre-recording tab noise.
       const rawSteps = this.events.filter(e => {
         if (!e || !e.type || !e.type.startsWith('action.')) return false;
         if (e.type === 'action.navigation') {
-          return e.source === 'browser' || e.source === 'content';
+          return e.source === 'content';
         }
         return e.source === 'content' || e.source === 'user';
       });
@@ -1297,13 +1299,20 @@ class ReplayEngine {
       // ── Input ───────────────────────────────────────────────────────────────
       } else if (step.type === 'action.input') {
         const selStart = Date.now();
+        const inputType = data.input_type || data.type || '';
+        const isCheckable = inputType === 'checkbox' || inputType === 'radio';
         const locator = await this._resolveLocator(page, data);
         recordSelector(this._countSelectorStrategies(data), Date.now() - selStart);
         if (locator) {
           await locator.waitFor({ state: 'visible', timeout: this.timeouts.elementVisible });
-          // Clear field first, then fill with final value
-          await locator.clear({ timeout: this.timeouts.click }).catch(() => {});
-          await locator.fill(String(data.final_value ?? data.text ?? ''), { timeout: this.timeouts.click });
+          if (isCheckable) {
+            const checked = data.final_value === 'true' || data.final_value === 'on';
+            await locator.setChecked(checked, { timeout: this.timeouts.click });
+          } else {
+            // Clear field first, then fill with final value
+            await locator.clear({ timeout: this.timeouts.click }).catch(() => {});
+            await locator.fill(String(data.final_value ?? data.text ?? ''), { timeout: this.timeouts.click });
+          }
         } else {
           const tried = (data.selector_strategies || (data.selector ? [data.selector] : [])).join(' | ');
           throw new Error(`Input element not found. Tried: ${tried || 'no selectors'}`);

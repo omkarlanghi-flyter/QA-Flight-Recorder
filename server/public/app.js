@@ -410,7 +410,8 @@ async function runSanityFlow(e, sessionId, flowName, moduleName) {
     const pdir = document.getElementById('sanity-profile-dir')?.value || '';
     const sdelay = document.getElementById('sanity-step-delay')?.value || '';
     
-    let bodyObj = { profileDir: pdir };
+    let bodyObj = {};
+    if (pdir) bodyObj.profileDir = pdir;
     if (sdelay) bodyObj.stepDelay = parseInt(sdelay, 10);
 
     const res = await fetch(`${API}/sessions/${sessionId}/replay`, { 
@@ -419,7 +420,8 @@ async function runSanityFlow(e, sessionId, flowName, moduleName) {
       body: JSON.stringify(bodyObj)
     });
     const data = await res.json();
-    if (data.error) throw new Error(data.error);
+    if (!data.ok || data.error) throw new Error(data.message || data.error || 'Replay failed');
+    if (!data.report) throw new Error('No report returned from replay engine');
     const { report } = data;
     
     // Check if the engine completely crashed or failed to connect
