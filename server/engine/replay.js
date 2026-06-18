@@ -225,6 +225,12 @@ class ReplayEngine {
         if (e.type === 'action.navigation') {
           return e.source === 'content';
         }
+        if (e.type === 'action.input') {
+          // Skip checkbox/radio input events — they are auto-generated noise from
+          // the content script's change handler, not intentional user actions.
+          const inputType = e.data?.input_type || e.data?.type || '';
+          if (inputType === 'checkbox' || inputType === 'radio') return false;
+        }
         return e.source === 'content' || e.source === 'user';
       });
 

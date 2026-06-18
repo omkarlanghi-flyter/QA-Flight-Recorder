@@ -194,16 +194,6 @@ if (!window.__qaRecorderInjected) {
                 selected_text: selectedOption ? selectedOption.text : '',
                 tag: 'select',
             });
-        } else if (el.tagName === 'INPUT' && ['checkbox', 'radio'].includes(el.type)) {
-            const { primary, strategies } = getSelectors(el);
-            sendEvent('action.input', {
-                selector: primary,
-                selector_strategies: strategies,
-                final_value: String(el.checked),
-                input_type: el.type,
-                is_sensitive: false,
-                tag: 'input',
-            });
         }
     }, { capture: true, passive: true });
 
