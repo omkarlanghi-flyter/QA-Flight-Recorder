@@ -1272,8 +1272,11 @@ app.post('/flows/:id/run', async (req, res) => {
 
         const firstNavigateStep = (plan.steps || []).find(s => s.step_type === 'navigate');
         const inferredStartUrl = firstNavigateStep?.url || firstNavigateStep?.meta?.url || null;
+        const runsDir = path.join(db.DATA_DIR, 'flows', id, 'runs');
+        const artifactDir = path.join(runsDir, runId, 'artifacts');
         const options = {
             startUrl: result.flow?.module_start_url || result.flow?.start_url || inferredStartUrl,
+            artifactDir,
             ...body,
         };
         const engine = new ReplayEngine([], options);
@@ -1291,6 +1294,8 @@ app.post('/flows/:id/run', async (req, res) => {
             duration_ms: s.duration_ms,
             label: s.label || null,
             associated_network_failures: s.associated_network_failures || [],
+            artifact_paths: s.artifact_paths || [],
+            artifact_errors: s.artifact_errors || [],
             error: s.error,
             selector: s.selector,
             timings: {
@@ -1311,8 +1316,6 @@ app.post('/flows/:id/run', async (req, res) => {
 
         db.updateRun(runId, { status: 'done', finished_at: Date.now(), score, cluster_counts: clusterCounts, timings: report.timings || {} });
 
-        const runsDir = path.join(db.DATA_DIR, 'flows', id, 'runs');
-        fs.mkdirSync(runsDir, { recursive: true });
         const ts = Date.now();
         fs.writeFileSync(path.join(runsDir, `${ts}.json`), JSON.stringify({ run_id: runId, report }, null, 2));
 

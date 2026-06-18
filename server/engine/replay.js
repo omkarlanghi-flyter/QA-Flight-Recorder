@@ -2,13 +2,14 @@ const { chromium } = require('playwright');
 const { spawn } = require('child_process');
 const path = require('path');
 const os = require('os');
+const fs = require('fs');
 const { evaluateAssertions } = require('./assertions');
 
 class ReplayEngine {
   constructor(events, options = {}) {
     this.events = events || [];
     this.options = options;
-    this.profileDir = options.profileDir || path.join(os.homedir(), '.qa-automation-profile');
+    this.profileDir = options.profileDir || path.join(os.homedir(), '.qa-flight-recorder-profile');
     this.cdpUrl = options.cdpUrl || 'http://127.0.0.1:9223';
     this.retries = options.retries || 2;
     this.timeouts = {
@@ -25,6 +26,7 @@ class ReplayEngine {
     this.minAdaptiveWait = options.minAdaptiveWait || 1000;
     this.strictNetworkWait = options.strictNetworkWait || false; // if true, network missing = fail; else warn
     this.abortOnFailure = options.abortOnFailure || false; // if true, stop replay on first failure
+    this.artifactDir = options.artifactDir || null; // directory to write per-step debug artifacts
     this.aborted = false;
     this.browser = null;
     this.activeStepIndex = -1;
@@ -45,6 +47,48 @@ class ReplayEngine {
         total_run_time_ms: 0,
       },
     };
+  }
+
+  async _captureStepArtifact(stepIndex, stepReport, page) {
+    if (!this.artifactDir || !page || page.isClosed()) return;
+    const tStart = Date.now();
+    const stepDir = path.join(this.artifactDir, `step-${stepIndex}`);
+    try {
+      fs.mkdirSync(stepDir, { recursive: true });
+      // Screenshot on failure
+      try {
+        const screenshotPath = path.join(stepDir, 'screenshot.png');
+        await page.screenshot({ path: screenshotPath, fullPage: false });
+        stepReport.artifact_paths = stepReport.artifact_paths || [];
+        stepReport.artifact_paths.push(screenshotPath);
+      } catch (e) {
+        stepReport.artifact_errors = stepReport.artifact_errors || [];
+        stepReport.artifact_errors.push(`screenshot: ${e.message}`);
+      }
+      // Debug context
+      const debugContext = {
+        step_index: stepIndex,
+        step_type: stepReport.step_type,
+        selector: stepReport.selector,
+        error: stepReport.error,
+        attempts: stepReport.attempts,
+        retry_count: stepReport.retry_count,
+        selector_attempt_count: stepReport.selector_attempt_count,
+        wait_reason: stepReport.wait_reason,
+        wait_duration_ms: stepReport.wait_duration_ms,
+        associated_network_failures: stepReport.associated_network_failures || [],
+        page_url: page.url(),
+        timestamp: Date.now(),
+      };
+      const debugPath = path.join(stepDir, 'debug.json');
+      require('fs').writeFileSync(debugPath, JSON.stringify(debugContext, null, 2));
+      stepReport.artifact_paths = stepReport.artifact_paths || [];
+      stepReport.artifact_paths.push(debugPath);
+    } catch (e) {
+      stepReport.artifact_errors = stepReport.artifact_errors || [];
+      stepReport.artifact_errors.push(`artifact_dir: ${e.message}`);
+    }
+    this.report.timings.artifact_capture_time_ms += Date.now() - tStart;
   }
 
   async abort() {
@@ -362,6 +406,8 @@ class ReplayEngine {
           artifact_duration_ms: 0,
           associated_logs: [],
           associated_network_failures: [],
+          artifact_paths: [],
+          artifact_errors: [],
         };
         this.report.steps.push(stepReport);
 
@@ -387,6 +433,7 @@ class ReplayEngine {
           stepReport.error = outcome.error?.message || 'step failed';
           this.report.summary.failed++;
           this.report.failures.ui.push({ step_index: i + 1, type: pStep.step_type, message: stepReport.error });
+          await this._captureStepArtifact(i + 1, stepReport, this.page);
           if (this.abortOnFailure) break;
         }
 
@@ -408,6 +455,7 @@ class ReplayEngine {
             this.report.summary.failed++;
             this.report.summary.passed = Math.max(0, this.report.summary.passed - 1);
             this.report.failures.ui.push({ step_index: i + 1, type: pStep.step_type, message: 'assertion failed' });
+            await this._captureStepArtifact(i + 1, stepReport, this.page);
           }
         }
       }
