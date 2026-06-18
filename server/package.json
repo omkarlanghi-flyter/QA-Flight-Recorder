@@ -8,7 +8,8 @@
         "dev": "nodemon server.js",
         "test:replay-accounting": "node test_replay_accounting.js",
         "test:triage-diagnosis": "node test_triage_diagnosis.js",
-        "test:event-types": "node test_event_type_normalization.js"
+        "test:event-types": "node test_event_type_normalization.js",
+        "test:assertions": "node test_assertions.js"
     },
     "dependencies": {
         "archiver": "^6.0.1",

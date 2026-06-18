@@ -32,6 +32,7 @@ class ReplayEngine {
       summary: { total_steps: 0, passed: 0, failed: 0 },
       failures: { ui: [], network: [], js_errors: [] },
       steps: [],
+      runtime: { network_events: [], console_events: [] },
       timings: {
         browser_start_time_ms: 0,
         profile_load_time_ms: 0,
@@ -303,6 +304,7 @@ class ReplayEngine {
       summary: { total_steps: plan.steps.length, passed: 0, failed: 0 },
       failures: { ui: [], network: [], js_errors: [] },
       steps: [],
+      runtime: { network_events: [], console_events: [] },
       timings: {
         browser_start_time_ms: 0,
         profile_load_time_ms: 0,
@@ -391,7 +393,11 @@ class ReplayEngine {
         // Evaluate assertions after action completes
         if (Array.isArray(pStep.assertions) && pStep.assertions.length > 0) {
           const tAssert = Date.now();
-          const assertResult = await evaluateAssertions(pStep.assertions, { page: this.page, report: this.report });
+          const assertResult = await evaluateAssertions(pStep.assertions, {
+            page: this.page,
+            report: this.report,
+            stepReport,
+          });
           const assertDur = Date.now() - tAssert;
           stepReport.assertion_duration_ms = assertDur;
           this.report.timings.assertion_time_ms += assertDur;
@@ -503,9 +509,18 @@ class ReplayEngine {
   }
 
   _attachListeners(page) {
+    const requestMeta = new Map();
+
     page.on('console', msg => {
       const type = msg.type();
-      const text = `[${type}] ${msg.text()}`;
+      const rawText = msg.text();
+      const text = `[${type}] ${rawText}`;
+      this.report.runtime.console_events.push({
+        type,
+        message: rawText.slice(0, 500),
+        ts_epoch_ms: Date.now(),
+        step_index: this.activeStepIndex > 0 ? this.activeStepIndex : null,
+      });
       if (type === 'error') {
         this.report.failures.js_errors.push({ type: 'console', message: text.slice(0, 300) });
       }
@@ -514,21 +529,69 @@ class ReplayEngine {
       }
     });
     page.on('pageerror', err => {
+      this.report.runtime.console_events.push({
+        type: 'page_error',
+        message: String(err.message || '').slice(0, 500),
+        ts_epoch_ms: Date.now(),
+        step_index: this.activeStepIndex > 0 ? this.activeStepIndex : null,
+      });
       this.report.failures.js_errors.push({ type: 'page_error', message: err.message.slice(0, 300) });
       if (this.activeStepIndex > 0 && this.report.steps[this.activeStepIndex - 1]) {
         this.report.steps[this.activeStepIndex - 1].associated_logs.push(`[uncaught] ${err.message.slice(0, 200)}`);
       }
     });
+    page.on('request', req => {
+      const meta = {
+        url: req.url(),
+        method: req.method(),
+        started_at: Date.now(),
+        step_index: this.activeStepIndex > 0 ? this.activeStepIndex : null,
+      };
+      requestMeta.set(req, meta);
+      this.report.runtime.network_events.push({
+        kind: 'request',
+        url: meta.url,
+        method: meta.method,
+        ts_epoch_ms: meta.started_at,
+        step_index: meta.step_index,
+      });
+    });
     page.on('requestfailed', req => {
       const url = req.url();
       const errText = req.failure()?.errorText || 'failed';
+      const meta = requestMeta.get(req);
+      const now = Date.now();
+      const durationMs = meta ? Math.max(0, now - meta.started_at) : null;
+      this.report.runtime.network_events.push({
+        kind: 'failure',
+        url,
+        method: req.method(),
+        error: errText,
+        duration_ms: durationMs,
+        ts_epoch_ms: now,
+        step_index: meta?.step_index ?? (this.activeStepIndex > 0 ? this.activeStepIndex : null),
+      });
       this.report.failures.network.push({ url, error: errText });
       if (this.activeStepIndex > 0 && this.report.steps[this.activeStepIndex - 1]) {
         this.report.steps[this.activeStepIndex - 1].associated_network_failures.push(`${url} → ${errText}`);
       }
+      requestMeta.delete(req);
     });
     page.on('response', resp => {
       const status = resp.status();
+      const req = resp.request();
+      const meta = requestMeta.get(req);
+      const now = Date.now();
+      const durationMs = meta ? Math.max(0, now - meta.started_at) : null;
+      this.report.runtime.network_events.push({
+        kind: 'response',
+        url: resp.url(),
+        method: req.method(),
+        status,
+        duration_ms: durationMs,
+        ts_epoch_ms: now,
+        step_index: meta?.step_index ?? (this.activeStepIndex > 0 ? this.activeStepIndex : null),
+      });
       if (status >= 400) {
         const url = resp.url();
         this.report.failures.network.push({ url, status, error: `HTTP ${status}` });
@@ -536,6 +599,7 @@ class ReplayEngine {
           this.report.steps[this.activeStepIndex - 1].associated_network_failures.push(`${url} → HTTP ${status}`);
         }
       }
+      requestMeta.delete(req);
     });
   }
 
