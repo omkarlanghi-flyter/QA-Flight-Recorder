@@ -157,4 +157,5 @@ Repeated console errors are **deduplicated** by signature (only first occurrence
 - **Multi-tab recording**: Record across multiple tabs simultaneously
 - **Custom redaction rules**: Configure per-domain URL/header redaction
 - **Cloud export**: Optional S3/GCS export for team sharing
+
 - **GitLab/GitHub integration**: Auto-create issues from bug markers
