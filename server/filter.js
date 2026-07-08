@@ -112,10 +112,10 @@ function generateTriageView(sessionDir, ignoredSignatures = []) {
 
     const anchorEventSet = new Set();
 
-    // Include all console warn/error + runtime exceptions
+    // Include all console warn/error + runtime exceptions + websocket errors
     for (const event of allEvents) {
         const type = getEventType(event);
-        if (['console.warn', 'console.error', 'runtime.exception'].includes(type)) {
+        if (['console.warn', 'console.error', 'runtime.exception', 'network.ws_error'].includes(type)) {
             anchorTimestamps.add(event.ts_epoch_ms);
             anchorEventSet.add(event);
             rulesTriggered.push({ rule: type, ts: event.ts_epoch_ms });

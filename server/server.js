@@ -7,17 +7,13 @@ const { v4: uuidv4 } = require('uuid');
 const archiver = require('archiver');
 const multer = require('multer');
 
-const { ReplayEngine } = require('./engine/replay');
-const { createPlan } = require('./engine/planner');
-const { attachClusters } = require('./engine/failure_clusterer');
 const db = require('./db');
 const { createIngestionContext, destroyIngestionContext } = require('./ingestion/ingestion');
 const { normalize } = require('./normalization/normalizer');
-const flowStore = require('./flows/flow_store');
 const { getEventType, normalizeEventType } = require('./event_type');
-
-const activeReplays = new Map();
 const { generateTriageView, errorSignature } = require('./filter');
+const { resolveStack } = require('./debug/sourcemap');
+const slack = require('./integrations/slack');
 
 const ingestMetrics = {
     legacy_calls: 0,
@@ -45,6 +41,11 @@ function saveIgnored(list) {
 }
 
 const PORT = process.env.PORT || 17890;
+// Default stays localhost-only (this tool is local-first / privacy-first).
+// Set HOST=0.0.0.0 to let a teammate on the same trusted network open the
+// dashboard directly and share session links — there is no auth layer, so
+// only do this on a network you trust.
+const HOST = process.env.HOST || '127.0.0.1';
 const app = express();
 
 // Configure multer for in-memory video chunk uploads
@@ -94,29 +95,6 @@ function sendApiError(res, status, code, message, details) {
     });
 }
 
-function ensureObjectBody(body) {
-    if (body === undefined || body === null) return {};
-    if (typeof body !== 'object' || Array.isArray(body)) return null;
-    return body;
-}
-
-function validateReplayBody(body) {
-    const errors = [];
-    if (body.profileDir !== undefined && typeof body.profileDir !== 'string') {
-        errors.push('profileDir must be a string when provided');
-    }
-    if (body.profileDir !== undefined && typeof body.profileDir === 'string' && body.profileDir.trim().length === 0) {
-        errors.push('profileDir cannot be empty');
-    }
-    if (body.stepDelay !== undefined) {
-        const stepDelay = Number(body.stepDelay);
-        if (!Number.isFinite(stepDelay) || stepDelay < 0 || stepDelay > 60000) {
-            errors.push('stepDelay must be a number between 0 and 60000');
-        }
-    }
-    return errors;
-}
-
 function validateBatchBody(events) {
     const errs = [];
     if (!Array.isArray(events)) return ['request body must be an event object or event array'];
@@ -136,46 +114,6 @@ function validateBatchBody(events) {
     return errs;
 }
 
-function validateFlowCreateBody(payload) {
-    const errors = [];
-    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
-        return ['request body must be an object'];
-    }
-    const flow = payload.flow || payload;
-    const steps = payload.steps || [];
-    if (!flow || typeof flow !== 'object' || Array.isArray(flow)) {
-        errors.push('flow must be an object');
-    }
-    if (!Array.isArray(steps)) {
-        errors.push('steps must be an array when provided');
-    }
-    return errors;
-}
-
-function validateFlowRunBody(body) {
-    const errors = [];
-    if (body.regenerate !== undefined && typeof body.regenerate !== 'boolean') {
-        errors.push('regenerate must be boolean when provided');
-    }
-    if (body.release_id !== undefined && typeof body.release_id !== 'string') {
-        errors.push('release_id must be a string when provided');
-    }
-    if (body.stepDelay !== undefined) {
-        const stepDelay = Number(body.stepDelay);
-        if (!Number.isFinite(stepDelay) || stepDelay < 0 || stepDelay > 60000) {
-            errors.push('stepDelay must be a number between 0 and 60000');
-        }
-    }
-    return errors;
-}
-
-// Flow plan cache helper
-function getFlowPlanPath(flowId) {
-    const dir = path.join(db.DATA_DIR, 'flows', flowId);
-    fs.mkdirSync(dir, { recursive: true });
-    return path.join(dir, 'latest_plan.json');
-}
-
 function appendEvents(sessionId, events) {
     const file = getEventsFile(sessionId);
     const lines = events.map(e => JSON.stringify(e)).join('\n') + '\n';
@@ -192,38 +130,34 @@ function appendEvents(sessionId, events) {
 app.post('/session/start', (req, res) => {
     const sessionId = uuidv4();
     const now = Date.now();
-    const { tab_id, url, title, recording_type, flow_name, module_name } = req.body || {};
+    const { tab_id, url, title, browser_info } = req.body || {};
 
     const sessionDir = getSessionDir(sessionId);
     fs.mkdirSync(path.join(sessionDir, 'raw'), { recursive: true });
     fs.mkdirSync(path.join(sessionDir, 'views'), { recursive: true });
     fs.mkdirSync(path.join(sessionDir, 'video'), { recursive: true });
 
-    const meta = { 
-        id: sessionId, 
-        started_at: now, 
-        tab_id, 
-        url, 
-        title, 
+    const meta = {
+        id: sessionId,
+        started_at: now,
+        tab_id,
+        url,
+        title,
         status: 'recording',
-        recording_type,
-        flow_name,
-        module_name 
+        browser_info: browser_info || null,
     };
     fs.writeFileSync(path.join(sessionDir, 'meta.json'), JSON.stringify(meta, null, 2));
 
-    db.createSession({ 
-        id: sessionId, 
-        started_at: now, 
-        tab_id: tab_id || null, 
-        url: url || null, 
+    db.createSession({
+        id: sessionId,
+        started_at: now,
+        tab_id: tab_id || null,
+        url: url || null,
         title: title || null,
-        recording_type,
-        flow_name,
-        module_name
+        browser_info: browser_info || null,
     });
 
-    console.log(`[START] Session ${sessionId} for tab ${tab_id} url=${url} type=${recording_type || 'default'}`);
+    console.log(`[START] Session ${sessionId} for tab ${tab_id} url=${url}`);
     res.json({ session_id: sessionId, started_at: now });
 });
 
@@ -351,145 +285,6 @@ app.post('/session/:id/stop', async (req, res) => {
     }
 
     res.json({ ok: true, session_id: id, duration_ms: stoppedAt - session.started_at });
-});
-
-/**
- * GET /sanity-flows
- * Returns aggregated sanity flows (latest per flow_name)
- */
-app.get('/sanity-flows', (req, res) => {
-    try {
-        const flows = db.listSanityFlows();
-        res.json({ flows });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-
-/**
- * POST /sessions/:id/replay
- * Replays a session using Playwright and CDP connection
- */
-app.post('/sessions/:id/replay', async (req, res) => {
-    const eventsFile = getEventsFile(req.params.id);
-    if (!fs.existsSync(eventsFile)) {
-        return sendApiError(res, 404, 'EVENTS_NOT_FOUND', 'Events not found for this session');
-    }
-
-    const body = ensureObjectBody(req.body);
-    if (body === null) {
-        return sendApiError(res, 400, 'INVALID_BODY', 'Request body must be a JSON object');
-    }
-    const replayValidationErrors = validateReplayBody(body);
-    if (replayValidationErrors.length > 0) {
-        return sendApiError(res, 400, 'INVALID_REPLAY_OPTIONS', 'Replay options validation failed', replayValidationErrors);
-    }
-
-    const content = fs.readFileSync(eventsFile, 'utf8').trim();
-    const events = content ? parseNdjsonEvents(content) : [];
-
-    const session = db.getSession(req.params.id);
-
-    try {
-        const options = { startUrl: session?.url };
-        if (body.profileDir) {
-            // Expand tilde if present
-            let pdir = body.profileDir.trim();
-            if (pdir.startsWith('~')) {
-                pdir = require('path').join(require('os').homedir(), pdir.slice(1));
-            }
-            options.profileDir = pdir;
-        }
-        if (body.stepDelay !== undefined) {
-            options.stepDelay = Number(body.stepDelay);
-        }
-
-        const engine = new ReplayEngine(events, options);
-        activeReplays.set(req.params.id, engine);
-        const report = await engine.run();
-        activeReplays.delete(req.params.id);
-
-        report.timestamp = Date.now();
-        const replaysDir = path.join(getSessionDir(req.params.id), 'replays');
-        fs.mkdirSync(replaysDir, { recursive: true });
-        fs.writeFileSync(path.join(replaysDir, `${report.timestamp}.json`), JSON.stringify(report, null, 2));
-
-        res.json({ ok: true, report });
-    } catch (err) {
-        activeReplays.delete(req.params.id);
-        return sendApiError(res, 500, 'REPLAY_FAILED', 'Replay execution failed', { reason: err.message });
-    }
-});
-
-/**
- * POST /sessions/:id/replay/stop
- * Stops an active replay
- */
-app.post('/sessions/:id/replay/stop', async (req, res) => {
-    const engine = activeReplays.get(req.params.id);
-    if (engine) {
-        try {
-            await engine.abort();
-            res.json({ ok: true });
-        } catch (err) {
-            return sendApiError(res, 500, 'REPLAY_STOP_FAILED', 'Failed to stop replay', { reason: err.message });
-        }
-    } else {
-        return sendApiError(res, 404, 'REPLAY_NOT_ACTIVE', 'No active replay for this session');
-    }
-});
-
-/**
- * GET /sessions/:id/replays
- * Returns all past sanity run reports for this session
- */
-app.get('/sessions/:id/replays', (req, res) => {
-    try {
-        const session = db.getSession(req.params.id);
-        if (!session) return res.status(404).json({ error: 'Session not found' });
-
-        let targetSessions = [session];
-        // If it's a sanity flow, find ALL recordings of this flow
-        if (session.recording_type === 'sanity' && session.flow_name) {
-            targetSessions = db.getSessionsByFlow(session.flow_name, session.module_name);
-        }
-
-        const events = [];
-
-        for (const s of targetSessions) {
-            // Add the manual recording baseline block
-            events.push({
-                type: 'manual_recording',
-                timestamp: s.started_at,
-                session_id: s.id,
-                duration_ms: s.duration_ms,
-                error_count: s.error_count || 0,
-                network_failure_count: s.network_failure_count || 0
-            });
-
-            // Find all automated Playwright replays executed on this version
-            const replaysDir = path.join(getSessionDir(s.id), 'replays');
-            if (fs.existsSync(replaysDir)) {
-                const files = fs.readdirSync(replaysDir).filter(f => f.endsWith('.json'));
-                for (const f of files) {
-                    try {
-                        const report = JSON.parse(fs.readFileSync(path.join(replaysDir, f), 'utf8'));
-                        report.type = 'automated_replay';
-                        report.source_session_id = s.id;
-                        events.push(report);
-                    } catch { }
-                }
-            }
-        }
-
-        // Sort descending by timestamp
-        events.sort((a, b) => b.timestamp - a.timestamp);
-        
-        // We still use the 'replays' key so the UI doesn't break
-        res.json({ replays: events });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
 });
 
 /**
@@ -844,12 +639,12 @@ app.delete('/ignored-errors/:id', (req, res) => {
  * POST /sessions
  * Canonical session start (v2). Same behaviour as POST /session/start but
  * initialises an IngestionContext for structured batch ingestion.
- * Body: { tab_id, url, title, recording_type?, flow_name?, module_name? }
+ * Body: { tab_id, url, title, browser_info? }
  */
 app.post('/sessions', (req, res) => {
     const sessionId = uuidv4();
     const now = Date.now();
-    const { tab_id, url, title, recording_type, flow_name, module_name } = req.body || {};
+    const { tab_id, url, title, browser_info } = req.body || {};
 
     const sessionDir = getSessionDir(sessionId);
     fs.mkdirSync(path.join(sessionDir, 'raw'),    { recursive: true });
@@ -858,15 +653,16 @@ app.post('/sessions', (req, res) => {
 
     const meta = {
         id: sessionId, started_at: now, tab_id, url, title,
-        status: 'recording', recording_type, flow_name, module_name,
+        status: 'recording',
         schema_version: '2.0',
+        browser_info: browser_info || null,
     };
     fs.writeFileSync(path.join(sessionDir, 'meta.json'), JSON.stringify(meta, null, 2));
 
     db.createSession({
         id: sessionId, started_at: now,
         tab_id: tab_id || null, url: url || null, title: title || null,
-        recording_type, flow_name, module_name,
+        browser_info: browser_info || null,
     });
 
     // Pre-create ingestion context so the first batch call is fast
@@ -1028,305 +824,185 @@ app.post('/sessions/:id/normalize', (req, res) => {
     }
 });
 
-// ── Flow CRUD & Promotion (Step 3) ─────────────────────────────────────────
-
 /**
- * POST /sessions/:id/promote
- * Promote a normalized session into a Flow + FlowSteps
+ * POST /sessions/:id/resolve-stack
+ * Resolves a raw (possibly minified) stack trace against the app's own
+ * source maps, fetched on demand. Body: { stack: string }.
  */
-app.post('/sessions/:id/promote', (req, res) => {
+app.post('/sessions/:id/resolve-stack', async (req, res) => {
     const { id } = req.params;
     const session = db.getSession(id);
-    if (!session) return res.status(404).json({ error: 'Session not found' });
+    if (!session) return sendApiError(res, 404, 'SESSION_NOT_FOUND', 'Session not found');
+
+    const stack = req.body && req.body.stack;
+    if (!stack || typeof stack !== 'string') {
+        return sendApiError(res, 400, 'INVALID_BODY', 'Body must include a "stack" string');
+    }
 
     try {
-        const sessionDir = getSessionDir(id);
-        const { flow, steps } = flowStore.promoteFromSession(id, sessionDir, req.body || {});
-        res.status(201).json({ ok: true, flow, step_count: steps.length });
+        const frames = await resolveStack(stack);
+        res.json({ ok: true, frames });
     } catch (err) {
-        res.status(400).json({ error: err.message });
+        return sendApiError(res, 500, 'RESOLVE_STACK_FAILED', 'Failed to resolve stack trace', { reason: err.message });
     }
 });
 
-/**
- * POST /flows
- */
-app.post('/flows', (req, res) => {
-    const body = ensureObjectBody(req.body);
-    if (body === null) {
-        return sendApiError(res, 400, 'INVALID_BODY', 'Request body must be a JSON object');
-    }
-    const flowValidationErrors = validateFlowCreateBody(body);
-    if (flowValidationErrors.length > 0) {
-        return sendApiError(res, 400, 'INVALID_FLOW_PAYLOAD', 'Flow payload validation failed', flowValidationErrors);
-    }
+// ── Slack Integration ───────────────────────────────────────────────────────
 
+/**
+ * GET /integrations/slack/config
+ * Never returns the bot token itself — only whether one is configured, plus
+ * the default channel and saved channel/thread shortcuts (not secret).
+ */
+app.get('/integrations/slack/config', (req, res) => {
+    const cfg = slack.loadConfig();
+    res.json({
+        configured: Boolean(cfg.botToken),
+        defaultChannel: cfg.defaultChannel || null,
+        savedChannels: cfg.savedChannels,
+        savedThreads: cfg.savedThreads,
+    });
+});
+
+/**
+ * POST /integrations/slack/config
+ * Body: { botToken?, defaultChannel? } — either field can be omitted to
+ * leave it unchanged (e.g. update just the default channel).
+ */
+app.post('/integrations/slack/config', (req, res) => {
+    const { botToken, defaultChannel } = req.body || {};
+    if (botToken !== undefined && (typeof botToken !== 'string' || !botToken.trim())) {
+        return sendApiError(res, 400, 'INVALID_BODY', 'botToken must be a non-empty string');
+    }
+    const saved = slack.saveConfig({ botToken, defaultChannel });
+    res.json({
+        ok: true,
+        configured: Boolean(saved.botToken),
+        defaultChannel: saved.defaultChannel || null,
+        savedChannels: saved.savedChannels,
+        savedThreads: saved.savedThreads,
+    });
+});
+
+/**
+ * Saved channel shortcuts — so a channel only needs to be entered once and
+ * can be picked from a dropdown afterwards instead of retyped/pasted.
+ */
+app.post('/integrations/slack/channels', (req, res) => {
+    const { id, name } = req.body || {};
+    if (!id || typeof id !== 'string' || !id.trim()) {
+        return sendApiError(res, 400, 'INVALID_BODY', 'id is required');
+    }
+    const saved = slack.addChannel({ id: id.trim(), name: (name || '').trim() });
+    res.json({ ok: true, savedChannels: saved.savedChannels, defaultChannel: saved.defaultChannel });
+});
+
+app.delete('/integrations/slack/channels/:id', (req, res) => {
+    const saved = slack.removeChannel(req.params.id);
+    res.json({ ok: true, savedChannels: saved.savedChannels, defaultChannel: saved.defaultChannel });
+});
+
+app.post('/integrations/slack/channels/:id/default', (req, res) => {
+    const saved = slack.setDefaultChannel(req.params.id);
+    res.json({ ok: true, defaultChannel: saved.defaultChannel });
+});
+
+/**
+ * Saved thread shortcuts — paste a Slack message link once, give it a label,
+ * and reply into it again later from a dropdown instead of re-pasting.
+ */
+app.post('/integrations/slack/threads', (req, res) => {
+    const { name, link } = req.body || {};
+    if (!link || typeof link !== 'string') {
+        return sendApiError(res, 400, 'INVALID_BODY', 'link is required');
+    }
     try {
-        const payload = body;
-        const flow = payload.flow || payload;
-        const steps = payload.steps || [];
-        const result = flowStore.createFlow(flow, steps);
-        res.status(201).json({ ok: true, flow: result.flow, steps: result.steps });
+        const saved = slack.addThread({ name, link });
+        res.json({ ok: true, savedThreads: saved.savedThreads });
     } catch (err) {
-        return sendApiError(res, 400, 'FLOW_VALIDATION_FAILED', 'Unable to create flow', { reason: err.message });
+        return sendApiError(res, 400, 'INVALID_THREAD_LINK', err.message);
     }
 });
 
-/**
- * GET /flows
- */
-app.get('/flows', (req, res) => {
-    try {
-        const filters = {
-            module: req.query.module,
-            feature: req.query.feature,
-            priority: req.query.priority,
-            criticality: req.query.criticality,
-        };
-        const flows = flowStore.listFlows(filters);
-        res.json({ flows });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
+app.delete('/integrations/slack/threads/:id', (req, res) => {
+    const saved = slack.removeThread(req.params.id);
+    res.json({ ok: true, savedThreads: saved.savedThreads });
 });
 
 /**
- * GET /flows/:id
+ * POST /integrations/slack/send
+ * Body: { text, channel?, threadLink? }
+ * `channel` falls back to the configured default channel if omitted.
+ * `threadLink` is a pasted Slack message permalink — when present, the
+ * message is sent as a reply in that thread instead of a new message.
  */
-app.get('/flows/:id', (req, res) => {
-    const result = flowStore.getFlow(req.params.id, { withSteps: true });
-    if (!result) return res.status(404).json({ error: 'Flow not found' });
-    res.json(result);
-});
-
-/**
- * PATCH /flows/:id
- */
-app.patch('/flows/:id', (req, res) => {
-    const body = ensureObjectBody(req.body);
-    if (body === null) {
-        return sendApiError(res, 400, 'INVALID_BODY', 'Request body must be a JSON object');
-    }
-
-    try {
-        const updated = flowStore.updateFlow(req.params.id, body);
-        res.json(updated);
-    } catch (err) {
-        const notFound = err.message.toLowerCase().includes('not found');
-        const status = notFound ? 404 : 400;
-        const code = notFound ? 'FLOW_NOT_FOUND' : 'FLOW_UPDATE_FAILED';
-        return sendApiError(res, status, code, 'Unable to update flow', { reason: err.message });
-    }
-});
-
-/**
- * DELETE /flows/:id
- */
-app.delete('/flows/:id', (req, res) => {
-    try {
-        flowStore.deleteFlow(req.params.id);
-        res.json({ ok: true });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-
-// ── Planner & Replay (Step 4) ───────────────────────────────────────────────
-
-/**
- * POST /flows/:id/plan
- * Generates and caches an execution plan for a flow
- */
-app.post('/flows/:id/plan', (req, res) => {
-    const body = ensureObjectBody(req.body);
-    if (body === null) {
-        return sendApiError(res, 400, 'INVALID_BODY', 'Request body must be a JSON object');
-    }
-
-    const result = flowStore.getFlow(req.params.id, { withSteps: true });
-    if (!result) return sendApiError(res, 404, 'FLOW_NOT_FOUND', 'Flow not found');
-    try {
-        const plan = createPlan(result.flow, result.steps);
-        const planPath = getFlowPlanPath(req.params.id);
-        fs.writeFileSync(planPath, JSON.stringify(plan, null, 2));
-        res.json({ ok: true, plan });
-    } catch (err) {
-        return sendApiError(res, 500, 'PLAN_GENERATION_FAILED', 'Unable to generate execution plan', { reason: err.message });
-    }
-});
-
-/**
- * GET /flows/:id/plan
- */
-app.get('/flows/:id/plan', (req, res) => {
-    const { id } = req.params;
-    const result = flowStore.getFlow(id, { withSteps: true });
-    if (!result) return sendApiError(res, 404, 'FLOW_NOT_FOUND', 'Flow not found');
-    const planPath = getFlowPlanPath(id);
-    try {
-        if (fs.existsSync(planPath) && !req.query.regenerate) {
-            const plan = JSON.parse(fs.readFileSync(planPath, 'utf8'));
-            return res.json({ plan, cached: true });
+// Shared by /send and /send-screenshot: resolves the target channel + optional
+// thread_ts from an explicit channel and/or a pasted thread permalink.
+// Returns { targetChannel, thread_ts } or { error: { code, message } }.
+function resolveSlackTarget({ channel, threadLink }) {
+    let targetChannel = channel || slack.loadConfig().defaultChannel;
+    let thread_ts;
+    if (threadLink) {
+        const parsed = slack.parsePermalink(threadLink);
+        if (!parsed) {
+            return { error: { code: 'INVALID_THREAD_LINK', message: 'Could not parse that Slack message link' } };
         }
-        const plan = createPlan(result.flow, result.steps);
-        fs.writeFileSync(planPath, JSON.stringify(plan, null, 2));
-        res.json({ plan, cached: false });
-    } catch (err) {
-        return sendApiError(res, 500, 'PLAN_READ_FAILED', 'Unable to read or generate execution plan', { reason: err.message });
+        targetChannel = channel || parsed.channel;
+        thread_ts = parsed.thread_ts;
     }
-});
+    if (!targetChannel) {
+        return { error: { code: 'NO_CHANNEL', message: 'No channel specified and no default channel configured' } };
+    }
+    return { targetChannel, thread_ts };
+}
 
-// ── Runs & Failures (Step 7/9) ─────────────────────────────────────────────
+app.post('/integrations/slack/send', async (req, res) => {
+    const { text, channel, threadLink } = req.body || {};
+    if (!text || typeof text !== 'string') {
+        return sendApiError(res, 400, 'INVALID_BODY', 'Body must include "text"');
+    }
+    if (!slack.isConfigured()) {
+        return sendApiError(res, 400, 'SLACK_NOT_CONFIGURED', 'Slack is not configured yet — add a Bot Token first');
+    }
 
-app.get('/runs', (req, res) => {
+    const target = resolveSlackTarget({ channel, threadLink });
+    if (target.error) return sendApiError(res, 400, target.error.code, target.error.message);
+
     try {
-        const runs = db.listRuns({ flow_id: req.query.flow_id, release_id: req.query.release_id, limit: parseInt(req.query.limit) || 50, offset: parseInt(req.query.offset) || 0 });
-        res.json({ runs });
+        const result = await slack.postMessage({ channel: target.targetChannel, text, thread_ts: target.thread_ts });
+        res.json({ ok: true, ...result });
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        return sendApiError(res, 502, 'SLACK_SEND_FAILED', 'Failed to send Slack message', { reason: err.message });
     }
-});
-
-app.get('/runs/:id', (req, res) => {
-    const run = db.getRun(req.params.id, { withSteps: true });
-    if (!run) return res.status(404).json({ error: 'Run not found' });
-    res.json(run);
-});
-
-app.get('/failures', (req, res) => {
-    try {
-        const clusters = db.listFailureClusters({ limit: parseInt(req.query.limit) || 50, offset: parseInt(req.query.offset) || 0 });
-        res.json({ clusters });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-
-app.get('/failures/:id', (req, res) => {
-    const cluster = db.getFailureCluster(req.params.id);
-    if (!cluster) return res.status(404).json({ error: 'Not found' });
-    res.json({ cluster });
-});
-
-// ── Releases (Step 8) ──────────────────────────────────────────────────────
-
-app.post('/releases', (req, res) => {
-    try {
-        const rid = db.createRelease(req.body || {});
-        res.status(201).json({ release_id: rid });
-    } catch (err) {
-        res.status(400).json({ error: err.message });
-    }
-});
-
-app.get('/releases', (req, res) => {
-    try {
-        const releases = db.listReleases({ limit: parseInt(req.query.limit) || 50, offset: parseInt(req.query.offset) || 0 });
-        res.json({ releases });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-
-app.get('/releases/:id', (req, res) => {
-    const release = db.getRelease(req.params.id);
-    if (!release) return res.status(404).json({ error: 'Not found' });
-    res.json({ release });
 });
 
 /**
- * POST /flows/:id/run
- * Generates plan (if needed) and executes via ReplayEngine
+ * POST /integrations/slack/send-screenshot
+ * multipart/form-data: image (PNG file), channel?, threadLink?, text? (caption)
  */
-app.post('/flows/:id/run', async (req, res) => {
-    const body = ensureObjectBody(req.body);
-    if (body === null) {
-        return sendApiError(res, 400, 'INVALID_BODY', 'Request body must be a JSON object');
+app.post('/integrations/slack/send-screenshot', upload.single('image'), async (req, res) => {
+    if (!req.file) {
+        return sendApiError(res, 400, 'INVALID_BODY', 'No image uploaded (field name must be "image")');
     }
-    const flowRunValidationErrors = validateFlowRunBody(body);
-    if (flowRunValidationErrors.length > 0) {
-        return sendApiError(res, 400, 'INVALID_FLOW_RUN_OPTIONS', 'Flow run options validation failed', flowRunValidationErrors);
+    if (!slack.isConfigured()) {
+        return sendApiError(res, 400, 'SLACK_NOT_CONFIGURED', 'Slack is not configured yet — add a Bot Token first');
     }
 
-    const { id } = req.params;
-    const result = flowStore.getFlow(id, { withSteps: true });
-    if (!result) return sendApiError(res, 404, 'FLOW_NOT_FOUND', 'Flow not found');
+    const { channel, threadLink, text } = req.body || {};
+    const target = resolveSlackTarget({ channel, threadLink });
+    if (target.error) return sendApiError(res, 400, target.error.code, target.error.message);
 
-    const planPath = getFlowPlanPath(id);
-    let plan;
     try {
-        if (body.regenerate || !fs.existsSync(planPath)) {
-            plan = createPlan(result.flow, result.steps);
-            fs.writeFileSync(planPath, JSON.stringify(plan, null, 2));
-        } else {
-            plan = JSON.parse(fs.readFileSync(planPath, 'utf8'));
-        }
+        const result = await slack.uploadFile({
+            channel: target.targetChannel,
+            thread_ts: target.thread_ts,
+            buffer: req.file.buffer,
+            filename: 'screenshot.png',
+            initialComment: text || undefined,
+        });
+        res.json({ ok: true, ...result });
     } catch (err) {
-        return sendApiError(res, 500, 'PLAN_GENERATION_FAILED', 'Unable to prepare flow execution plan', { reason: err.message });
-    }
-
-    let runId = null;
-    try {
-        runId = uuidv4();
-        db.createRun({ run_id: runId, flow_id: id, flow_version: result.flow.version, release_id: body.release_id, started_at: Date.now() });
-
-        const firstNavigateStep = (plan.steps || []).find(s => s.step_type === 'navigate');
-        const inferredStartUrl = firstNavigateStep?.url || firstNavigateStep?.meta?.url || null;
-        const runsDir = path.join(db.DATA_DIR, 'flows', id, 'runs');
-        const artifactDir = path.join(runsDir, runId, 'artifacts');
-        const options = {
-            startUrl: result.flow?.module_start_url || result.flow?.start_url || inferredStartUrl,
-            artifactDir,
-            ...body,
-        };
-        const engine = new ReplayEngine([], options);
-        const report = await engine.runPlan(plan);
-
-        // Enrich run steps and cluster failures
-        const rawSteps = report.steps || [];
-        const runSteps = rawSteps.map((s, idx) => ({
-            run_step_id: uuidv4(),
-            step_index: s.index || idx + 1,
-            step_type: s.step_type,
-            status: s.status,
-            retry_count: Math.max(0, (s.attempts || 1) - 1),
-            assertion_failures: (s.assertions || []).filter(a => a.status === 'failed'),
-            duration_ms: s.duration_ms,
-            label: s.label || null,
-            associated_network_failures: s.associated_network_failures || [],
-            artifact_paths: s.artifact_paths || [],
-            artifact_errors: s.artifact_errors || [],
-            error: s.error,
-            selector: s.selector,
-            timings: {
-                wait_duration_ms: s.wait_duration_ms || 0,
-                selector_resolution_time_ms: s.selector_resolution_time_ms || 0,
-                assertion_duration_ms: s.assertion_duration_ms || 0,
-                wait_reason: s.wait_reason || null,
-                selector_attempt_count: s.selector_attempt_count || 0,
-            },
-        }));
-
-        const { stepReports, clusterCounts } = attachClusters(runSteps, db);
-        db.insertRunSteps(runId, stepReports);
-
-        const passed = report.summary?.passed || 0;
-        const total = report.summary?.total_steps || runSteps.length || 1;
-        const score = total > 0 ? passed / total : 0;
-
-        db.updateRun(runId, { status: 'done', finished_at: Date.now(), score, cluster_counts: clusterCounts, timings: report.timings || {} });
-
-        const ts = Date.now();
-        fs.writeFileSync(path.join(runsDir, `${ts}.json`), JSON.stringify({ run_id: runId, report }, null, 2));
-
-        res.json({ run_id: runId, report, cluster_counts: clusterCounts });
-    } catch (err) {
-        if (runId) {
-            try {
-                db.updateRun(runId, { status: 'failed', finished_at: Date.now(), score: 0 });
-            } catch { }
-        }
-        return sendApiError(res, 500, 'FLOW_RUN_FAILED', 'Flow run execution failed', { reason: err.message, run_id: runId });
+        return sendApiError(res, 502, 'SLACK_UPLOAD_FAILED', 'Failed to upload screenshot to Slack', { reason: err.message });
     }
 });
 
@@ -1357,18 +1033,39 @@ app.get('*', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
+function getLanUrls(port) {
+    const nets = os.networkInterfaces();
+    const urls = [];
+    for (const ifaces of Object.values(nets)) {
+        for (const iface of ifaces || []) {
+            if (iface.family === 'IPv4' && !iface.internal) {
+                urls.push(`http://${iface.address}:${port}`);
+            }
+        }
+    }
+    return urls;
+}
+
 // ── Bootstrap ────────────────────────────────────────────────────────────────
 (async () => {
     try {
         await db.init();
-        app.listen(PORT, '127.0.0.1', () => {
+        app.listen(PORT, HOST, () => {
             console.log(`
-╔══════════════════════════════════════════════════╗
-║       QA Flight Recorder — Local Server          ║
-║  Listening on http://127.0.0.1:${PORT}             ║
-║  Data dir: ~/.qa-flight-recorder/                ║
-╚══════════════════════════════════════════════════╝
-  `);
+────────────────────────────────────────────────────
+  QA Flight Recorder — Local Server
+  Listening on http://${HOST}:${PORT}
+  Data dir: ~/.qa-flight-recorder/`);
+            if (HOST === '0.0.0.0') {
+                const urls = getLanUrls(PORT);
+                if (urls.length) {
+                    console.log(`  Shared on your network at:`);
+                    urls.forEach(u => console.log(`    ${u}`));
+                } else {
+                    console.log(`  HOST=0.0.0.0 set but no LAN interface found.`);
+                }
+            }
+            console.log('────────────────────────────────────────────────────\n');
         });
     } catch (err) {
         console.error('[FATAL] Failed to initialize database:', err);

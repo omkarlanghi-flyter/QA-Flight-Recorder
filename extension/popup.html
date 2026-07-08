@@ -274,6 +274,80 @@
             margin-bottom: 12px;
         }
 
+        /* Capture mode pills (Video / Screenshot) */
+        .mode-row {
+            padding: 10px 0;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .mode-label {
+            font-size: 12px;
+            color: var(--text-muted);
+            margin-bottom: 8px;
+        }
+
+        .mode-pills {
+            display: flex;
+            gap: 6px;
+        }
+
+        .mode-pill {
+            flex: 1;
+            background: var(--surface2);
+            border: 1px solid var(--border);
+            color: var(--text-muted);
+            padding: 7px 4px;
+            border-radius: 6px;
+            font-size: 12px;
+            font-weight: 600;
+            font-family: inherit;
+            cursor: pointer;
+            transition: all 0.15s;
+        }
+
+        .mode-pill.active {
+            background: rgba(99, 102, 241, 0.15);
+            border-color: var(--accent);
+            color: var(--accent);
+        }
+
+        .toggle-row.dimmed {
+            opacity: 0.35;
+            pointer-events: none;
+        }
+
+        /* Screenshot report screen */
+        #screenshot-report {
+            display: none;
+        }
+
+        #screenshot-preview {
+            width: 100%;
+            border-radius: 6px;
+            border: 1px solid var(--border);
+            margin-bottom: 10px;
+            display: block;
+        }
+
+        #screenshot-report textarea.marker-input {
+            width: 100%;
+            min-height: 48px;
+            resize: vertical;
+            margin-bottom: 8px;
+        }
+
+        #screenshot-report select.marker-input {
+            width: 100%;
+            margin-bottom: 8px;
+            appearance: none;
+        }
+
+        .field-mini-label {
+            font-size: 10px;
+            color: var(--text-muted);
+            margin-bottom: 3px;
+        }
+
         /* Bug marker note input */
         .marker-input-row {
             display: none;
@@ -401,69 +475,81 @@
             <div id="session-id-value">—</div>
         </div>
 
-        <!-- Toggles -->
-        <div class="toggles-section" id="toggle-section">
-            <div class="toggle-row">
-                <div class="toggle-label">
-                    🎬 Record video
-                    <span class="toggle-sub">Tab screen capture, low FPS</span>
+        <!-- Main capture screen -->
+        <div id="main-screen">
+            <!-- Toggles -->
+            <div class="toggles-section" id="toggle-section">
+                <div class="mode-row">
+                    <div class="mode-label">Capture mode</div>
+                    <div class="mode-pills">
+                        <button type="button" class="mode-pill active" id="mode-pill-video">🎬 Video</button>
+                        <button type="button" class="mode-pill" id="mode-pill-screenshot">📸 Screenshot</button>
+                    </div>
                 </div>
-                <label class="toggle">
-                    <input type="checkbox" id="toggle-video" checked />
-                    <span class="toggle-slider"></span>
-                </label>
-            </div>
-            <div class="toggle-row">
-                <div class="toggle-label">
-                    📦 Capture error bodies
-                    <span class="toggle-sub">Response bodies for status ≥ 400</span>
+                <div class="toggle-row" id="row-toggle-logs">
+                    <div class="toggle-label">
+                        📶 Capture logs (console + network)
+                        <span class="toggle-sub">Off = video only, no telemetry — lighter &amp; faster</span>
+                    </div>
+                    <label class="toggle">
+                        <input type="checkbox" id="toggle-logs" checked />
+                        <span class="toggle-slider"></span>
+                    </label>
                 </div>
-                <label class="toggle">
-                    <input type="checkbox" id="toggle-bodies" />
-                    <span class="toggle-slider"></span>
-                </label>
+                <div class="toggle-row" id="row-toggle-bodies">
+                    <div class="toggle-label">
+                        📦 Lite capture (errors only)
+                        <span class="toggle-sub">Off = full bodies for errors + first 3 calls per endpoint</span>
+                    </div>
+                    <label class="toggle">
+                        <input type="checkbox" id="toggle-bodies" />
+                        <span class="toggle-slider"></span>
+                    </label>
+                </div>
+            </div>
+
+            <!-- Start/Stop -->
+            <button class="btn btn-start" id="btn-start">
+                ● Start Recording
+            </button>
+            <button class="btn btn-stop" id="btn-stop" style="display:none">
+                ■ Stop Recording
+            </button>
+
+            <!-- Bug Marker -->
+            <button class="btn btn-marker" id="btn-marker" disabled>
+                🐛 Add Bug Marker
+            </button>
+
+            <div class="marker-input-row" id="marker-row">
+                <input type="text" class="marker-input" id="marker-note" placeholder="Optional note…" maxlength="200" />
+                <button class="marker-submit" id="btn-submit-marker">Add</button>
+            </div>
+
+            <!-- Open viewer -->
+            <button class="btn btn-viewer" id="btn-viewer">
+                🗂 Open Viewer UI
+            </button>
+
+            <div class="hotkeys">
+                <span class="hotkey">Ctrl+Shift+S: Start/Stop</span>
+                <span class="hotkey">Ctrl+Shift+M: Bug Marker</span>
             </div>
         </div>
 
-        <!-- Start/Stop -->
-        <button class="btn btn-start" id="btn-start">
-            ● Start Recording
-        </button>
-        <button class="btn btn-start" id="btn-sanity-start" style="margin-top: 8px; background: linear-gradient(135deg, #10b981, #059669); box-shadow: 0 4px 12px rgba(16, 185, 129, 0.3);">
-            🩺 Start Sanity Recording
-        </button>
-        <button class="btn btn-stop" id="btn-stop" style="display:none">
-            ■ Stop Recording
-        </button>
-
-        <!-- Sanity Inputs -->
-        <div class="sanity-input-row" id="sanity-row" style="display: none; flex-direction: column; gap: 6px; margin-top: 8px;">
-            <input type="text" class="marker-input" id="sanity-flow-name" placeholder="Flow Name (required)..." />
-            <input type="text" class="marker-input" id="sanity-module-name" placeholder="Module Name (optional)..." />
-            <div style="display: flex; gap: 6px;">
-                <button class="marker-submit" id="btn-confirm-sanity" style="flex: 1; background: var(--success); color: #000;">Start</button>
-                <button class="marker-submit" id="btn-cancel-sanity" style="flex: 1; background: var(--surface2); color: var(--text);">Cancel</button>
+        <!-- Screenshot report screen (shown right after a screenshot capture) -->
+        <div id="screenshot-report">
+            <img id="screenshot-preview" alt="Captured screenshot" />
+            <div class="field-mini-label">What's the issue?</div>
+            <textarea class="marker-input" id="screenshot-desc" placeholder="Describe the bug in your own words…" maxlength="500"></textarea>
+            <div class="field-mini-label">Channel</div>
+            <select class="marker-input" id="screenshot-channel"></select>
+            <div class="field-mini-label">Reply in thread (optional)</div>
+            <select class="marker-input" id="screenshot-thread"></select>
+            <div style="display:flex; gap:6px; margin-top:4px;">
+                <button class="btn btn-start" id="btn-send-screenshot" style="flex:1;">Send to Slack</button>
+                <button class="btn btn-viewer" id="btn-cancel-screenshot" style="flex:0 0 76px; margin-top:0;">Cancel</button>
             </div>
-        </div>
-
-        <!-- Bug Marker -->
-        <button class="btn btn-marker" id="btn-marker" disabled>
-            🐛 Add Bug Marker
-        </button>
-
-        <div class="marker-input-row" id="marker-row">
-            <input type="text" class="marker-input" id="marker-note" placeholder="Optional note…" maxlength="200" />
-            <button class="marker-submit" id="btn-submit-marker">Add</button>
-        </div>
-
-        <!-- Open viewer -->
-        <button class="btn btn-viewer" id="btn-viewer">
-            🗂 Open Viewer UI
-        </button>
-
-        <div class="hotkeys">
-            <span class="hotkey">Ctrl+Shift+S: Start/Stop</span>
-            <span class="hotkey">Ctrl+Shift+M: Bug Marker</span>
         </div>
     </div>
 

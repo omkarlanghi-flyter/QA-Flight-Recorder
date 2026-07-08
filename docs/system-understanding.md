@@ -1,5 +1,12 @@
 # QA Flight Recorder — Complete System Understanding
 
+> **⚠️ Partially outdated.** This document describes the Sanity Runs / Flow /
+> automated-replay subsystem (Playwright-based replay, Flow CRUD, releases,
+> failure clustering) that has since been **removed** — the tool is now a
+> pure session-recording + debugging-capture tool. Sections on recording,
+> triage, ingestion, and the normalization/Repro-Steps pipeline are still
+> accurate. See `CLAUDE.md` at the repo root for the current architecture.
+
 ## What This System Is
 
 QA Flight Recorder is a **local-first manual QA session recording and replay tool** built for FlytBase (a drone-fleet software company). It runs entirely on the tester's machine — nothing leaves the local machine. No cloud dependency.

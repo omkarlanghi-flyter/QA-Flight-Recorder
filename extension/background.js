@@ -40,7 +40,9 @@ let state = {
     // Video
     mediaRecorder: null,
     videoEnabled: true,
-    captureFailedBodies: false,
+    liteCapture: false,
+    captureLogs: true,
+    cdpAttached: false,
     // Buffered events
     eventBuffer: [],
     batchTimer: null,
@@ -51,11 +53,12 @@ let state = {
 
 // ── Storage helpers ──────────────────────────────────────────────────────────
 async function loadSettings() {
-    const settings = await chrome.storage.local.get(['collectorUrl', 'videoEnabled', 'captureFailedBodies']);
+    const settings = await chrome.storage.local.get(['collectorUrl', 'videoEnabled', 'liteCapture', 'captureLogs']);
     return {
         collectorUrl: settings.collectorUrl || COLLECTOR_URL,
         videoEnabled: settings.videoEnabled !== undefined ? settings.videoEnabled : true,
-        captureFailedBodies: settings.captureFailedBodies || false,
+        liteCapture: settings.liteCapture || false,
+        captureLogs: settings.captureLogs !== undefined ? settings.captureLogs : true,
     };
 }
 
@@ -166,13 +169,63 @@ async function flushEvents() {
 // Static asset extensions to skip — NOTE: .js and .css are intentionally NOT here
 // so we can still detect 4xx/5xx failures on critical scripts and stylesheets.
 const STATIC_ASSET_RE = /\.(png|jpe?g|gif|svg|ico|webp|avif|woff2?|ttf|eot|otf|map|mp4|webm|mp3|wav|pdf|zip|gz)(\?|#|$)/i;
-const BODY_SIZE_LIMIT_BYTES = 50000; // 50KB — skip body capture for large responses
+const BODY_SIZE_LIMIT_BYTES = 500000; // 500KB — truncate bodies larger than this
 
 function isStaticAsset(url) {
     if (!url) return false;
     try { return STATIC_ASSET_RE.test(new URL(url).pathname); }
     catch { return STATIC_ASSET_RE.test(url); }
 }
+
+// ── Polling Throttle ─────────────────────────────────────────────────────────
+// Recording full bodies for a live/telemetry app means the SAME endpoint can
+// get hit every second or two (polling, live status, etc). Fetching a full
+// body over the debugger protocol on every single one of those calls is what
+// actually slows the recorded page down — so after a few samples of a given
+// endpoint we keep capturing status/headers/timing (cheap, always useful) but
+// stop re-fetching the body. Errors are exempt: every failing call always
+// gets its full body, no matter how many times that endpoint has been seen.
+const BODY_SAMPLE_LIMIT = 3; // full body captured for the first N calls per endpoint per session
+let _pathSampleCounts = {};  // reset per recording — key: `${method} ${sanitizedUrl}`
+
+function shouldSampleBody(method, url) {
+    const key = `${method} ${url}`;
+    const count = (_pathSampleCounts[key] || 0) + 1;
+    _pathSampleCounts[key] = count;
+    return count <= BODY_SAMPLE_LIMIT;
+}
+
+// Concurrency-limited queue for Network.getResponseBody CDP calls. Without
+// this, a bursty page (many XHRs firing at once) can queue up dozens of
+// simultaneous debugger-protocol round trips and visibly stall the tab.
+const MAX_CONCURRENT_BODY_FETCHES = 4;
+let _activeBodyFetches = 0;
+const _bodyFetchQueue = [];
+
+function runBodyFetch(fn) {
+    return new Promise((resolve) => {
+        const task = async () => {
+            _activeBodyFetches++;
+            try { await fn(); } finally {
+                _activeBodyFetches--;
+                resolve();
+                if (_bodyFetchQueue.length) _bodyFetchQueue.shift()();
+            }
+        };
+        if (_activeBodyFetches < MAX_CONCURRENT_BODY_FETCHES) task();
+        else _bodyFetchQueue.push(task);
+    });
+}
+
+// A live telemetry/status WebSocket can push many frames per second — capturing
+// every payload would reproduce the exact "polling flood slows the page down"
+// problem the body-sampling throttle above exists to prevent. So: connection
+// lifecycle (open/close/error) is always logged in full (cheap, high-signal),
+// but frame payloads are only captured in full for the first few frames per
+// connection; after that we just count/size them so a developer still sees
+// volume and cadence without paying a redaction+buffer cost on every frame.
+const WS_FRAME_SAMPLE_LIMIT = 5; // full payload captured for the first N frames per direction per socket
+let _wsConnections = {}; // reset per recording — key: requestId
 
 /**
  * Attempt to extract GraphQL operation name and query type from a POST body.
@@ -222,10 +275,17 @@ function handleCDPEvent(source, method, params) {
 
             const url = sanitizeUrl(rawUrl);
 
-            // Capture POST/PUT body if available (limit to 50KB)
+            // Sample bodies per endpoint (see "Polling Throttle" above) — the
+            // first few calls to a given endpoint get full bodies; repeats
+            // (typical of polling/telemetry) don't, to keep the recorded page fast.
+            const sampled = shouldSampleBody(req.method, url);
+
+            // Capture POST/PUT body if available (redacted + size-capped)
             let requestBody = null;
-            if (req.hasPostData && req.postData) {
-                requestBody = req.postData.substring(0, BODY_SIZE_LIMIT_BYTES);
+            if (sampled && req.hasPostData && req.postData) {
+                requestBody = redactBodyText(req.postData.substring(0, BODY_SIZE_LIMIT_BYTES));
+            } else if (!sampled && req.hasPostData) {
+                requestBody = '[omitted — repeat call to this endpoint, body captured on earlier occurrences]';
             }
 
             const requestHeaders = redactHeaders(req.headers || {});
@@ -245,6 +305,7 @@ function handleCDPEvent(source, method, params) {
                 responseStatus: null,
                 bodyFetchPromise: null,
                 isAPI: false,
+                sampled,
                 graphql: gql,
             };
 
@@ -278,23 +339,30 @@ function handleCDPEvent(source, method, params) {
             pending.isAPI = isAPIType;
             pending.responseHeaders = redactHeaders(resp.headers || {});
 
-            // PERF FIX 4: Gate body capture by status code and user setting
-            // Default (captureFailedBodies=false): only fetch bodies for errors (>=400)
-            // Opt-in (captureFailedBodies=true): fetch bodies for ALL XHR/Fetch
+            // Body capture: full bodies for every XHR/Fetch/Document response by default
+            // (this tool's whole purpose is deep debug capture). `state.liteCapture`
+            // is an opt-in switch (popup toggle) to fall back to errors-only capture
+            // for people who want a smaller footprint. Error responses are ALWAYS
+            // captured in full regardless of sampling or liteCapture — that's the
+            // signal that matters most. Non-error repeats beyond BODY_SAMPLE_LIMIT
+            // for the same endpoint are skipped (see "Polling Throttle" above) so a
+            // chatty/polling page doesn't get flooded with debugger round trips.
             const isErrorResponse = resp.status >= 400;
             const shouldCaptureBody = isAPIType && (
-                isErrorResponse || state.captureFailedBodies
+                isErrorResponse || (!state.liteCapture && pending.sampled)
             ) && (resp.encodedDataLength || 0) < BODY_SIZE_LIMIT_BYTES * 4;
 
             if (shouldCaptureBody) {
-                pending.bodyFetchPromise = chrome.debugger
+                pending.bodyFetchPromise = runBodyFetch(() => chrome.debugger
                     .sendCommand({ tabId: source.tabId }, 'Network.getResponseBody', { requestId: reqId })
                     .then((result) => {
                         if (result && result.body) {
-                            pending.responseBody = result.body.substring(0, BODY_SIZE_LIMIT_BYTES);
+                            pending.responseBody = redactBodyText(result.body.substring(0, BODY_SIZE_LIMIT_BYTES));
                         }
                     })
-                    .catch(() => { /* preflight or body dropped */ });
+                    .catch(() => { /* preflight or body dropped */ }));
+            } else if (isAPIType && !pending.sampled && !isErrorResponse) {
+                pending.responseBody = '[omitted — repeat call to this endpoint, body captured on earlier occurrences]';
             }
 
             bufferEvent(makeEvent('network.response', 'cdp', {
@@ -362,18 +430,112 @@ function handleCDPEvent(source, method, params) {
             break;
         }
 
+        // ── WebSocket ──────────────────────────────────────────────────────────
+        // See "WS Frame Sampling" note above `WS_FRAME_SAMPLE_LIMIT`: lifecycle
+        // events are always captured in full; frame payloads are sampled.
+        case 'Network.webSocketCreated': {
+            _wsConnections[params.requestId] = {
+                url: sanitizeUrl(params.url),
+                rawUrl: params.url,
+                sentCount: 0,
+                receivedCount: 0,
+                sentBytes: 0,
+                receivedBytes: 0,
+                startTime: null,
+            };
+            bufferEvent(makeEvent('network.ws_open', 'cdp', {
+                request_id: params.requestId,
+                url_sanitized: sanitizeUrl(params.url),
+                url_full: params.url,
+                initiator: params.initiator?.type,
+            }, sanitizeUrl(params.url)));
+            break;
+        }
+
+        case 'Network.webSocketWillSendHandshakeRequest': {
+            const conn = _wsConnections[params.requestId];
+            if (conn) conn.startTime = params.timestamp;
+            break;
+        }
+
+        case 'Network.webSocketHandshakeResponseReceived': {
+            const conn = _wsConnections[params.requestId];
+            const resp = params.response || {};
+            bufferEvent(makeEvent('network.ws_handshake', 'cdp', {
+                request_id: params.requestId,
+                status: resp.status,
+                statusText: resp.statusText,
+                url_sanitized: conn?.url,
+            }, conn?.url));
+            break;
+        }
+
+        case 'Network.webSocketFrameSent':
+        case 'Network.webSocketFrameReceived': {
+            const isSent = method === 'Network.webSocketFrameSent';
+            const conn = _wsConnections[params.requestId];
+            const frame = params.response || {};
+            const payload = frame.payloadData || '';
+
+            if (conn) {
+                if (isSent) { conn.sentCount++; conn.sentBytes += payload.length; }
+                else { conn.receivedCount++; conn.receivedBytes += payload.length; }
+            }
+
+            const frameIndex = isSent ? (conn?.sentCount || 1) : (conn?.receivedCount || 1);
+            const sampled = frameIndex <= WS_FRAME_SAMPLE_LIMIT;
+
+            bufferEvent(makeEvent('network.ws_frame', 'cdp', {
+                request_id: params.requestId,
+                direction: isSent ? 'sent' : 'received',
+                opcode: frame.opcode,
+                size: payload.length,
+                url_sanitized: conn?.url,
+                payload: sampled
+                    ? redactBodyText(payload.substring(0, BODY_SIZE_LIMIT_BYTES))
+                    : '[omitted — sampling limit reached for this connection, earlier frames captured in full]',
+            }, conn?.url));
+            break;
+        }
+
+        case 'Network.webSocketFrameError': {
+            const conn = _wsConnections[params.requestId];
+            bufferEvent(makeEvent('network.ws_error', 'cdp', {
+                request_id: params.requestId,
+                errorMessage: params.errorMessage,
+                url_sanitized: conn?.url,
+            }, conn?.url));
+            break;
+        }
+
+        case 'Network.webSocketClosed': {
+            const conn = _wsConnections[params.requestId];
+            bufferEvent(makeEvent('network.ws_close', 'cdp', {
+                request_id: params.requestId,
+                url_sanitized: conn?.url,
+                frames_sent: conn?.sentCount || 0,
+                frames_received: conn?.receivedCount || 0,
+                bytes_sent: conn?.sentBytes || 0,
+                bytes_received: conn?.receivedBytes || 0,
+            }, conn?.url));
+            delete _wsConnections[params.requestId];
+            break;
+        }
+
         // ── Runtime Exceptions ──────────────────────────────────────────────────
         case 'Runtime.exceptionThrown': {
             const exc = params.exceptionDetails;
             const msg = exc?.exception?.description || exc?.text || 'Unknown exception';
             const stack = exc?.exception?.description || null;
-            bufferEvent(makeEvent('runtime.exception', 'cdp', {
+            const excEvt = makeEvent('runtime.exception', 'cdp', {
                 message: msg.split('\n')[0].slice(0, 500),
                 stack: stack ? stack.slice(0, 1000) : null,
                 source: exc?.url,
                 line: exc?.lineNumber,
                 column: exc?.columnNumber,
-            }));
+            });
+            bufferEvent(excEvt);
+            attachStorageSnapshot(source.tabId, excEvt);
             break;
         }
 
@@ -394,12 +556,14 @@ function handleCDPEvent(source, method, params) {
                     url: entry.url,
                 }, entry.url));
             } else if (level === 'error') {
-                bufferEvent(makeEvent('console.error', 'cdp-log', {
+                const logErrEvt = makeEvent('console.error', 'cdp-log', {
                     message,
                     source: entry.source,
                     url: entry.url,
                     breadcrumbs: drainBreadcrumbs(),
-                }, entry.url));
+                }, entry.url);
+                bufferEvent(logErrEvt);
+                attachStorageSnapshot(source.tabId, logErrEvt);
             }
             break;
         }
@@ -417,10 +581,12 @@ function handleCDPEvent(source, method, params) {
                 addBreadcrumb('warn', message);
                 bufferEvent(makeEvent('console.warn', 'cdp-runtime', { message }));
             } else if (level === 'error') {
-                bufferEvent(makeEvent('console.error', 'cdp-runtime', {
+                const consoleErrEvt = makeEvent('console.error', 'cdp-runtime', {
                     message,
                     breadcrumbs: drainBreadcrumbs(),
-                }));
+                });
+                bufferEvent(consoleErrEvt);
+                attachStorageSnapshot(source.tabId, consoleErrEvt);
             }
             break;
         }
@@ -465,6 +631,74 @@ function redactHeaders(headers) {
         out[k] = SENSITIVE_HEADERS.test(k) ? '[REDACTED]' : v;
     }
     return out;
+}
+
+// ── Body Redaction ───────────────────────────────────────────────────────────
+// Full request/response bodies are now captured for debugging, so we scrub
+// sensitive-looking keys out of them client-side, same as we do for headers.
+const SENSITIVE_BODY_KEY = /password|passwd|secret|token|api[_-]?key|authorization|ssn|cvv|card[_-]?number/i;
+
+function _redactJsonValue(value) {
+    if (Array.isArray(value)) return value.map(_redactJsonValue);
+    if (value && typeof value === 'object') {
+        const out = {};
+        for (const [k, v] of Object.entries(value)) {
+            out[k] = SENSITIVE_BODY_KEY.test(k) ? '[REDACTED]' : _redactJsonValue(v);
+        }
+        return out;
+    }
+    return value;
+}
+
+function redactBodyText(str) {
+    if (!str || typeof str !== 'string') return str;
+    try {
+        const parsed = JSON.parse(str);
+        return JSON.stringify(_redactJsonValue(parsed));
+    } catch {
+        // Not JSON (form-encoded, plain text, etc.) — best-effort key=value redaction
+        return str.replace(/\b(password|passwd|secret|token|api[_-]?key|ssn|cvv)\b(=|%3D|":\s*")[^&"\s]+/gi, '$1$2[REDACTED]');
+    }
+}
+
+// ── Storage Snapshot ──────────────────────────────────────────────────────────
+// Best-effort localStorage/sessionStorage snapshot taken at the moment of an
+// error, so a developer can see app state without reproducing the bug live.
+const SENSITIVE_STORAGE_KEY = /password|token|secret|auth|session[_-]?id|jwt|api[_-]?key/i;
+const STORAGE_SNAPSHOT_LIMIT_BYTES = 20000;
+
+function _redactStorageObj(obj) {
+    const out = {};
+    for (const [k, v] of Object.entries(obj || {})) {
+        out[k] = SENSITIVE_STORAGE_KEY.test(k) ? '[REDACTED]' : v;
+    }
+    return out;
+}
+
+// Mutates `evt.data.storage_snapshot` in place once the CDP round-trip
+// resolves. Fire-and-forget from call sites — if the event has already been
+// flushed to the server by the time this resolves, the snapshot is simply
+// omitted (non-fatal; snapshotting must never block or delay error capture).
+async function attachStorageSnapshot(tabId, evt) {
+    try {
+        const result = await chrome.debugger.sendCommand({ tabId }, 'Runtime.evaluate', {
+            expression: `(() => { try {
+                const pick = s => { const o = {}; for (let i = 0; i < s.length; i++) { const k = s.key(i); o[k] = s.getItem(k); } return o; };
+                return JSON.stringify({ local: pick(localStorage), session: pick(sessionStorage) });
+            } catch (e) { return null; } })()`,
+            returnByValue: true,
+        });
+        const raw = result && result.result && result.result.value;
+        if (!raw) return;
+        const parsed = JSON.parse(raw);
+        const snapshot = { local: _redactStorageObj(parsed.local), session: _redactStorageObj(parsed.session) };
+        const json = JSON.stringify(snapshot);
+        evt.data.storage_snapshot = json.length > STORAGE_SNAPSHOT_LIMIT_BYTES
+            ? { truncated: true, note: 'Snapshot exceeded size limit and was omitted' }
+            : snapshot;
+    } catch {
+        // best-effort only — no localStorage access, tab closed mid-request, etc.
+    }
 }
 
 // ── CDP Attachment ────────────────────────────────────────────────────────────
@@ -564,8 +798,35 @@ async function stopVideoCapture() {
     } catch { }
 }
 
+// ── Environment Info ─────────────────────────────────────────────────────────
+// Screen/viewport aren't available in the MV3 service worker context, so we
+// read them from the recorded tab itself via a one-off injected script.
+async function collectBrowserInfo(tabId) {
+    const info = {
+        user_agent: (typeof navigator !== 'undefined' && navigator.userAgent) || null,
+        platform: (typeof navigator !== 'undefined' && navigator.platform) || null,
+        extension_version: chrome.runtime.getManifest().version,
+    };
+    try {
+        const [{ result }] = await chrome.scripting.executeScript({
+            target: { tabId },
+            func: () => ({
+                screen_width: screen.width,
+                screen_height: screen.height,
+                viewport_width: window.innerWidth,
+                viewport_height: window.innerHeight,
+                device_pixel_ratio: window.devicePixelRatio,
+            }),
+        });
+        Object.assign(info, result);
+    } catch {
+        // Tab may not allow script injection (chrome:// pages, etc.) — non-fatal
+    }
+    return info;
+}
+
 // ── Start Recording ───────────────────────────────────────────────────────────
-async function startRecording(tabId, options = {}) {
+async function startRecording(tabId) {
     if (state.recording) return { error: 'Already recording' };
 
     const settings = await loadSettings();
@@ -574,22 +835,26 @@ async function startRecording(tabId, options = {}) {
     const tab = await chrome.tabs.get(tabId);
     state.tabId = tabId;
     state.videoEnabled = settings.videoEnabled;
-    state.captureFailedBodies = settings.captureFailedBodies;
+    state.liteCapture = settings.liteCapture;
+    state.captureLogs = settings.captureLogs;
     state.chunkIndex = 0;
     state.pendingRequests = {};
     state.eventBuffer = [];
+    _pathSampleCounts = {};
+    _wsConnections = {};
+
+    // Collect environment info for the developer picking this up later
+    const browserInfo = await collectBrowserInfo(tabId);
 
     // Start session on server
     const res = await fetch(`${settings.collectorUrl}/session/start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ 
-            tab_id: tabId, 
-            url: tab.url, 
+        body: JSON.stringify({
+            tab_id: tabId,
+            url: tab.url,
             title: tab.title,
-            recording_type: options.recordingType,
-            flow_name: options.flowName,
-            module_name: options.moduleName
+            browser_info: browserInfo,
         }),
     });
     const { session_id, started_at } = await res.json();
@@ -597,8 +862,14 @@ async function startRecording(tabId, options = {}) {
     state.startedAt = started_at;
     state.recording = true;
 
-    // Attach CDP
-    await attachCDP(tabId);
+    // Attach CDP — skipped entirely when "Capture logs" is off, so a
+    // video-only recording never pays the console/network telemetry cost.
+    if (state.captureLogs) {
+        await attachCDP(tabId);
+        state.cdpAttached = true;
+    } else {
+        state.cdpAttached = false;
+    }
 
     // Inject content script
     await chrome.scripting.executeScript({
@@ -644,14 +915,16 @@ async function stopRecording() {
         console.warn('[QA Recorder] stopVideoCapture error (ignored):', e.message);
     }
 
-    // Detach CDP (ignore errors if already closed)
-    if (tabId) {
+    // Detach CDP (ignore errors if already closed) — only if it was attached
+    // in the first place (video-only recordings skip CDP entirely)
+    if (tabId && state.cdpAttached) {
         try {
             await detachCDP(tabId);
         } catch (e) {
             console.warn('[QA Recorder] detachCDP error (ignored):', e.message);
         }
     }
+    state.cdpAttached = false;
 
     // Reset state early so UI updates immediately
     state.recording = false;
@@ -688,6 +961,21 @@ function addBugMarker(note) {
     flushEvents();
 }
 
+// ── Screenshot Capture ───────────────────────────────────────────────────────
+// Deliberately independent of the recording session lifecycle — no CDP
+// attach, no video, no session_id. Just grabs the visible tab as a PNG so a
+// quick bug report doesn't require starting a full recording first.
+async function captureScreenshot() {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!tab) return { error: 'No active tab found' };
+    try {
+        const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' });
+        return { ok: true, dataUrl };
+    } catch (e) {
+        return { error: e.message || 'Failed to capture screenshot' };
+    }
+}
+
 // ── Message Handler ───────────────────────────────────────────────────────────
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     (async () => {
@@ -697,11 +985,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                 break;
 
             case 'START_RECORDING':
-                sendResponse(await startRecording(msg.tabId, {
-                    recordingType: msg.recordingType,
-                    flowName: msg.flowName,
-                    moduleName: msg.moduleName
-                }));
+                sendResponse(await startRecording(msg.tabId));
                 break;
 
             case 'STOP_RECORDING':
@@ -711,6 +995,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             case 'ADD_BUG_MARKER':
                 addBugMarker(msg.note);
                 sendResponse({ ok: true });
+                break;
+
+            case 'CAPTURE_SCREENSHOT':
+                sendResponse(await captureScreenshot());
                 break;
 
             case 'CONTENT_EVENT':

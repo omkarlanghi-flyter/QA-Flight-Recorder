@@ -264,7 +264,8 @@ if (!window.__qaRecorderInjected) {
     // ── MutationObserver — DOM State Changes ───────────────────────────────────
     /**
      * Watches for significant DOM additions (modals, toasts, alerts, spinners)
-     * Emits lightweight 'dom.state_change' events for implicit assertions during replay.
+     * and emits 'dom.state_change' events so the triage view can show what
+     * the UI did right around an error (e.g. an error toast appearing).
      */
     const SIGNIFICANT_SELECTORS = [
         '[role="alert"]', '[role="dialog"]', '[role="status"]',

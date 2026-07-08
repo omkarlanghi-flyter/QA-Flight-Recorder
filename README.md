@@ -1,14 +1,21 @@
 # 🛩️ QA Flight Recorder
 
-A **local-first** manual QA session recorder for Chrome. Captures:
+A **local-first** manual QA session recorder for Chrome, built for capturing
+everything a developer needs to debug a reported issue without having to
+reproduce it themselves. Captures:
 
 - 🎬 Screen video (tab capture, low FPS)
-- 🖱️ User interactions (click, scroll, navigation)
-- 🌐 Network metadata (via Chrome DevTools Protocol)
-- ⚠️ Console errors/warnings and JS exceptions
+- 🖱️ User interactions (click, scroll, navigation) — surfaced as a readable **Repro Steps** timeline
+- 🌐 Full network requests/responses (headers + bodies, not just failures) via Chrome DevTools Protocol
+- ⚠️ Console errors/warnings and JS exceptions, with on-demand **source-map resolution** of minified stack traces
+- 💾 A localStorage/sessionStorage snapshot at the moment of each error
+- 🖥️ Browser/OS/viewport info for the recording
 - 🐛 Manual bug markers
 
-All data is stored **locally** on your machine. Nothing goes to the cloud.
+All data is stored **locally** on your machine. Nothing goes to the cloud —
+share a session by giving a teammate a link into your own dashboard (see
+[Sharing a session](#sharing-a-session-with-a-developer)) rather than
+uploading it anywhere.
 
 ---
 
@@ -59,6 +66,22 @@ The server starts on **http://127.0.0.1:17890**
 Open the viewer in your browser: [http://127.0.0.1:17890](http://127.0.0.1:17890)
 
 > **Tip:** Use `npm run dev` (with nodemon) for auto-restart during development.
+
+### Sharing a session with a developer
+
+Every session has a shareable deep link (click **Copy Link** in the session
+header) that opens straight to that session/tab — no export needed if the
+developer can reach your machine.
+
+By default the server only listens on `127.0.0.1` (nobody else on your
+network can reach it). To let a teammate open the dashboard directly:
+
+```bash
+HOST=0.0.0.0 npm start
+```
+
+The startup banner will print the LAN URL(s) to share. There's no
+authentication layer, so only do this on a network you trust.
 
 ---
 
@@ -113,6 +136,9 @@ The 🛩️ QA Flight Recorder icon will appear in your toolbar.
 | GET  | `/sessions/:id/video` | Serve concatenated video |
 | GET  | `/sessions/:id/download` | ZIP bundle download |
 | POST | `/sessions/:id/regenerate-views` | Re-run triage generation |
+| POST | `/sessions/:id/normalize` | Generate human-readable Repro Steps |
+| GET  | `/sessions/:id/normalized` | Fetch generated Repro Steps |
+| POST | `/sessions/:id/resolve-stack` | Resolve a minified stack trace via source maps |
 
 ---
 
@@ -135,10 +161,13 @@ Repeated console errors are **deduplicated** by signature (only first occurrence
 
 ## 6. Privacy & Redaction
 
-- **URL query params are stripped** by default (only `scheme://host/path` is stored)
-- **Auth headers** (`Authorization`, `Cookie`, `Set-Cookie`) are **never captured**
-- **Typed input values** are **never captured** (only element selectors and non-input text labels)
+- **URL query params are stripped** by default (only `scheme://host/path` is stored in the sanitized URL field; the raw URL is also kept for debugging)
+- **Auth headers** (`Authorization`, `Cookie`, `Set-Cookie`, `X-API-Key`, etc.) are **never captured**
+- Request/response **bodies are captured by default** (for deep debugging) but are scanned client-side and any key matching `password`, `token`, `secret`, `api_key`, `ssn`, `cvv`, etc. is replaced with `[REDACTED]` before it ever leaves the browser. Failed (≥400) requests **always** get a full body captured. Successful calls to the same endpoint only get a full body for the first 3 occurrences per recording — after that, repeat polling/telemetry calls skip the body fetch (status/headers/timing are still always kept) so a chatty live-status page doesn't get flooded with debugger round trips and slow down while you're recording. Toggle **Lite capture (errors only)** in the extension popup to go further and skip bodies for all successful calls.
+- **Typed input values into password fields are never captured** (masked to `***`); other typed values are captured for debugging unless the field looks sensitive
+- The **localStorage/sessionStorage snapshot** taken at error time is redacted the same way (keys matching `password`, `token`, `secret`, `auth`, `session_id`, `jwt`, `api_key` are masked)
 - Raw NDJSON is **never overwritten** — only filtered **view** files are generated
+- Nothing leaves your machine unless you explicitly set `HOST=0.0.0.0` to share your dashboard on your local network
 
 ---
 

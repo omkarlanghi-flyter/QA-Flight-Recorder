@@ -1,7 +1,7 @@
 /**
  * app.js - QA Flight Recorder Viewer UI Logic (v2)
  */
-const API = 'http://127.0.0.1:17890';
+const API = window.location.origin;
 let currentSessionId = null;
 let currentTab = 'overview';
 let allSessionsCache = [];
@@ -10,12 +10,63 @@ let allInputEventsCache = [];
 let triageFilter = 'all';
 let ignoredSignatures = new Set(); // globally muted error sigs
 
+// ── Icon System ──────────────────────────────────────────────────────────────
+// Small Feather-style line-icon set (24x24, stroke=currentColor) used everywhere
+// instead of raw color emoji, so the chrome renders consistently across OS/fonts.
+const ICONS = {
+  logo: '<path d="M22 2 11 13"/><path d="M22 2 15 22 11 13 2 9 22 2z"/>',
+  sun: '<circle cx="12" cy="12" r="5"/><path d="M12 1v3M12 20v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M1 12h3M20 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1"/>',
+  moon: '<path d="M21 12.8A9 9 0 1 1 11.2 3 7 7 0 0 0 21 12.8z"/>',
+  refresh: '<polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.5 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.65 4.36A9 9 0 0 0 20.5 15"/>',
+  search: '<circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>',
+  barChart: '<line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/>',
+  activity: '<polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>',
+  mousePointer: '<path d="M3 3l7.07 16.97 2.51-7.39 7.39-2.51L3 3z"/><path d="M13 13l6 6"/>',
+  list: '<line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/>',
+  film: '<rect x="2" y="2" width="20" height="20" rx="2"/><line x1="7" y1="2" x2="7" y2="22"/><line x1="17" y1="2" x2="17" y2="22"/><line x1="2" y1="12" x2="22" y2="12"/><line x1="2" y1="7" x2="7" y2="7"/><line x1="2" y1="17" x2="7" y2="17"/><line x1="17" y1="17" x2="22" y2="17"/><line x1="17" y1="7" x2="22" y2="7"/>',
+  play: '<polygon points="5 3 19 12 5 21 5 3"/>',
+  pause: '<rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/>',
+  stop: '<rect x="4" y="4" width="16" height="16" rx="2"/>',
+  trash: '<polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/>',
+  download: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>',
+  checkSquare: '<polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/>',
+  x: '<line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>',
+  alertTriangle: '<path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>',
+  alertOctagon: '<polygon points="7.86 2 16.14 2 22 7.86 22 16.14 16.14 22 7.86 22 2 16.14 2 7.86 7.86 2"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>',
+  checkCircle: '<circle cx="12" cy="12" r="10"/><polyline points="16 8 10.5 15 8 12.5"/>',
+  infoCircle: '<circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="11"/><line x1="12" y1="7.5" x2="12.01" y2="7.5"/>',
+  globe: '<circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>',
+  clock: '<circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>',
+  clipboard: '<path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><rect x="8" y="2" width="8" height="4" rx="1"/>',
+  eye: '<path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>',
+  eyeOff: '<path d="M17.94 17.94A10.94 10.94 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/>',
+  copy: '<rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>',
+  folder: '<path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>',
+  bug: '<rect x="8" y="6" width="8" height="14" rx="4"/><path d="M19 7l-3 2M5 7l3 2M19 19l-3-2M5 19l3-2M12 6V3M9.5 3.5 12 6l2.5-2.5M2 13h4M18 13h4"/>',
+  maximize: '<path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/>',
+  link: '<path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>',
+  arrowDown: '<line x1="12" y1="5" x2="12" y2="19"/><polyline points="19 12 12 19 5 12"/>',
+  arrowUp: '<line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/>',
+  zap: '<polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>',
+  film2: '<rect x="1" y="4" width="15" height="16" rx="2"/><path d="M16 8l6-3v14l-6-3"/>',
+  edit: '<path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/>',
+  slack: '<path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/>',
+  star: '<polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>',
+};
+
+function icon(name, size, extra) {
+  const body = ICONS[name] || '';
+  const cls = 'icon' + (extra ? ' ' + extra : '');
+  return `<svg class="${cls}" width="${size || 14}" height="${size || 14}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${body}</svg>`;
+}
+window.icon = icon;
+
 // ── Theme ─────────────────────────────────────────────────────────────────────
 function toggleTheme() {
   const html = document.documentElement;
   const isDark = html.dataset.theme === 'dark';
   html.dataset.theme = isDark ? 'light' : 'dark';
-  document.getElementById('theme-toggle').textContent = isDark ? '🌙' : '☀️';
+  document.getElementById('theme-toggle').innerHTML = icon(isDark ? 'moon' : 'sun', 15);
   localStorage.setItem('qa-theme', html.dataset.theme);
 }
 
@@ -23,7 +74,7 @@ function toggleTheme() {
   const saved = localStorage.getItem('qa-theme') || 'light';
   document.documentElement.dataset.theme = saved;
   const btn = document.getElementById('theme-toggle');
-  if (btn) btn.textContent = saved === 'dark' ? '☀️' : '🌙';
+  if (btn) btn.innerHTML = icon(saved === 'dark' ? 'sun' : 'moon', 15);
 })();
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
@@ -54,6 +105,27 @@ function formatDate(epochMs) {
     ' ' + d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
 }
 
+function formatBrowserInfo(raw) {
+  if (!raw) return null;
+  let info;
+  try { info = typeof raw === 'string' ? JSON.parse(raw) : raw; } catch { return null; }
+  if (!info || typeof info !== 'object') return null;
+
+  let browser = 'Browser';
+  const ua = info.user_agent || '';
+  const m = ua.match(/(Chrome|Edg|Firefox|Safari)\/(\d+)/);
+  if (m) browser = `${m[1] === 'Edg' ? 'Edge' : m[1]} ${m[2]}`;
+
+  let os = info.platform || '';
+  if (/Mac/i.test(os)) os = 'macOS';
+  else if (/Win/i.test(os)) os = 'Windows';
+  else if (/Linux/i.test(os)) os = 'Linux';
+
+  const parts = [browser, os, info.viewport_width && info.viewport_height ? `${info.viewport_width}×${info.viewport_height}` : null]
+    .filter(Boolean);
+  return parts.length ? parts.join(' · ') : null;
+}
+
 function esc(str) {
   return String(str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
@@ -79,8 +151,9 @@ function normalizeEventList(events) {
 
 function showToast(msg, type = 'info') {
   const toast = document.getElementById('toast');
-  const icon = type === 'error' ? '❌' : type === 'success' ? '✅' : 'ℹ️';
-  toast.innerHTML = `<span>${icon}</span><span>${esc(msg)}</span>`;
+  const iconName = type === 'error' ? 'alertTriangle' : type === 'success' ? 'checkCircle' : 'infoCircle';
+  const color = type === 'error' ? 'var(--danger)' : type === 'success' ? 'var(--success)' : 'var(--accent)';
+  toast.innerHTML = `<span style="color:${color};display:flex;">${icon(iconName, 16)}</span><span>${esc(msg)}</span>`;
   toast.classList.add('show');
   setTimeout(() => toast.classList.remove('show'), 3000);
 }
@@ -88,7 +161,7 @@ function showToast(msg, type = 'info') {
 function getTypeClass(type) {
   if (!type) return '';
   if (type.startsWith('action.')) return 'type-action';
-  if (type === 'network.failure') return 'type-network-fail';
+  if (type === 'network.failure' || type === 'network.ws_error') return 'type-network-fail';
   if (type.startsWith('network.')) return 'type-network';
   if (type === 'console.error' || type === 'runtime.exception') return 'type-error';
   if (type.startsWith('console.')) return 'type-console';
@@ -141,19 +214,28 @@ function summarizeEvent(event) {
     case 'network.response': summary = `${d.status} ${d.mimeType || ''} ${d.url_full || d.url_sanitized || ''}`; break;
     case 'network.failure': summary = `FAILED ${d.errorText || ''} — ${d.url_full || d.url_sanitized || ''}`; break;
     case 'network.timing': summary = `${d.method || ''} ${d.response_status ? d.response_status + ' ' : ''}${d.duration_ms}ms — ${d.url_full || d.url_sanitized || ''}`; break;
+    case 'network.ws_open': summary = `WS OPEN ${d.url_full || d.url_sanitized || ''}`; break;
+    case 'network.ws_handshake': summary = `WS HANDSHAKE ${d.status || ''} ${d.statusText || ''} — ${d.url_sanitized || ''}`; break;
+    case 'network.ws_frame': summary = `WS ${d.direction === 'sent' ? '↑' : '↓'} ${d.size ?? ''}B — ${d.url_sanitized || ''}`; break;
+    case 'network.ws_error': summary = `WS ERROR: ${d.errorMessage || ''} — ${d.url_sanitized || ''}`; break;
+    case 'network.ws_close': summary = `WS CLOSE ${d.frames_sent || 0}↑/${d.frames_received || 0}↓ frames — ${d.url_sanitized || ''}`; break;
     case 'console.warn': summary = `WARN: ${d.message || d.text || ''}`; break;
     case 'console.error': summary = `ERROR: ${d.message || d.text || ''}`; break;
     case 'runtime.exception': summary = `EXC: ${d.message || ''}`; break;
     case 'marker.bug': summary = `🐛 Bug Marker: ${d.note || ''}`; break;
-    default: summary = JSON.stringify(d).slice(0, 80);
+    case 'action.input': summary = `Fill: ${d.selector || ''}${d.is_sensitive ? ' = ***' : d.final_value ? ` = '${d.final_value}'` : ''}`; break;
+    case 'action.select': summary = `Select: ${d.selected_text || d.selected_value || ''} (${d.selector || ''})`; break;
+    case 'action.keydown': summary = `Key: ${d.key || ''} (${d.selector || ''})`; break;
+    case 'dom.state_change': summary = `${d.kind ? d.kind[0].toUpperCase() + d.kind.slice(1) : 'DOM change'}${d.role ? ` (${d.role})` : ''}${d.text ? `: ${d.text}` : ''}`; break;
+    default: summary = type || 'Unknown event';
   }
 
   // Build accordions for payloads and headers
   let payloadHtml = '';
-  payloadHtml += makePayloadAccordion('📤 Request Body', d.request_body, false);
-  payloadHtml += makeHeadersAccordion('📋 Request Headers', d.request_headers);
-  payloadHtml += makePayloadAccordion('📥 Response Body', d.response_body, isNetworkError);
-  payloadHtml += makeHeadersAccordion('📋 Response Headers', d.response_headers);
+  payloadHtml += makePayloadAccordion('Request Body', d.request_body, false);
+  payloadHtml += makeHeadersAccordion('Request Headers', d.request_headers);
+  payloadHtml += makePayloadAccordion('Response Body', d.response_body, isNetworkError);
+  payloadHtml += makeHeadersAccordion('Response Headers', d.response_headers);
 
   return esc(summary) + payloadHtml;
 }
@@ -200,18 +282,17 @@ async function loadGlobalStats() {
 }
 
 // ── Bulk Delete ───────────────────────────────────────────────────────────────
-let isBulkMode = { sessions: false, sanity: false };
-let bulkSelected = { sessions: new Set(), sanity: new Set() };
+let isBulkMode = { sessions: false };
+let bulkSelected = { sessions: new Set() };
 
 function toggleBulkMode(type) {
   isBulkMode[type] = !isBulkMode[type];
   bulkSelected[type].clear();
-  
+
   const controls = document.getElementById(`bulk-controls-${type}`);
   if (controls) controls.style.display = isBulkMode[type] ? 'flex' : 'none';
-  
+
   if (type === 'sessions') renderSessionList(allSessionsCache);
-  if (type === 'sanity') renderSanityList(allSanityCache);
 }
 
 function toggleBulkSelect(type, id, checked, e) {
@@ -247,7 +328,6 @@ async function executeBulkDelete(type) {
     }
     
     await loadSessions();
-    await loadSanityFlows();
   } catch {
     showToast('Failed to bulk delete sessions', 'error');
   }
@@ -314,7 +394,7 @@ function renderSessionList(sessions) {
         ? `<input type="checkbox" style="margin-right:10px; pointer-events:none;" ${bulkSelected.sessions.has(s.id) ? 'checked' : ''} />` 
         : '';
     const deleteBtn = !isBulkMode.sessions 
-        ? `<button class="session-delete-btn" onclick="deleteSession(event,'${esc(s.id)}')" title="Delete session">✕</button>`
+        ? `<button class="session-delete-btn" onclick="deleteSession(event,'${esc(s.id)}')" title="Delete session">${icon('x', 12)}</button>`
         : '';
 
     return `
@@ -345,198 +425,6 @@ function renderSessionList(sessions) {
   }).join('');
 }
 
-// ── Sanity Runs List ──────────────────────────────────────────────────────────
-function switchSidebar(tab) {
-  document.getElementById('sidebar-sessions').style.display = tab === 'sessions' ? 'flex' : 'none';
-  document.getElementById('sidebar-sanity').style.display = tab === 'sanity' ? 'flex' : 'none';
-  document.getElementById('nav-btn-sessions').style.borderBottomColor = tab === 'sessions' ? 'var(--accent)' : 'transparent';
-  document.getElementById('nav-btn-sessions').style.color = tab === 'sessions' ? 'var(--accent)' : 'var(--text-muted)';
-  document.getElementById('nav-btn-sanity').style.borderBottomColor = tab === 'sanity' ? 'var(--accent)' : 'transparent';
-  document.getElementById('nav-btn-sanity').style.color = tab === 'sanity' ? 'var(--accent)' : 'var(--text-muted)';
-  
-  if (tab === 'sanity') {
-    loadSanityFlows();
-  } else {
-    loadSessions();
-  }
-}
-
-let allSanityCache = [];
-
-async function loadSanityFlows() {
-  const listEl = document.getElementById('sanity-list');
-  listEl.innerHTML = '<div class="loading-row"><span class="spinner"></span> Loading…</div>';
-  try {
-    const res = await fetch(`${API}/sanity-flows`);
-    const { flows } = await res.json();
-    allSanityCache = flows;
-    document.getElementById('sanity-count').textContent = flows.length;
-    renderSanityList(flows);
-  } catch {
-    listEl.innerHTML = `<div class="loading-row" style="color:var(--danger)">⚠ Cannot connect to server</div>`;
-  }
-}
-
-function filterSanity() {
-  const q = (document.getElementById('sanity-search').value || '').toLowerCase();
-  if (!q) return renderSanityList(allSanityCache);
-  const filtered = allSanityCache.filter(f => 
-    (f.flow_name || '').toLowerCase().includes(q) ||
-    (f.module_name || '').toLowerCase().includes(q)
-  );
-  renderSanityList(filtered);
-}
-
-async function runSanityFlow(e, sessionId, flowName, moduleName) {
-  e.stopPropagation();
-  const btn = e.currentTarget;
-  
-  if (btn.dataset.running === 'true') {
-    // Stop it
-    btn.disabled = true;
-    btn.textContent = 'Stopping...';
-    try {
-      await fetch(`${API}/sessions/${sessionId}/replay/stop`, { method: 'POST' });
-    } catch (e) {}
-    return;
-  }
-  
-  btn.dataset.running = 'true';
-  btn.textContent = '⏹ Stop';
-  btn.style.backgroundColor = '#ef4444';
-  btn.style.borderColor = '#ef4444';
-  
-  try {
-    const pdir = document.getElementById('sanity-profile-dir')?.value || '';
-    const sdelay = document.getElementById('sanity-step-delay')?.value || '';
-    
-    let bodyObj = {};
-    if (pdir) bodyObj.profileDir = pdir;
-    if (sdelay) bodyObj.stepDelay = parseInt(sdelay, 10);
-
-    const res = await fetch(`${API}/sessions/${sessionId}/replay`, { 
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(bodyObj)
-    });
-    const data = await res.json();
-    if (!data.ok || data.error) throw new Error(data.message || data.error || 'Replay failed');
-    if (!data.report) throw new Error('No report returned from replay engine');
-    const { report } = data;
-    
-    // Check if the engine completely crashed or failed to connect
-    const engineCrash = report.failures.ui.find(e => e.type === 'engine_crash');
-    if (engineCrash) throw new Error(engineCrash.message);
-    const wasAborted = report.failures.ui.find(e => e.type === 'engine_aborted');
-    if (wasAborted) {
-      alert('Replay was stopped manually.');
-    } else {
-      const errCount = report.failures.ui.length + report.failures.js_errors.length;
-      alert(`Replay Finished!\nPassed: ${report.summary.passed}\nFailed: ${report.summary.failed}\nErrors: ${errCount}\nNet Fails: ${report.failures.network.length}`);
-    }
-
-    if (currentTab === 'runs' && currentSessionId === sessionId) {
-      loadRuns();
-    }
-  } catch (err) {
-    alert(`Replay Error: ${err.message}`);
-  } finally {
-    btn.dataset.running = 'false';
-    btn.disabled = false;
-    btn.textContent = '▶ Run';
-    btn.style.backgroundColor = '';
-    btn.style.borderColor = '';
-  }
-}
-
-function renderSanityList(flows) {
-  const listEl = document.getElementById('sanity-list');
-  if (!flows.length) {
-    listEl.innerHTML = '<div class="empty-list">No sanity runs found</div>';
-    return;
-  }
-
-  // 1. Group by module
-  const groups = {};
-  for (const f of flows) {
-    const mod = f.module_name || 'Uncategorized';
-    if (!groups[mod]) groups[mod] = [];
-    groups[mod].push(f);
-  }
-
-  // 2. Render groups as <details> accordions
-  let html = '';
-  // Sort keys so Uncategorized is last, others alphabetical
-  const sortedKeys = Object.keys(groups).sort((a,b) => {
-    if (a === 'Uncategorized') return 1;
-    if (b === 'Uncategorized') return -1;
-    return a.localeCompare(b);
-  });
-
-  for (const mod of sortedKeys) {
-    const modFlows = groups[mod];
-    
-    // Check if any flow in this module is currently active
-    const hasActive = modFlows.some(f => f.id === currentSessionId);
-    
-    const flowsHtml = modFlows.map(f => {
-      const health = sessionHealthColor(f);
-      const isClean = (f.error_count || 0) === 0 && (f.network_failure_count || 0) === 0;
-
-      const clickAction = isBulkMode.sanity
-          ? `toggleBulkSelect('sanity', '${esc(f.id)}', !this.querySelector('input').checked, event); const cb = this.querySelector('input'); cb.checked = !cb.checked;`
-          : `selectSession('${esc(f.id)}')`;
-
-      const checkboxHtml = isBulkMode.sanity
-          ? `<input type="checkbox" style="margin-right:10px; pointer-events:none;" ${bulkSelected.sanity.has(f.id) ? 'checked' : ''} />` 
-          : '';
-
-      const actionsHtml = !isBulkMode.sanity
-          ? `<button class="btn btn-primary sanity-run-btn" style="padding: 4px 8px; font-size: 10px;" onclick="runSanityFlow(event, '${esc(f.id)}', '${esc(f.flow_name)}', '${esc(f.module_name || '')}')">▶ Run</button>
-             <button class="session-delete-btn" style="margin-left: 4px;" onclick="deleteSession(event,'${esc(f.id)}')" title="Delete sanity run">✕</button>`
-          : '';
-
-      return `
-      <div class="session-item ${f.id === currentSessionId ? 'active' : ''}" style="border-left: 3px solid transparent; padding-left: 24px; ${isBulkMode.sanity ? 'cursor:pointer;' : ''}"
-           onclick="${clickAction}" data-id="${esc(f.id)}">
-        ${checkboxHtml}
-        <div style="flex:1; min-width:0;">
-            <div class="session-item-top">
-              <div style="flex:1; min-width:0; display:flex; flex-direction:column; gap:4px;">
-                 <div class="session-title" title="${esc(f.flow_name)}">${esc(f.flow_name)}</div>
-              </div>
-              ${actionsHtml}
-            </div>
-            <div class="session-meta">
-              <span>${formatDate(f.created_at)}</span>
-              <span>${formatDuration(f.duration_ms)}</span>
-            </div>
-        <div class="session-badges">
-          ${f.last_run_status === 'recording' ? '<span class="badge badge-recording">● Live</span>' : ''}
-          ${(f.error_count || 0) > 0 ? `<span class="badge badge-error">⚠ ${f.error_count} err</span>` : ''}
-          ${(f.network_failure_count || 0) > 0 ? `<span class="badge badge-warn">${f.network_failure_count} net fail</span>` : ''}
-          ${isClean && f.last_run_status !== 'recording' ? '<span class="badge badge-success">✓ Clean</span>' : ''}
-        </div>
-        <div class="health-bar-wrap">
-          <div class="health-bar" style="background:${health};width:${isClean ? 100 : Math.max(10, 100 - (f.error_count || 0) * 15 - (f.network_failure_count || 0) * 10)}%"></div>
-        </div>
-      </div>
-      </div>`;
-    }).join('');
-
-    html += `
-    <details class="module-group" style="border-bottom: 1px solid var(--border);" ${hasActive ? 'open' : ''}>
-      <summary style="padding: 12px 16px; cursor: pointer; font-size: 12px; font-weight: 700; color: var(--text); background: var(--surface); display: flex; align-items: center; gap: 8px; user-select: none; outline: none;">
-        📁 ${esc(mod)} <span class="session-count" style="margin-left:auto; background: var(--surface3); color: var(--text-dim);">${modFlows.length}</span>
-      </summary>
-      <div class="module-flows" style="background: var(--surface2);">
-        ${flowsHtml}
-      </div>
-    </details>`;
-  }
-
-  listEl.innerHTML = html;
-}
 
 // ── Delete Session ────────────────────────────────────────────────────────────
 async function deleteSession(e, id) {
@@ -552,7 +440,6 @@ async function deleteSession(e, id) {
       document.getElementById('session-detail').style.display = 'none';
     }
     await loadSessions();
-    await loadSanityFlows();
   } catch (err) {
     showToast('Failed to delete session', 'error');
   }
@@ -565,6 +452,7 @@ async function deleteCurrentSession() {
 
 // ── Session Detail ────────────────────────────────────────────────────────────
 let sessionStartMs = null;
+let currentSessionData = null; // last-loaded { session, summary } — reused by the Slack report action
 
 async function selectSession(id) {
   // Toggle: clicking the already-selected session closes it and shows the dashboard
@@ -573,6 +461,7 @@ async function selectSession(id) {
     document.querySelectorAll('.session-item').forEach(el => el.classList.remove('active'));
     document.getElementById('empty-state').style.display = '';
     document.getElementById('session-detail').style.display = 'none';
+    history.replaceState(null, '', location.pathname + location.search);
     loadDashboardIgnored();
     return;
   }
@@ -581,14 +470,17 @@ async function selectSession(id) {
   document.querySelectorAll('.session-item').forEach(el => {
     el.classList.toggle('active', el.dataset.id === id);
   });
+  updateUrlHash();
 
   document.getElementById('empty-state').style.display = 'none';
+  document.getElementById('settings-view').style.display = 'none';
   const detail = document.getElementById('session-detail');
   detail.style.display = 'flex';
 
   const res = await fetch(`${API}/sessions/${id}`);
   const { session, summary } = await res.json();
   sessionStartMs = session.started_at;
+  currentSessionData = session;
 
   document.getElementById('detail-title').textContent = session.title || session.url || id;
   document.getElementById('detail-url').textContent = session.url || '';
@@ -597,32 +489,37 @@ async function selectSession(id) {
   const nc2 = session.network_failure_count || 0;
   const sc2 = session.slow_request_count || 0;
   const isLive = session.status === 'recording';
+  const browserInfoLabel = formatBrowserInfo(session.browser_info);
 
   document.getElementById('detail-meta').innerHTML = `
     <span class="meta-chip" data-tip="Session started at ${formatDate(session.started_at)}">
-      <span class="chip-icon">🕐</span>${formatDate(session.started_at)}
+      <span class="chip-icon">${icon('clock', 12)}</span>${formatDate(session.started_at)}
     </span>
+    ${browserInfoLabel
+      ? `<span class="meta-chip" data-tip="Browser environment this session was recorded in"><span class="chip-icon">${icon('infoCircle', 12)}</span>${esc(browserInfoLabel)}</span>`
+      : ''
+    }
     <span class="meta-chip" data-tip="Total recording duration">
-      <span class="chip-icon">⏱</span>${formatDuration(session.duration_ms)}
+      <span class="chip-icon">${icon('clock', 12)}</span>${formatDuration(session.duration_ms)}
     </span>
     <span class="meta-chip" data-tip="Total events captured during this session (clicks, network, console, etc.)">
-      <span class="chip-icon">📝</span>${session.event_count || 0} events
+      <span class="chip-icon">${icon('clipboard', 12)}</span>${session.event_count || 0} events
     </span>
     ${ec2 > 0
-      ? `<span class="meta-chip chip-danger" data-tip="${ec2} JavaScript error${ec2 !== 1 ? 's' : ''} or uncaught exception${ec2 !== 1 ? 's' : ''} were recorded. Check the Triage tab."><span class="chip-icon">⚠️</span>${ec2} JS error${ec2 !== 1 ? 's' : ''}</span>`
-      : `<span class="meta-chip chip-success" data-tip="No JavaScript errors detected in this session"><span class="chip-icon">✅</span>No JS errors</span>`
+      ? `<span class="meta-chip chip-danger" data-tip="${ec2} JavaScript error${ec2 !== 1 ? 's' : ''} or uncaught exception${ec2 !== 1 ? 's' : ''} were recorded. Check the Triage tab."><span class="chip-icon">${icon('alertTriangle', 12)}</span>${ec2} JS error${ec2 !== 1 ? 's' : ''}</span>`
+      : `<span class="meta-chip chip-success" data-tip="No JavaScript errors detected in this session"><span class="chip-icon">${icon('checkCircle', 12)}</span>No JS errors</span>`
     }
     ${nc2 > 0
-      ? `<span class="meta-chip chip-warn" data-tip="${nc2} API/network request${nc2 !== 1 ? 's' : ''} failed (CORS, timeout, or server error). Check the Triage tab."><span class="chip-icon">🌐</span>${nc2} net failure${nc2 !== 1 ? 's' : ''}</span>`
+      ? `<span class="meta-chip chip-warn" data-tip="${nc2} API/network request${nc2 !== 1 ? 's' : ''} failed (CORS, timeout, or server error). Check the Triage tab."><span class="chip-icon">${icon('globe', 12)}</span>${nc2} net failure${nc2 !== 1 ? 's' : ''}</span>`
       : ''
     }
     ${sc2 > 0
-      ? `<span class="meta-chip chip-warn" data-tip="${sc2} request${sc2 !== 1 ? 's' : ''} took longer than 2 seconds — potential performance issue."><span class="chip-icon">🐢</span>${sc2} slow req${sc2 !== 1 ? 's' : ''}</span>`
+      ? `<span class="meta-chip chip-warn" data-tip="${sc2} request${sc2 !== 1 ? 's' : ''} took longer than 2 seconds — potential performance issue."><span class="chip-icon">${icon('clock', 12)}</span>${sc2} slow req${sc2 !== 1 ? 's' : ''}</span>`
       : ''
     }
     ${isLive
       ? `<span class="meta-chip chip-live" data-tip="This session is actively being recorded"><span class="chip-icon">●</span>Live</span>`
-      : `<span class="meta-chip chip-success" data-tip="Recording has finished"><span class="chip-icon">✓</span>Done</span>`
+      : `<span class="meta-chip chip-success" data-tip="Recording has finished"><span class="chip-icon">${icon('checkCircle', 12)}</span>Done</span>`
     }
   `;
   document.getElementById('download-btn').href = `${API}/sessions/${id}/download`;
@@ -651,6 +548,7 @@ async function selectSession(id) {
   else if (currentTab === 'input') loadInputTrack();
   else if (currentTab === 'events') loadEvents();
   else if (currentTab === 'video') loadVideo();
+  else if (currentTab === 'repro') loadReproSteps();
 }
 
 // ── Overview ──────────────────────────────────────────────────────────────────
@@ -663,18 +561,19 @@ function renderOverview(session, summary) {
 
   // ── Stats grid: icons · trend chips · tooltips · priority banners ──────────
   // priorityBanner: { level: 'critical'|'moderate', text: string } | null
-  function statCard({ variant, icon, label, value, valueCls, trend, trendCls, sub, tip, priorityBanner, ariaLabel }) {
+  function statCard({ variant, iconName, label, value, valueCls, trend, trendCls, sub, tip, priorityBanner, ariaLabel }) {
+    const iconSvg = icon(iconName, 16);
     const banner = priorityBanner
       ? `<div class="stat-priority-banner ${priorityBanner.level}" role="status" aria-label="${priorityBanner.text}">
-           <span aria-hidden="true">${priorityBanner.level === 'critical' ? '⛔' : '⚠'}</span>
+           <span aria-hidden="true" style="display:inline-flex;flex-shrink:0;margin-top:2px;">${icon(priorityBanner.level === 'critical' ? 'alertOctagon' : 'alertTriangle', 11)}</span>
            ${priorityBanner.text}
          </div>`
       : '';
     return `
       <div class="stat-card ${variant}" data-tip="${tip}" role="region" aria-label="${ariaLabel || label + ': ' + value}">
-        <div class="stat-icon-bg" aria-hidden="true">${icon}</div>
+        <div class="stat-icon-bg" aria-hidden="true">${icon(iconName, 40)}</div>
         <div class="stat-header">
-          <span class="stat-icon" aria-hidden="true">${icon}</span>
+          <span class="stat-icon" aria-hidden="true" style="display:inline-flex;">${iconSvg}</span>
           <span class="stat-label">${label}</span>
           ${trend ? `<span class="stat-trend ${trendCls}" aria-label="${trend}">${trend}</span>` : ''}
         </div>
@@ -686,7 +585,7 @@ function renderOverview(session, summary) {
 
   document.getElementById('overview-stats').innerHTML = [
     statCard({
-      variant: 'accent', icon: '⏱', label: 'Duration',
+      variant: 'accent', iconName: 'clock', label: 'Duration',
       value: formatDuration(session.duration_ms), valueCls: 'accent',
       trend: '', trendCls: '',
       sub: 'Total session length',
@@ -695,7 +594,7 @@ function renderOverview(session, summary) {
     }),
     statCard({
       variant: ec > 0 ? 'danger' : 'success',
-      icon: ec > 0 ? '🚨' : '✅',
+      iconName: ec > 0 ? 'alertOctagon' : 'checkCircle',
       label: 'JS Errors',
       value: ec, valueCls: ec > 0 ? 'danger' : 'success',
       trend: ec > 0 ? '⚠ Action needed' : '✓ Clean',
@@ -711,7 +610,7 @@ function renderOverview(session, summary) {
     }),
     statCard({
       variant: nc > 0 ? 'warn' : 'success',
-      icon: nc > 0 ? '🌐' : '✅',
+      iconName: nc > 0 ? 'globe' : 'checkCircle',
       label: 'Net Failures',
       value: nc, valueCls: nc > 0 ? 'warn' : 'success',
       trend: nc > 0 ? '⚠ Check Triage' : '✓ All OK',
@@ -727,7 +626,7 @@ function renderOverview(session, summary) {
     }),
     statCard({
       variant: sc > 0 ? 'warn' : 'success',
-      icon: sc > 0 ? '🐢' : '⚡',
+      iconName: sc > 0 ? 'clock' : 'zap',
       label: 'Slow Reqs (>2s)',
       value: sc, valueCls: sc > 0 ? 'warn' : 'success',
       trend: sc > 0 ? 'Perf issue' : '✓ Fast',
@@ -742,7 +641,7 @@ function renderOverview(session, summary) {
         : 'Slow requests: 0, all responses fast',
     }),
     statCard({
-      variant: '', icon: '📋', label: 'Total Events',
+      variant: '', iconName: 'clipboard', label: 'Total Events',
       value: session.event_count || 0, valueCls: '',
       trend: '', trendCls: '',
       sub: 'Clicks, network, console…',
@@ -779,7 +678,7 @@ function renderOverview(session, summary) {
       </div>
       <div class="hs-desc">
         ${overallOk
-          ? '✅ This session is clean — no errors or API failures detected.'
+          ? `<span style="color:var(--success);display:inline-flex;vertical-align:-2px;">${icon('checkCircle', 13)}</span> This session is clean — no errors or API failures detected.`
           : `Found <strong>${totalIssues} issue${totalIssues !== 1 ? 's' : ''}</strong>: ${[
               ec > 0 ? `<span style="color:var(--danger)">⚠ ${ec} JS error${ec !== 1 ? 's' : ''}</span>` : '',
               nc > 0 ? `<span style="color:var(--warn)">🌐 ${nc} net failure${nc !== 1 ? 's' : ''}</span>` : '',
@@ -906,7 +805,7 @@ function renderTlCanvas() {
       const idx = Math.min(BUCKETS - 1, Math.max(0, Math.floor((relMs - startVis) / bucketMs)));
       counts[idx]++;
       bucketEvs[idx].push(ev);
-      if (['console.error', 'runtime.exception', 'network.failure'].includes(ev.type)) errCounts[idx]++;
+      if (['console.error', 'runtime.exception', 'network.failure', 'network.ws_error'].includes(ev.type)) errCounts[idx]++;
     }
   }
 
@@ -1080,6 +979,9 @@ function eventSignature(ev) {
     const url = d.url_sanitized || d.url_full || 'unknown_url';
     return `network.failure::${url}`;
   }
+  if (ev.type === 'network.ws_error') {
+    return `network.ws_error::${d.url_sanitized || 'unknown_url'}::${d.errorMessage || ''}`;
+  }
   const msg = d.message || d.text || '';
   return `${ev.type}::${msg.slice(0, 120)}`;
 }
@@ -1095,7 +997,7 @@ async function ignoreEvent(ev, sessionId) {
       body: JSON.stringify({ signature: sig, label, source_session_id: sessionId }),
     });
     ignoredSignatures.add(sig);
-    showToast('Error muted globally 🙈', 'success');
+    showToast('Error muted globally', 'success');
     renderTriage(triageEventsCache);  // re-render in-place with greyed-out state
     loadDashboardIgnored();           // refresh the dashboard panel
   } catch {
@@ -1109,7 +1011,7 @@ async function restoreIgnored(id) {
     await refreshIgnoredSignatures();
     renderTriage(triageEventsCache);
     loadDashboardIgnored();
-    showToast('Error restored ✅', 'success');
+    showToast('Error restored', 'success');
   } catch {
     showToast('Failed to restore error', 'error');
   }
@@ -1133,7 +1035,7 @@ async function loadDashboardIgnored() {
         <div style="font-size:12px; font-weight:600; color:var(--text); word-break:break-all; margin-bottom:4px;">${esc(e.label)}</div>
         <div style="font-size:10px; color:var(--text-dim);">Muted ${formatDate(e.ignored_at)}${e.source_session_id ? ` · from session <code>${e.source_session_id.slice(0,8)}</code>` : ''}</div>
       </div>
-      <button onclick="restoreIgnored('${esc(e.id)}')" style="flex-shrink:0; background:none; border:1px solid var(--border); color:var(--text-muted); border-radius:5px; padding:4px 10px; font-size:11px; cursor:pointer;" title="Restore this error">👁️ Restore</button>
+      <button onclick="restoreIgnored('${esc(e.id)}')" style="flex-shrink:0; background:none; border:1px solid var(--border); color:var(--text-muted); border-radius:5px; padding:4px 10px; font-size:11px; cursor:pointer;" title="Restore this error">${icon('eye', 12)} Restore</button>
     </div>`);
     list.innerHTML += ignored.length > 0 ? '' : '';
 }
@@ -1163,7 +1065,7 @@ function renderTriage(events) {
   }
 
   const show = triageFilter === 'errors'
-    ? events.filter(ev => ['console.error', 'runtime.exception', 'network.failure'].includes(ev.type))
+    ? events.filter(ev => ['console.error', 'runtime.exception', 'network.failure', 'network.ws_error'].includes(ev.type))
     : events;
 
   _triageShowCache = show; // update safe index reference
@@ -1172,7 +1074,7 @@ function renderTriage(events) {
     const d = ev.data || {};
     const sig = eventSignature(ev);
     const isIgnored = ignoredSignatures.has(sig);
-    const isCritical = ['console.error', 'runtime.exception', 'network.failure'].includes(ev.type);
+    const isCritical = ['console.error', 'runtime.exception', 'network.failure', 'network.ws_error'].includes(ev.type);
     let msg = d.message || d.text || d.text_snippet || '';
     const stack = d.stack || d.stackTrace || null;
     const dedup = ev._triage?.dedup_count > 1 ? `<span class="dedup-badge">×${ev._triage.dedup_count}</span>` : '';
@@ -1187,14 +1089,17 @@ function renderTriage(events) {
       : '';
 
     const ignoredBadge = isIgnored
-      ? `<span style="font-size:10px;background:var(--surface3);color:var(--text-dim);border-radius:99px;padding:1px 8px;font-weight:600;">🙈 Muted</span>`
+      ? `<span style="font-size:10px;background:var(--surface3);color:var(--text-dim);border-radius:99px;padding:1px 8px;font-weight:600;display:inline-flex;align-items:center;gap:3px;">${icon('eyeOff', 10)} Muted</span>`
       : '';
 
     // Use data-idx to avoid embedding event JSON in onclick attrs (breaks on special chars)
     const ignoreBtn = isCritical && !isIgnored
-      ? `<button class="copy-btn" data-idx="${i}" onclick="triageIgnoreByIdx(this.dataset.idx)" title="Mute this error globally">🙈 Ignore</button>`
+      ? `<button class="copy-btn" data-idx="${i}" onclick="triageIgnoreByIdx(this.dataset.idx)" title="Mute this error globally">${icon('eyeOff', 11)} Ignore</button>`
       : '';
-    const copyBtn = `<button class="copy-btn" data-idx="${i}" onclick="triagreCopyByIdx(this.dataset.idx)" title="Copy">📋</button>`;
+    const copyBtn = `<button class="copy-btn" data-idx="${i}" onclick="triagreCopyByIdx(this.dataset.idx)" title="Copy">${icon('copy', 11)}</button>`;
+    const slackBtn = ev.type === 'marker.bug'
+      ? `<button class="copy-btn" data-idx="${i}" onclick="sendBugMarkerToSlack(this.dataset.idx)" title="Send this bug to Slack">${icon('slack', 11)} Slack</button>`
+      : '';
 
     return `
       <div class="triage-event ${isIgnored ? '' : getTriageClass(ev.type)}" id="trev-${i}" style="${isIgnored ? 'opacity:0.45;' : ''}">
@@ -1203,15 +1108,53 @@ function renderTriage(events) {
           <div class="triage-ts">${formatTs(ev.ts_epoch_ms, sessionStartMs)} ${ignoredBadge}</div>
           <div class="triage-msg">${msg}${dedup}</div>
           ${diagHtml}
-          ${stack ? `<pre class="triage-stack">${esc(String(stack).slice(0, 500))}</pre>` : ''}
+          ${stack ? `
+            <pre class="triage-stack" id="stack-${i}">${esc(String(stack).slice(0, 500))}</pre>
+            <button class="copy-btn" data-idx="${i}" onclick="resolveStackByIdx(this.dataset.idx)" title="Resolve minified stack via source maps" style="margin-top:4px;">${icon('search', 11)} Resolve source map</button>
+          ` : ''}
+          ${d.storage_snapshot ? makePayloadAccordion('Storage at time of error', JSON.stringify(d.storage_snapshot), false) : ''}
         </div>
         <div class="triage-actions">
           ${ignoreBtn}
+          ${slackBtn}
           ${copyBtn}
         </div>
       </div>`;
   }).join('');
 }
+
+window.resolveStackByIdx = async function (idx) {
+  const ev = _triageShowCache[Number(idx)];
+  if (!ev) return;
+  const stack = ev.data?.stack || ev.data?.stackTrace;
+  if (!stack) return;
+  const pre = document.getElementById(`stack-${idx}`);
+  const original = pre.textContent;
+  pre.textContent = 'Resolving…';
+  try {
+    const res = await fetch(`${API}/sessions/${currentSessionId}/resolve-stack`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ stack }),
+    });
+    const data = await res.json();
+    const resolvedFrames = (data.frames || []).filter(f => f.resolved);
+    if (!resolvedFrames.length) {
+      pre.textContent = original;
+      showToast('No source map found for this stack', 'info');
+      return;
+    }
+    pre.textContent = data.frames.map(f => {
+      if (!f.resolved) return f.raw;
+      const r = f.resolved;
+      return `${f.raw}\n    → ${r.source}:${r.line}:${r.column}${r.name ? ` (${r.name})` : ''}`;
+    }).join('\n');
+    showToast(`Resolved ${resolvedFrames.length} frame${resolvedFrames.length !== 1 ? 's' : ''}`, 'success');
+  } catch {
+    pre.textContent = original;
+    showToast('Failed to resolve stack trace', 'error');
+  }
+};
 
 function filterTriage(mode) {
   triageFilter = mode;
@@ -1256,12 +1199,12 @@ function filterEventsTable() {
 function renderEventsTable(events) {
   const hasPayload = ev => {
     const d = ev.data || {};
-    return d.request_body || d.response_body || d.request_headers || d.response_headers;
+    return d.request_body || d.response_body || d.request_headers || d.response_headers || d.storage_snapshot;
   };
 
   document.getElementById('events-tbody').innerHTML = events.map((ev, i) => {
     const d = ev.data || {};
-    const isError = ['console.error', 'runtime.exception', 'network.failure'].includes(ev.type);
+    const isError = ['console.error', 'runtime.exception', 'network.failure', 'network.ws_error'].includes(ev.type);
     const isNetworkRow = ev.type.startsWith('network.');
 
     // Build the brief one-line summary (no HTML)
@@ -1274,20 +1217,30 @@ function renderEventsTable(events) {
       case 'network.response': brief = `HTTP ${d.status} ${d.mimeType || ''} — ${d.url_full || d.url_sanitized || ''}`; break;
       case 'network.failure': brief = `FAILED ${d.errorText || ''} — ${d.url_full || d.url_sanitized || ''}`; break;
       case 'network.timing': brief = `${d.method || ''} ${d.response_status ? d.response_status + ' ↩ ' : ''}${d.duration_ms}ms — ${d.url_full || d.url_sanitized || ''}`; break;
+      case 'network.ws_open': brief = `WS OPEN ${d.url_full || d.url_sanitized || ''}`; break;
+      case 'network.ws_handshake': brief = `WS HANDSHAKE ${d.status || ''} ${d.statusText || ''} — ${d.url_sanitized || ''}`; break;
+      case 'network.ws_frame': brief = `WS ${d.direction === 'sent' ? '↑' : '↓'} ${d.size ?? ''}B — ${d.url_sanitized || ''}`; break;
+      case 'network.ws_error': brief = `WS ERROR: ${d.errorMessage || ''} — ${d.url_sanitized || ''}`; break;
+      case 'network.ws_close': brief = `WS CLOSE ${d.frames_sent || 0}↑/${d.frames_received || 0}↓ frames — ${d.url_sanitized || ''}`; break;
       case 'console.warn': brief = `WARN: ${d.message || d.text || ''}`; break;
       case 'console.error': brief = `ERROR: ${d.message || d.text || ''}`; break;
       case 'runtime.exception': brief = `EXC: ${d.message || ''}`; break;
       case 'marker.bug': brief = `🐛 ${d.note || ''}`; break;
-      default: brief = JSON.stringify(d).slice(0, 120);
+      case 'action.input': brief = `Fill: ${d.selector || ''}${d.is_sensitive ? ' = ***' : d.final_value ? ` = '${d.final_value}'` : ''}`; break;
+      case 'action.select': brief = `Select: ${d.selected_text || d.selected_value || ''} (${d.selector || ''})`; break;
+      case 'action.keydown': brief = `Key: ${d.key || ''} (${d.selector || ''})`; break;
+      case 'dom.state_change': brief = `${d.kind ? d.kind[0].toUpperCase() + d.kind.slice(1) : 'DOM change'}${d.role ? ` (${d.role})` : ''}${d.text ? `: ${d.text}` : ''}`; break;
+      default: brief = ev.type || 'Unknown event';
     }
 
     // Build expandable payload section
     let payloads = '';
     if (hasPayload(ev)) {
-      payloads += makePayloadAccordion('📤 Request Body', d.request_body, false);
-      payloads += makeHeadersAccordion('📋 Request Headers', d.request_headers);
-      payloads += makePayloadAccordion('📥 Response Body', d.response_body, isError);
-      payloads += makeHeadersAccordion('📋 Response Headers', d.response_headers);
+      payloads += makePayloadAccordion('Request Body', d.request_body, false);
+      payloads += makeHeadersAccordion('Request Headers', d.request_headers);
+      payloads += makePayloadAccordion('Response Body', d.response_body, isError);
+      payloads += makeHeadersAccordion('Response Headers', d.response_headers);
+      if (d.storage_snapshot) payloads += makePayloadAccordion('Storage at time of error', JSON.stringify(d.storage_snapshot), false);
     }
 
     const payloadCell = payloads
@@ -1384,12 +1337,12 @@ function renderInputTable(events) {
         const sel = d.selector
           ? `<div class="input-selector">${esc(d.selector.slice(0, 120))}</div>`
           : '';
-        detailHtml = `<div class="input-detail-cell">🖱️ ${text}${sel}</div>`;
+        detailHtml = `<div class="input-detail-cell" style="display:flex;align-items:center;gap:5px;">${icon('mousePointer', 12)} ${text}${sel}</div>`;
         break;
       }
       case 'action.scroll': {
         const dy = d.deltaY || 0;
-        const dir = dy > 0 ? '↓ Down' : '↑ Up';
+        const dir = dy > 0 ? `${icon('arrowDown', 11)} Down` : `${icon('arrowUp', 11)} Up`;
         const pct = Math.min(100, (Math.abs(dy) / maxDelta) * 100);
         const barHtml = `<span class="scroll-delta-bar-bg"><span class="scroll-delta-bar-fill" style="width:${pct}%"></span></span>`;
         detailHtml = `<div class="input-detail-cell">${dir} <span style="color:var(--accent2);font-weight:600;">${Math.abs(dy).toFixed(0)}px</span>${barHtml}</div>`;
@@ -1403,7 +1356,7 @@ function renderInputTable(events) {
           ? `<span style="color:var(--success);font-weight:600;">${esc(d.to_url.slice(0, 80))}</span>`
           : '<em>unknown</em>';
         const arrow = from ? `<span class="input-nav-arrow">→</span>` : '';
-        detailHtml = `<div class="input-detail-cell">🔗 ${from}${arrow}${to}</div>`;
+        detailHtml = `<div class="input-detail-cell" style="display:flex;align-items:center;gap:5px;">${icon('link', 12)} ${from}${arrow}${to}</div>`;
         break;
       }
       default:
@@ -1441,8 +1394,8 @@ async function loadVideo() {
     const { chunks } = await res.json();
 
     if (!chunks || !chunks.length) {
-      container.innerHTML = '<div class="no-video">No video recorded for this session</div>';
-      sidebar.innerHTML   = '<div class="video-sidebar-title">Activity Feed</div><div class="no-video">No video</div>';
+      container.innerHTML = `<div class="no-video">${icon('film', 34)}<div class="no-video-title">No video recorded</div><div class="no-video-sub">This session doesn't have a screen capture attached.</div></div>`;
+      sidebar.innerHTML   = `<div class="video-sidebar-title">Activity Feed</div><div class="no-video" style="padding:30px 20px;">${icon('film', 26)}<div class="no-video-sub">No video</div></div>`;
       return;
     }
 
@@ -1482,7 +1435,7 @@ async function loadVideo() {
       const playerRoot = document.getElementById('video-player-root');
       controlsEl.className = 'video-custom-controls';
       controlsEl.innerHTML = `
-        <button class="vctrl-btn" id="vctrl-play" title="Play / Pause (Space)" onclick="window._videoTogglePlay()">▶</button>
+        <button class="vctrl-btn" id="vctrl-play" title="Play / Pause (Space)" onclick="window._videoTogglePlay()">${icon('play', 13)}</button>
         <span class="vctrl-time" id="vctrl-time">0:00 / 0:00</span>
         <span class="vctrl-spacer"></span>
         <div class="vctrl-marker-legend">
@@ -1494,7 +1447,7 @@ async function loadVideo() {
         <div class="speed-group" id="vctrl-speed-group">
           ${speeds.map(s => `<button class="speed-btn ${s === 1 ? 'active' : ''}" onclick="window._videoSetSpeed(${s})">${s}×</button>`).join('')}
         </div>
-        <button class="vctrl-btn" title="Fullscreen (F)" onclick="window._videoFullscreen()">⛶</button>`;
+        <button class="vctrl-btn" title="Fullscreen (F)" onclick="window._videoFullscreen()">${icon('maximize', 13)}</button>`;
     }
     buildControls();
 
@@ -1528,8 +1481,8 @@ async function loadVideo() {
     document.addEventListener('keydown', kbHandler);
 
     // Play/pause icon sync
-    video.addEventListener('play',  () => { const b = document.getElementById('vctrl-play'); if (b) b.textContent = '⏸'; });
-    video.addEventListener('pause', () => { const b = document.getElementById('vctrl-play'); if (b) b.textContent = '▶'; });
+    video.addEventListener('play',  () => { const b = document.getElementById('vctrl-play'); if (b) b.innerHTML = icon('pause', 13); });
+    video.addEventListener('pause', () => { const b = document.getElementById('vctrl-play'); if (b) b.innerHTML = icon('play', 13); });
 
     // ── Scrubber builder ──────────────────────────────────────────
     // Called once metadata is loaded (so video.duration is known)
@@ -1621,7 +1574,7 @@ async function loadVideo() {
     renderVideoFeed('all');
 
   } catch (err) {
-    container.innerHTML = '<div class="no-video">Error loading video</div>';
+    container.innerHTML = `<div class="no-video">${icon('alertTriangle', 30)}<div class="no-video-title">Error loading video</div></div>`;
     sidebar.innerHTML   = '<div class="video-sidebar-title">Activity Feed</div>';
   }
 }
@@ -1642,12 +1595,12 @@ function renderVideoFeed(filter) {
       : _videoSideEvents;
 
   const pills = [
-    { id: 'all', label: 'All', icon: '📋' },
-    { id: 'input', label: 'Interactions', icon: '🖱️' },
-    { id: 'system', label: 'Errors', icon: '⚠️' },
+    { id: 'all', label: 'All', iconName: 'list' },
+    { id: 'input', label: 'Interactions', iconName: 'mousePointer' },
+    { id: 'system', label: 'Errors', iconName: 'alertTriangle' },
   ].map(p => `
     <button class="vfeed-pill ${filter === p.id ? 'active' : ''}" onclick="renderVideoFeed('${p.id}')">
-      ${p.icon} ${p.label}
+      ${icon(p.iconName, 11)} ${p.label}
     </button>`).join('');
 
   const inputCount = _videoSideEvents.filter(ev => INPUT_TYPES.has(ev.type)).length;
@@ -1657,8 +1610,8 @@ function renderVideoFeed(filter) {
     <div class="video-sidebar-title">Activity Feed</div>
     <div class="vfeed-pills">${pills}</div>
     <div class="vfeed-counts">
-      <span>🖱️ ${inputCount} interactions</span>
-      <span>⚠️ ${systemCount} system</span>
+      <span style="display:inline-flex;align-items:center;gap:3px;">${icon('mousePointer', 10)} ${inputCount} interactions</span>
+      <span style="display:inline-flex;align-items:center;gap:3px;">${icon('alertTriangle', 10)} ${systemCount} system</span>
     </div>`;
 
   if (!filtered.length) {
@@ -1699,75 +1652,119 @@ window.seekVideo = function (epochMs) {
 // ── Tabs ──────────────────────────────────────────────────────────────────────
 function switchTab(tab) {
   currentTab = tab;
-  ['overview', 'triage', 'input', 'events', 'video', 'runs'].forEach(t => {
+  ['overview', 'triage', 'input', 'events', 'video', 'repro'].forEach(t => {
     document.getElementById(`tab-${t}`)?.classList.toggle('active', t === tab);
     document.getElementById(`panel-${t}`)?.classList.toggle('active', t === tab);
   });
+  updateUrlHash();
   if (tab === 'triage') loadTriage();
   else if (tab === 'input') loadInputTrack();
   else if (tab === 'events') loadEvents();
   else if (tab === 'video') loadVideo();
-  else if (tab === 'runs') loadRuns();
+  else if (tab === 'repro') loadReproSteps();
 }
 
-async function loadRuns() {
+// ── Shareable Deep Links ─────────────────────────────────────────────────────
+// #/session/<id>/<tab> — lets a QA tester paste a direct link to a session
+// (and tab) for a developer to open straight away.
+function updateUrlHash() {
   if (!currentSessionId) return;
-  const listEl = document.getElementById('runs-list');
+  history.replaceState(null, '', `#/session/${currentSessionId}/${currentTab}`);
+}
+
+function applyHashRoute() {
+  const m = location.hash.match(/^#\/session\/([^/]+)(?:\/([a-z]+))?/);
+  if (!m) return;
+  const [, id, tab] = m;
+  if (!allSessionsCache.some(s => s.id === id)) return;
+  selectSession(id).then(() => {
+    if (tab && tab !== 'overview') switchTab(tab);
+  });
+}
+
+async function copySessionLink() {
+  if (!currentSessionId) return;
+  await copyEventText(location.href);
+}
+
+// ── Repro Steps ───────────────────────────────────────────────────────────────
+const REPRO_STEP_ICONS = {
+  navigate: 'link', click: 'mousePointer', fill_field: 'edit', submit_form: 'checkCircle',
+  select_option: 'list', press_key: 'zap', scroll: 'arrowDown', observe_toast: 'infoCircle',
+  raw_action: 'activity',
+};
+
+async function loadReproSteps() {
+  if (!currentSessionId) return;
+  const listEl = document.getElementById('repro-list');
+  const countEl = document.getElementById('repro-count');
   listEl.innerHTML = '<div class="loading-row"><span class="spinner"></span> Loading…</div>';
   try {
-    const res = await fetch(`${API}/sessions/${currentSessionId}/replays`);
-    const { replays } = await res.json();
-    if (!replays || !replays.length) {
-      listEl.innerHTML = '<div class="empty-list">No execution history found.</div>';
+    const res = await fetch(`${API}/sessions/${currentSessionId}/normalized`);
+    if (res.status === 404) {
+      countEl.textContent = '';
+      listEl.innerHTML = `
+        <div class="empty-list" style="padding:32px; display:flex; flex-direction:column; align-items:center; gap:10px;">
+          <span style="color:var(--text-dim);display:inline-flex;">${icon('list', 30)}</span>
+          <div>No repro steps generated yet for this session.</div>
+          <button class="btn btn-primary" onclick="generateReproSteps()">Generate Repro Steps</button>
+        </div>`;
       return;
     }
-    
-    listEl.innerHTML = replays.map(r => {
-      if (r.type === 'manual_recording') {
-        const isClean = r.error_count === 0 && r.network_failure_count === 0;
-        return `
-        <div class="cluster-item" style="display:flex; gap:10px; align-items:center; border-left: 3px solid var(--accent); background: var(--surface2);">
-            <span style="font-size:16px;">🎥</span>
-            <span style="font-weight:600; font-size:12px;">Manual Recording</span>
-            <span style="font-size:11px; color:var(--text-dim);">${formatDate(r.timestamp)}</span>
-            <div style="margin-left:auto; display:flex; gap:6px; align-items:center;">
-               ${!isClean ? `<span class="badge badge-warn">⚠ ${r.error_count + r.network_failure_count} initial issues</span>` : '<span class="badge badge-success">✓ Clean record</span>'}
-               <span style="font-size:10px; color:var(--text-muted); font-family:monospace;" title="Version UUID">v_${esc(r.session_id).slice(0, 8)}</span>
-            </div>
-        </div>`;
-      } else {
-        const errCount = (r.failures?.ui?.length || 0) + (r.failures?.js_errors?.length || 0);
-        const isClean = errCount === 0 && (r.failures?.network?.length || 0) === 0;
-        return `
-        <details class="cluster-item" style="display:block; cursor:pointer;">
-            <summary style="display:flex; gap:10px; align-items:center; list-style:none;">
-                <span style="font-size:16px;">🤖</span>
-                <span style="font-weight:600; font-size:12px;">Automated Replay</span>
-                <span style="font-size:11px; color:var(--text-dim);">${formatDate(r.timestamp)}</span>
-                ${isClean ? '<span class="badge badge-success">✓ Passed</span>' : `<span class="badge badge-error">⚠ ${errCount} Issues</span>`}
-                <div style="margin-left:auto; display:flex; gap:10px; align-items:center;">
-                  <span style="font-size:11px; color:var(--text-muted)">Pass rate: ${r.summary?.passed || 0}/${r.summary?.total_steps || 0}</span>
-                  <span style="font-size:10px; color:var(--text-muted); opacity:0.6; font-family:monospace;" title="Replayed against version">src: v_${esc(r.source_session_id || '').slice(0, 8)}</span>
-                </div>
-            </summary>
-            <div style="margin-top:10px; padding-top:10px; border-top:1px solid var(--border);">
-                <div style="font-size:11px; margin-bottom:6px;"><strong>Execution Report:</strong></div>
-                <pre style="font-size:10px; background:var(--surface); padding:8px; border-radius:4px; max-height:200px; overflow:auto; color:var(--text); white-space:pre-wrap;">${esc(JSON.stringify(r, null, 2))}</pre>
-            </div>
-        </details>
-        `;
-      }
-    }).join('');
+    if (!res.ok) throw new Error();
+    const data = await res.json();
+    renderReproSteps(data);
   } catch {
-    listEl.innerHTML = '<div class="empty-list" style="color:var(--danger)">Failed to load runs</div>';
+    countEl.textContent = '';
+    listEl.innerHTML = '<div class="empty-list" style="color:var(--danger)">Failed to load repro steps</div>';
   }
+}
+
+function renderReproSteps(data) {
+  const listEl = document.getElementById('repro-list');
+  const countEl = document.getElementById('repro-count');
+  const steps = data?.steps || [];
+  countEl.textContent = steps.length ? `${steps.length} steps` : '';
+
+  if (!steps.length) {
+    listEl.innerHTML = '<div class="empty-list">No steps found — try a session with more recorded activity.</div>';
+    return;
+  }
+
+  listEl.innerHTML = steps.map(s => `
+    <div class="repro-step">
+      <div class="repro-step-dot">${icon(REPRO_STEP_ICONS[s.step_type] || 'activity', 13)}</div>
+      <div class="repro-step-body">
+        <div class="repro-step-label">${esc(s.label || s.step_type)}</div>
+        <div class="repro-step-meta">${formatTs(s.start_ts, sessionStartMs)}${s.selector ? ` · ${esc(s.selector)}` : ''}</div>
+      </div>
+    </div>`).join('');
+}
+
+async function generateReproSteps() {
+  if (!currentSessionId) return;
+  const btn = document.getElementById('repro-generate-btn');
+  const original = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = `<span class="spinner" style="width:11px;height:11px;border-width:2px;"></span> …`;
+  try {
+    const res = await fetch(`${API}/sessions/${currentSessionId}/normalize`, { method: 'POST' });
+    const data = await res.json();
+    if (!data.ok) throw new Error(data.error || 'Failed');
+    showToast(`Generated ${data.step_count} repro steps`, 'success');
+    await loadReproSteps();
+  } catch (err) {
+    showToast('Failed to generate repro steps', 'error');
+  }
+  btn.disabled = false;
+  btn.innerHTML = original;
 }
 
 // ── Regen Views ───────────────────────────────────────────────────────────────
 async function regenerateViews() {
   if (!currentSessionId) return;
   const btn = document.getElementById('regen-btn');
-  btn.disabled = true; btn.textContent = '⚙ …';
+  btn.disabled = true; btn.innerHTML = `<span class="spinner" style="width:11px;height:11px;border-width:2px;"></span> …`;
   try {
     const res = await fetch(`${API}/sessions/${currentSessionId}/regenerate-views`, { method: 'POST' });
     const data = await res.json();
@@ -1776,11 +1773,400 @@ async function regenerateViews() {
   } catch {
     showToast('Failed to regenerate views', 'error');
   }
-  btn.disabled = false; btn.textContent = '⚙ Regen';
+  btn.disabled = false; btn.innerHTML = `${icon('refresh', 13)} Regen`;
 }
 
+// ── Slack Integration ────────────────────────────────────────────────────────
+let _slackConfigCache = null; // { configured, defaultChannel, savedChannels, savedThreads }
+
+function closeModal(id) {
+  document.getElementById(id)?.classList.remove('show');
+}
+
+function openModal(id) {
+  document.getElementById(id)?.classList.add('show');
+}
+
+document.querySelectorAll('.modal-overlay').forEach(overlay => {
+  overlay.addEventListener('click', (e) => {
+    if (e.target === overlay) overlay.classList.remove('show');
+  });
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') {
+    document.querySelectorAll('.modal-overlay.show').forEach(o => o.classList.remove('show'));
+  }
+});
+
+function sessionDeepLink(id, tab) {
+  return `${location.origin}${location.pathname}#/session/${id}/${tab}`;
+}
+
+async function fetchSlackConfig() {
+  try {
+    const res = await fetch(`${API}/integrations/slack/config`);
+    _slackConfigCache = await res.json();
+  } catch {
+    _slackConfigCache = { configured: false, defaultChannel: null, savedChannels: [], savedThreads: [] };
+  }
+  return _slackConfigCache;
+}
+
+// ── Settings tab: token + saved channels/threads management ───────────────────
+function switchSidebar(tab) {
+  document.getElementById('sidebar-sessions').style.display = tab === 'sessions' ? 'flex' : 'none';
+  document.getElementById('sidebar-settings').style.display = tab === 'settings' ? 'flex' : 'none';
+  document.getElementById('nav-btn-sessions').style.borderBottomColor = tab === 'sessions' ? 'var(--accent)' : 'transparent';
+  document.getElementById('nav-btn-sessions').style.color = tab === 'sessions' ? 'var(--accent)' : 'var(--text-muted)';
+  document.getElementById('nav-btn-settings').style.borderBottomColor = tab === 'settings' ? 'var(--accent)' : 'transparent';
+  document.getElementById('nav-btn-settings').style.color = tab === 'settings' ? 'var(--accent)' : 'var(--text-muted)';
+
+  if (tab === 'settings') {
+    document.getElementById('empty-state').style.display = 'none';
+    document.getElementById('session-detail').style.display = 'none';
+    document.getElementById('settings-view').style.display = 'flex';
+    selectSettingsSection('slack');
+  } else {
+    document.getElementById('settings-view').style.display = 'none';
+    if (currentSessionId) {
+      document.getElementById('session-detail').style.display = 'flex';
+    } else {
+      document.getElementById('empty-state').style.display = '';
+    }
+    loadSessions();
+  }
+}
+
+function selectSettingsSection(id) {
+  document.querySelectorAll('.settings-nav-item').forEach(el => el.classList.toggle('active', el.dataset.settingsId === id));
+  if (id === 'slack') loadSlackSettingsPanel();
+}
+
+async function loadSlackSettingsPanel() {
+  const cfg = await fetchSlackConfig();
+  const tokenInput = document.getElementById('slack-bot-token');
+  tokenInput.value = '';
+  tokenInput.placeholder = cfg.configured ? 'Already set — leave blank to keep it' : 'xoxb-…';
+  document.getElementById('slack-token-status').textContent = cfg.configured
+    ? '✓ A Bot Token is configured.'
+    : 'Not configured yet — paste a Bot Token (xoxb-…) from your Slack App.';
+  renderSlackChannelsList();
+  renderSlackThreadsList();
+}
+
+function renderSlackChannelsList() {
+  const cfg = _slackConfigCache || {};
+  const list = document.getElementById('slack-channels-list');
+  const channels = cfg.savedChannels || [];
+  if (!channels.length) {
+    list.innerHTML = '<div class="field-sub">No saved channels yet — add one below.</div>';
+    return;
+  }
+  list.innerHTML = channels.map(c => {
+    const isDefault = cfg.defaultChannel === c.id;
+    return `
+      <div class="saved-row">
+        <button class="saved-row-star ${isDefault ? 'is-default' : ''}" onclick="setDefaultSlackChannel('${esc(c.id)}')" title="${isDefault ? 'Default channel' : 'Set as default'}">${icon('star', 14)}</button>
+        <div style="min-width:0;">
+          <div class="saved-row-name">${esc(c.name)}</div>
+          <div class="saved-row-sub">${esc(c.id)}</div>
+        </div>
+        <button class="saved-row-del" onclick="deleteSlackChannel('${esc(c.id)}')" title="Remove">${icon('x', 13)}</button>
+      </div>`;
+  }).join('');
+}
+
+function renderSlackThreadsList() {
+  const cfg = _slackConfigCache || {};
+  const list = document.getElementById('slack-threads-list');
+  const threads = cfg.savedThreads || [];
+  const hint = document.getElementById('slack-threads-empty-hint');
+  if (!threads.length) {
+    list.innerHTML = '';
+    hint.style.display = '';
+    return;
+  }
+  hint.style.display = 'none';
+  list.innerHTML = threads.map(t => `
+    <div class="saved-row">
+      <div style="min-width:0; flex:1;">
+        <div class="saved-row-name">${esc(t.name)}</div>
+        <div class="saved-row-sub">${esc(t.channel)}</div>
+      </div>
+      <button class="saved-row-del" onclick="deleteSlackThread('${esc(t.id)}')" title="Remove">${icon('x', 13)}</button>
+    </div>`).join('');
+}
+
+async function addSlackChannel() {
+  const id = document.getElementById('slack-new-channel-id').value.trim();
+  const name = document.getElementById('slack-new-channel-name').value.trim();
+  if (!id) { showToast('Enter a channel ID', 'error'); return; }
+  try {
+    const res = await fetch(`${API}/integrations/slack/channels`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id, name }),
+    });
+    const data = await res.json();
+    if (!data.ok) throw new Error();
+    _slackConfigCache.savedChannels = data.savedChannels;
+    _slackConfigCache.defaultChannel = data.defaultChannel;
+    document.getElementById('slack-new-channel-id').value = '';
+    document.getElementById('slack-new-channel-name').value = '';
+    renderSlackChannelsList();
+    showToast('Channel saved', 'success');
+  } catch {
+    showToast('Failed to save channel', 'error');
+  }
+}
+
+async function deleteSlackChannel(id) {
+  try {
+    const res = await fetch(`${API}/integrations/slack/channels/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    const data = await res.json();
+    if (!data.ok) throw new Error();
+    _slackConfigCache.savedChannels = data.savedChannels;
+    _slackConfigCache.defaultChannel = data.defaultChannel;
+    renderSlackChannelsList();
+  } catch {
+    showToast('Failed to remove channel', 'error');
+  }
+}
+
+async function setDefaultSlackChannel(id) {
+  try {
+    const res = await fetch(`${API}/integrations/slack/channels/${encodeURIComponent(id)}/default`, { method: 'POST' });
+    const data = await res.json();
+    if (!data.ok) throw new Error();
+    _slackConfigCache.defaultChannel = data.defaultChannel;
+    renderSlackChannelsList();
+  } catch {
+    showToast('Failed to set default channel', 'error');
+  }
+}
+
+async function deleteSlackThread(id) {
+  try {
+    const res = await fetch(`${API}/integrations/slack/threads/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    const data = await res.json();
+    if (!data.ok) throw new Error();
+    _slackConfigCache.savedThreads = data.savedThreads;
+    renderSlackThreadsList();
+  } catch {
+    showToast('Failed to remove thread', 'error');
+  }
+}
+
+async function saveSlackSettings() {
+  const btn = document.getElementById('slack-settings-save-btn');
+  const tokenInput = document.getElementById('slack-bot-token').value.trim();
+  if (!tokenInput) { showToast('Enter a Bot Token to save', 'error'); return; }
+
+  btn.disabled = true;
+  try {
+    const res = await fetch(`${API}/integrations/slack/config`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ botToken: tokenInput }),
+    });
+    const data = await res.json();
+    if (!data.ok) throw new Error();
+    _slackConfigCache = data;
+    showToast('Slack token saved', 'success');
+    loadSlackSettingsPanel();
+  } catch {
+    showToast('Failed to save Slack token', 'error');
+  }
+  btn.disabled = false;
+}
+
+// Plain-English session health, no jargon — used in the read-only context
+// preview so a non-technical reader can tell at a glance if this is serious.
+function sessionHealthSummary(s) {
+  const ec = s.error_count || 0;
+  const nc = s.network_failure_count || 0;
+  const sc = s.slow_request_count || 0;
+  if (ec === 0 && nc === 0 && sc === 0) return 'No issues detected — clean session.';
+  const parts = [];
+  if (ec > 0) parts.push(`${ec} JS error${ec !== 1 ? 's' : ''}`);
+  if (nc > 0) parts.push(`${nc} network failure${nc !== 1 ? 's' : ''}`);
+  if (sc > 0) parts.push(`${sc} slow request${sc !== 1 ? 's' : ''}`);
+  return `Found ${parts.join(', ')}.`;
+}
+
+function buildSlackContext(s, tab) {
+  return [
+    `Page: ${s.title || s.url || s.id}`,
+    s.url ? `URL: ${s.url}` : null,
+    `Health: ${sessionHealthSummary(s)}`,
+    `Link: ${sessionDeepLink(s.id, tab)}`,
+  ].filter(Boolean).join('\n');
+}
+
+let _slackContextText = '';
+
+function toggleSlackContextPreview() {
+  const checked = document.getElementById('slack-send-include-context').checked;
+  document.getElementById('slack-send-context-preview').style.opacity = checked ? '1' : '0.4';
+}
+
+// ── Send modal: channel/thread dropdowns fed by saved shortcuts ───────────────
+function renderSlackChannelSelect() {
+  const cfg = _slackConfigCache || {};
+  const select = document.getElementById('slack-send-channel-select');
+  const channels = cfg.savedChannels || [];
+  const options = channels.map(c => `<option value="${esc(c.id)}">${esc(c.name)} (${esc(c.id)})</option>`).join('');
+  select.innerHTML = options + `<option value="__new__">+ Add new channel…</option>`;
+  if (cfg.defaultChannel && channels.some(c => c.id === cfg.defaultChannel)) {
+    select.value = cfg.defaultChannel;
+  } else if (channels.length) {
+    select.value = channels[0].id;
+  }
+  document.getElementById('slack-new-channel-inline').style.display = 'none';
+}
+
+function renderSlackThreadSelect() {
+  const cfg = _slackConfigCache || {};
+  const select = document.getElementById('slack-send-thread-select');
+  const threads = cfg.savedThreads || [];
+  const options = threads.map(t => `<option value="${esc(t.id)}">${esc(t.name)}</option>`).join('');
+  select.innerHTML = `<option value="">No thread — new message</option>` + options + `<option value="__new__">+ Add new thread…</option>`;
+  select.value = '';
+  document.getElementById('slack-new-thread-inline').style.display = 'none';
+}
+
+function onSlackChannelSelectChange() {
+  const select = document.getElementById('slack-send-channel-select');
+  document.getElementById('slack-new-channel-inline').style.display = select.value === '__new__' ? 'flex' : 'none';
+}
+
+function onSlackThreadSelectChange() {
+  const select = document.getElementById('slack-send-thread-select');
+  document.getElementById('slack-new-thread-inline').style.display = select.value === '__new__' ? 'flex' : 'none';
+}
+
+async function confirmInlineAddChannel() {
+  const id = document.getElementById('slack-inline-channel-id').value.trim();
+  const name = document.getElementById('slack-inline-channel-name').value.trim();
+  if (!id) { showToast('Enter a channel ID', 'error'); return; }
+  try {
+    const res = await fetch(`${API}/integrations/slack/channels`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id, name }),
+    });
+    const data = await res.json();
+    if (!data.ok) throw new Error();
+    _slackConfigCache.savedChannels = data.savedChannels;
+    _slackConfigCache.defaultChannel = data.defaultChannel;
+    document.getElementById('slack-inline-channel-id').value = '';
+    document.getElementById('slack-inline-channel-name').value = '';
+    renderSlackChannelSelect();
+    document.getElementById('slack-send-channel-select').value = id;
+    showToast('Channel saved', 'success');
+  } catch {
+    showToast('Failed to save channel', 'error');
+  }
+}
+
+async function confirmInlineAddThread() {
+  const link = document.getElementById('slack-inline-thread-link').value.trim();
+  const name = document.getElementById('slack-inline-thread-name').value.trim();
+  if (!link) { showToast('Paste a Slack message link', 'error'); return; }
+  try {
+    const res = await fetch(`${API}/integrations/slack/threads`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ link, name }),
+    });
+    const data = await res.json();
+    if (!data.ok) throw new Error(data.message || 'Failed');
+    _slackConfigCache.savedThreads = data.savedThreads;
+    document.getElementById('slack-inline-thread-link').value = '';
+    document.getElementById('slack-inline-thread-name').value = '';
+    renderSlackThreadSelect();
+    const newest = data.savedThreads[data.savedThreads.length - 1];
+    document.getElementById('slack-send-thread-select').value = newest.id;
+    showToast('Thread saved', 'success');
+  } catch (err) {
+    showToast(`Could not save that link: ${err.message}`, 'error');
+  }
+}
+
+// `text` is the free-text box the user types/edits directly (the actual bug
+// description). `context` is a separate, plain-language, read-only summary
+// (page/health/link) shown below with a checkbox to include or drop it — kept
+// apart from `text` so the two never get jumbled into one wall of markdown.
+async function openSlackSendModal(title, text, context) {
+  const cfg = _slackConfigCache || await fetchSlackConfig();
+  if (!cfg.configured) {
+    showToast('Set up Slack first — opening Settings', 'info');
+    switchSidebar('settings');
+    return;
+  }
+  document.getElementById('slack-send-title').textContent = title;
+  document.getElementById('slack-send-text').value = text || '';
+  _slackContextText = context || '';
+  document.getElementById('slack-send-context-preview').textContent = _slackContextText;
+  document.getElementById('slack-send-include-context').checked = true;
+  toggleSlackContextPreview();
+  renderSlackChannelSelect();
+  renderSlackThreadSelect();
+  openModal('slack-send-modal');
+}
+
+async function confirmSendToSlack() {
+  const btn = document.getElementById('slack-send-confirm-btn');
+  const channel = document.getElementById('slack-send-channel-select').value;
+  const threadId = document.getElementById('slack-send-thread-select').value;
+  const includeContext = document.getElementById('slack-send-include-context').checked;
+  const noteText = document.getElementById('slack-send-text').value.trim();
+  const text = [noteText, includeContext ? _slackContextText : ''].filter(Boolean).join('\n\n');
+
+  if (!channel || channel === '__new__') { showToast('Choose or add a channel', 'error'); return; }
+  if (threadId === '__new__') { showToast('Finish adding the thread, or choose "No thread"', 'error'); return; }
+  if (!text) { showToast('Write a description or include session details', 'error'); return; }
+
+  const savedThread = threadId ? (_slackConfigCache.savedThreads || []).find(t => t.id === threadId) : null;
+  const threadLink = savedThread ? savedThread.link : undefined;
+
+  btn.disabled = true;
+  const original = btn.textContent;
+  btn.textContent = 'Sending…';
+  try {
+    const res = await fetch(`${API}/integrations/slack/send`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ channel, threadLink, text }),
+    });
+    const data = await res.json();
+    if (!data.ok) throw new Error(data.message || 'Failed to send');
+    showToast(threadLink ? 'Replied in Slack thread' : 'Sent to Slack', 'success');
+    closeModal('slack-send-modal');
+  } catch (err) {
+    showToast(`Failed to send: ${err.message}`, 'error');
+  }
+  btn.disabled = false;
+  btn.textContent = original;
+}
+
+function reportSessionToSlack() {
+  if (!currentSessionData) return;
+  openSlackSendModal('Report Session to Slack', '', buildSlackContext(currentSessionData, 'overview'));
+}
+
+window.sendBugMarkerToSlack = function (idx) {
+  const ev = _triageShowCache[Number(idx)];
+  if (!ev) return;
+  const d = ev.data || {};
+  const context = currentSessionData
+    ? buildSlackContext(currentSessionData, 'triage')
+    : `Link: ${sessionDeepLink(currentSessionId, 'triage')}`;
+  openSlackSendModal('Send Bug to Slack', d.note || '', context);
+};
+
 // ── Init ──────────────────────────────────────────────────────────────────────
-loadSessions();
+loadSessions().then(applyHashRoute);
 
 // Auto-refresh every 8s if there are live sessions
 setInterval(async () => {
