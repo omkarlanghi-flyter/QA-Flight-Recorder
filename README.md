@@ -4,18 +4,31 @@ A **local-first** manual QA session recorder for Chrome, built for capturing
 everything a developer needs to debug a reported issue without having to
 reproduce it themselves. Captures:
 
-- 🎬 Screen video (tab capture, low FPS)
+- 🎬 Screen video (tab capture, low FPS) — or a one-click **screenshot** mode when you don't need a full recording
 - 🖱️ User interactions (click, scroll, navigation) — surfaced as a readable **Repro Steps** timeline
-- 🌐 Full network requests/responses (headers + bodies, not just failures) via Chrome DevTools Protocol
+- 🌐 Full network requests/responses (headers + bodies, not just failures) via Chrome DevTools Protocol, including **WebSocket** connection lifecycle + sampled frame payloads
 - ⚠️ Console errors/warnings and JS exceptions, with on-demand **source-map resolution** of minified stack traces
 - 💾 A localStorage/sessionStorage snapshot at the moment of each error
 - 🖥️ Browser/OS/viewport info for the recording
 - 🐛 Manual bug markers
+- 💬 **Slack reporting** — send a session or bug marker straight to a saved channel or thread, with a formatted message and optional screenshot upload
 
 All data is stored **locally** on your machine. Nothing goes to the cloud —
 share a session by giving a teammate a link into your own dashboard (see
 [Sharing a session](#sharing-a-session-with-a-developer)) rather than
 uploading it anywhere.
+
+---
+
+## Getting Started
+
+```bash
+git clone https://github.com/omkarlanghi-flyter/QA-Flight-Recorder.git
+cd QA-Flight-Recorder
+```
+
+Then follow [1. Run the Local Server](#1-run-the-local-server) and
+[2. Install the Chrome Extension](#2-install-the-chrome-extension) below.
 
 ---
 
@@ -83,6 +96,33 @@ HOST=0.0.0.0 npm start
 The startup banner will print the LAN URL(s) to share. There's no
 authentication layer, so only do this on a network you trust.
 
+### Reporting to Slack (optional)
+
+Open the dashboard → **Settings** tab → **Slack Integration**:
+
+1. Paste a Slack **Bot Token** (`xoxb-...`) — needs `chat:write` and
+   `files:write` scopes. Stored locally at
+   `~/.qa-flight-recorder/slack_config.json`, never sent back to the browser.
+2. Add a **saved channel** (channel ID + a friendly name) — the first one
+   saved becomes the default.
+3. Optionally add a **saved thread** by pasting a Slack message permalink
+   ("Copy link" on any message) — replies land in that thread instead of
+   starting a new message.
+
+Once configured, you can report straight from either place:
+- A session's **Report to Slack** button (sends a summary + link)
+- The extension popup's **Screenshot** capture mode (captures, then lets you
+  pick a channel/thread and add a note before sending)
+
+### WebSocket capture
+
+Connection lifecycle (`open` / `handshake` / `error` / `close`) is always
+captured in full. Frame **payloads** are sampled — the first 5 frames per
+direction per connection get a full (redacted) payload, after that frames are
+just counted/sized — so a busy live-telemetry socket doesn't flood capture
+the same way a polling HTTP endpoint would. `close` always reports total
+frame counts/bytes for the connection, even for sampled-out frames.
+
 ---
 
 ## 2. Install the Chrome Extension
@@ -139,6 +179,14 @@ The 🛩️ QA Flight Recorder icon will appear in your toolbar.
 | POST | `/sessions/:id/normalize` | Generate human-readable Repro Steps |
 | GET  | `/sessions/:id/normalized` | Fetch generated Repro Steps |
 | POST | `/sessions/:id/resolve-stack` | Resolve a minified stack trace via source maps |
+| GET  | `/integrations/slack/config` | Fetch Slack setup state (never returns the bot token) |
+| POST | `/integrations/slack/config` | Save the Slack bot token / default channel |
+| POST | `/integrations/slack/channels` | Save a channel shortcut (id + name) |
+| DELETE | `/integrations/slack/channels/:id` | Remove a saved channel |
+| POST | `/integrations/slack/threads` | Save a thread shortcut from a Slack message permalink |
+| DELETE | `/integrations/slack/threads/:id` | Remove a saved thread |
+| POST | `/integrations/slack/send` | Post a session/bug report to a channel or thread |
+| POST | `/integrations/slack/send-screenshot` | Upload a screenshot + message to a channel or thread |
 
 ---
 
