@@ -8,6 +8,84 @@
 if (!window.__qaRecorderInjected) {
     window.__qaRecorderInjected = true;
 
+    // ── On-page Recording Indicator ──────────────────────────────────────────────
+    // The extension's popup closes the instant it loses focus (normal Chrome
+    // behavior for action popups) — without something visible on the page
+    // itself, there's no way to tell a recording is running, or to stop it,
+    // without reopening the popup. This is a small fixed-position widget
+    // (Shadow DOM, so host-page CSS can't break it and it can't break the
+    // host page) that shows while recording and lets you stop directly.
+    let __qaIndicatorHost = null;
+    let __qaIndicatorTimer = null;
+
+    function showRecordingIndicator(startedAt) {
+        if (__qaIndicatorHost) return; // already showing
+
+        __qaIndicatorHost = document.createElement('div');
+        __qaIndicatorHost.style.cssText = 'all:initial; position:fixed; z-index:2147483647; bottom:16px; right:16px;';
+        const shadow = __qaIndicatorHost.attachShadow({ mode: 'open' });
+        shadow.innerHTML = `
+            <style>
+                .pill {
+                    display: flex; align-items: center; gap: 8px;
+                    background: #1a1d29; color: #e2e8f0;
+                    border: 1px solid #f87171; border-radius: 999px;
+                    padding: 6px 8px 6px 12px;
+                    font: 600 12px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+                    box-shadow: 0 4px 16px rgba(0,0,0,0.35);
+                    user-select: none;
+                }
+                .dot {
+                    width: 8px; height: 8px; border-radius: 50%; background: #f87171;
+                    animation: qa-pulse 1.2s infinite; flex-shrink: 0;
+                }
+                @keyframes qa-pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+                .timer { font-variant-numeric: tabular-nums; color: #f87171; min-width: 34px; }
+                button {
+                    all: unset; cursor: pointer; display: flex; align-items: center; gap: 4px;
+                    background: #f87171; color: #1a1d29; border-radius: 999px;
+                    padding: 4px 10px; font: 700 11px inherit;
+                }
+                button:hover { background: #fca5a5; }
+                button:disabled { opacity: 0.6; cursor: default; }
+            </style>
+            <div class="pill">
+                <span class="dot"></span>
+                <span>Recording</span>
+                <span class="timer" id="t">0:00</span>
+                <button id="stop">■ Stop</button>
+            </div>
+        `;
+        document.documentElement.appendChild(__qaIndicatorHost);
+
+        const timerEl = shadow.getElementById('t');
+        const update = () => {
+            const elapsed = Date.now() - startedAt;
+            const s = Math.floor(elapsed / 1000) % 60;
+            const m = Math.floor(elapsed / 60000);
+            timerEl.textContent = `${m}:${String(s).padStart(2, '0')}`;
+        };
+        update();
+        __qaIndicatorTimer = setInterval(update, 1000);
+
+        shadow.getElementById('stop').addEventListener('click', () => {
+            const btn = shadow.getElementById('stop');
+            btn.disabled = true;
+            btn.textContent = '…Stopping';
+            chrome.runtime.sendMessage({ type: 'STOP_RECORDING_FROM_INDICATOR' }).catch(() => { });
+        });
+    }
+
+    function hideRecordingIndicator() {
+        if (__qaIndicatorTimer) { clearInterval(__qaIndicatorTimer); __qaIndicatorTimer = null; }
+        if (__qaIndicatorHost) { __qaIndicatorHost.remove(); __qaIndicatorHost = null; }
+    }
+
+    chrome.runtime.onMessage.addListener((msg) => {
+        if (msg.type === 'SHOW_RECORDING_INDICATOR') showRecordingIndicator(msg.startedAt);
+        else if (msg.type === 'HIDE_RECORDING_INDICATOR') hideRecordingIndicator();
+    });
+
     // ── Event Helpers ──────────────────────────────────────────────────────────
     function sendEvent(type, data) {
         chrome.runtime.sendMessage({

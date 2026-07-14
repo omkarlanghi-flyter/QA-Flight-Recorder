@@ -1910,6 +1910,87 @@
     }
     .saved-row-del:hover { color: var(--danger); }
 
+    /* Channel card wraps a channel's saved-row + its nested threads */
+    /* ── Integrations hub ─────────────────────────────────────── */
+    .integrations-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+      gap: 14px;
+      padding: 24px;
+      max-width: 720px;
+    }
+    .integration-card {
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: var(--surface2);
+      padding: 18px;
+      cursor: pointer;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      transition: border-color 0.15s, transform 0.1s;
+    }
+    .integration-card:hover { border-color: var(--accent); transform: translateY(-1px); }
+    .integration-card-icon {
+      width: 36px; height: 36px; border-radius: 9px;
+      background: var(--surface); display: flex; align-items: center; justify-content: center;
+      color: var(--accent);
+    }
+    .integration-card-name { font-weight: 600; font-size: 13px; color: var(--text); }
+    .integration-card-status { font-size: 11px; display: flex; align-items: center; gap: 5px; }
+    .integration-card-status.is-configured { color: var(--success); }
+    .integration-card-status.is-unconfigured { color: var(--text-dim); }
+    .integration-back-link {
+      display: inline-flex; align-items: center; gap: 6px;
+      font-size: 12px; color: var(--text-muted); cursor: pointer;
+      padding: 2px 0; margin-bottom: 4px; width: fit-content;
+    }
+    .integration-back-link:hover { color: var(--accent); }
+
+    .channel-card {
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      background: var(--surface2);
+      overflow: hidden;
+    }
+    .channel-card .saved-row {
+      border: none;
+      border-radius: 0;
+      background: transparent;
+    }
+    .channel-threads {
+      padding: 6px 10px 10px 34px;
+      border-top: 1px dashed var(--border);
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .thread-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 11px;
+      padding: 4px 8px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+    }
+    .thread-row-name { color: var(--text); flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .thread-add-row {
+      display: flex;
+      gap: 6px;
+    }
+    .thread-add-row input {
+      flex: 1;
+      font-size: 11px;
+      padding: 5px 8px;
+    }
+    .thread-add-row button {
+      font-size: 11px;
+      padding: 5px 10px;
+      white-space: nowrap;
+    }
+
     /* ── Misc ─────────────────────────────────────────────────── */
 
     /* ── Pure-CSS Tooltips ────────────────────────────────────── */
@@ -2286,7 +2367,7 @@
     <aside class="sidebar" style="display: flex; flex-direction: column;">
       <div style="display: flex; gap: 0; border-bottom: 1px solid var(--border); overflow: hidden; flex-shrink: 0;">
         <button id="nav-btn-sessions" onclick="switchSidebar('sessions')" style="flex:1; background: var(--surface); color: var(--accent); border: none; border-bottom: 2px solid var(--accent); padding: 11px 10px; font-weight: 600; font-size: 12px; cursor: pointer; display:flex; align-items:center; justify-content:center; gap:6px;"><svg class="icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg> Sessions</button>
-        <button id="nav-btn-settings" onclick="switchSidebar('settings')" style="flex:1; background: var(--surface2); color: var(--text-muted); border: none; border-bottom: 2px solid transparent; padding: 11px 10px; font-weight: 600; font-size: 12px; cursor: pointer; display:flex; align-items:center; justify-content:center; gap:6px;"><svg class="icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg> Settings</button>
+        <button id="nav-btn-settings" onclick="switchSidebar('settings')" style="flex:1; background: var(--surface2); color: var(--text-muted); border: none; border-bottom: 2px solid transparent; padding: 11px 10px; font-weight: 600; font-size: 12px; cursor: pointer; display:flex; align-items:center; justify-content:center; gap:6px;"><svg class="icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg> Integrations</button>
       </div>
 
       <div id="sidebar-sessions" style="display: flex; flex-direction: column; flex: 1; overflow: hidden;">
@@ -2315,21 +2396,6 @@
         </div>
       </div>
 
-      <!-- Settings Section -->
-      <div id="sidebar-settings" style="display: none; flex-direction: column; flex: 1; overflow: hidden;">
-        <div class="sidebar-header">
-          <div class="sidebar-title-row">
-            <h2>Settings</h2>
-          </div>
-        </div>
-        <div class="sessions-list">
-          <div class="session-item settings-nav-item active" data-settings-id="slack" onclick="selectSettingsSection('slack')">
-            <div class="session-item-top">
-              <div class="session-title" style="display:flex; align-items:center; gap:8px;"><svg class="icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg> Slack Integration</div>
-            </div>
-          </div>
-        </div>
-      </div>
     </aside>
 
     <!-- ── Main ── -->
@@ -2561,10 +2627,25 @@
         </div>
       </div>
 
-      <!-- Settings -->
+      <!-- Integrations -->
       <div id="settings-view" style="display:none; flex-direction:column; height:100%; overflow:auto;">
+
+        <!-- Hub: grid of available integrations -->
+        <div id="integrations-hub-view">
+          <div class="detail-header">
+            <div class="detail-header-info">
+              <div class="detail-title">Integrations</div>
+              <div class="detail-url">Connect tools to report bugs and sessions straight from a recording.</div>
+            </div>
+          </div>
+          <div class="integrations-grid" id="integrations-grid"></div>
+        </div>
+
+        <!-- Detail: Slack config (hidden until the Slack card is opened) -->
+        <div id="integrations-slack-detail" style="display:none;">
         <div class="detail-header">
           <div class="detail-header-info">
+            <div class="integration-back-link" onclick="showIntegrationsHub()">← Integrations</div>
             <div class="detail-title">Slack Integration</div>
             <div class="detail-url">Manage the Bot Token, saved channels, and saved threads used when reporting bugs.</div>
           </div>
@@ -2577,22 +2658,23 @@
           </div>
           <div>
             <label class="field-label">Saved Channels</label>
-            <div id="slack-channels-list" style="display:flex; flex-direction:column; gap:6px;"></div>
+            <div id="slack-channels-list" style="display:flex; flex-direction:column; gap:8px;"></div>
             <div style="display:flex; gap:6px; margin-top:8px;">
               <input class="field-input" id="slack-new-channel-id" placeholder="Channel ID (C0123456789)" style="flex:1;" />
               <input class="field-input" id="slack-new-channel-name" placeholder="Label (e.g. qa-bugs)" style="flex:1;" />
               <button class="btn btn-ghost" onclick="addSlackChannel()">Add</button>
             </div>
-            <div class="field-sub">The bot must be invited to the channel first (<code>/invite @your-bot</code> in Slack).</div>
+            <div class="field-sub">The bot must be invited to the channel first (<code>/invite @your-bot</code> in Slack). Each channel below can have its own saved threads — paste a Slack message link ("Copy link" on any message) to save a reply target.</div>
           </div>
-          <div>
-            <label class="field-label">Saved Threads</label>
-            <div id="slack-threads-list" style="display:flex; flex-direction:column; gap:6px;"></div>
-            <div class="field-sub" id="slack-threads-empty-hint">None yet — add one from the "Reply in thread" dropdown when sending a message.</div>
+          <div id="slack-orphan-threads-wrap" style="display:none;">
+            <label class="field-label">Other Saved Threads</label>
+            <div class="field-sub" style="margin-bottom:6px;">Threads whose channel isn't in your saved list above.</div>
+            <div id="slack-orphan-threads-list" style="display:flex; flex-direction:column; gap:6px;"></div>
           </div>
           <div>
             <button class="btn btn-primary" id="slack-settings-save-btn" onclick="saveSlackSettings()">Save Token</button>
           </div>
+        </div>
         </div>
       </div>
     </main>

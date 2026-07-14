@@ -43,8 +43,8 @@ Two independent components talk via HTTP:
 
 **Chrome Extension (MV3)** — captures and streams events to the server
 - `extension/background.js` — service worker: CDP telemetry, event routing, v2 batch flush with legacy fallback
-- `extension/content.js` — DOM action capture, video recording via `tabCapture`
-- `extension/offscreen.js` — offscreen document for MediaRecorder
+- `extension/content.js` — DOM action capture only (video does not go through the content script)
+- `extension/offscreen.js` — offscreen document; owns `tabCapture`/`MediaRecorder` and uploads video chunks directly to the server
 - `extension/popup.js` — Start/Stop/Bug Marker UI, capture-mode toggles
 
 **Node Server** (`server/`) — stores sessions, serves the viewer UI

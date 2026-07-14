@@ -164,7 +164,7 @@ function getTypeClass(type) {
   if (type === 'network.failure' || type === 'network.ws_error') return 'type-network-fail';
   if (type.startsWith('network.')) return 'type-network';
   if (type === 'console.error' || type === 'runtime.exception') return 'type-error';
-  if (type.startsWith('console.')) return 'type-console';
+  if (type.startsWith('console.') || type === 'system.warning') return 'type-console';
   if (type.startsWith('marker.')) return 'type-marker';
   return '';
 }
@@ -223,6 +223,7 @@ function summarizeEvent(event) {
     case 'console.error': summary = `ERROR: ${d.message || d.text || ''}`; break;
     case 'runtime.exception': summary = `EXC: ${d.message || ''}`; break;
     case 'marker.bug': summary = `🐛 Bug Marker: ${d.note || ''}`; break;
+    case 'system.warning': summary = `⚠️ ${d.message || ''}`; break;
     case 'action.input': summary = `Fill: ${d.selector || ''}${d.is_sensitive ? ' = ***' : d.final_value ? ` = '${d.final_value}'` : ''}`; break;
     case 'action.select': summary = `Select: ${d.selected_text || d.selected_value || ''} (${d.selector || ''})`; break;
     case 'action.keydown': summary = `Key: ${d.key || ''} (${d.selector || ''})`; break;
@@ -1226,6 +1227,7 @@ function renderEventsTable(events) {
       case 'console.error': brief = `ERROR: ${d.message || d.text || ''}`; break;
       case 'runtime.exception': brief = `EXC: ${d.message || ''}`; break;
       case 'marker.bug': brief = `🐛 ${d.note || ''}`; break;
+      case 'system.warning': brief = `⚠️ ${d.message || ''}`; break;
       case 'action.input': brief = `Fill: ${d.selector || ''}${d.is_sensitive ? ' = ***' : d.final_value ? ` = '${d.final_value}'` : ''}`; break;
       case 'action.select': brief = `Select: ${d.selected_text || d.selected_value || ''} (${d.selector || ''})`; break;
       case 'action.keydown': brief = `Key: ${d.key || ''} (${d.selector || ''})`; break;
@@ -1559,7 +1561,7 @@ async function loadVideo() {
     });
 
     // ── Load side events ──────────────────────────────────────────
-    const reqTypes = 'action.click,action.scroll,action.navigation,console.warn,console.error,runtime.exception,marker.bug';
+    const reqTypes = 'action.click,action.scroll,action.navigation,console.warn,console.error,runtime.exception,marker.bug,system.warning';
     const evRes = await fetch(`${API}/sessions/${currentSessionId}/events?types=${reqTypes}&limit=5000`);
     const { events: rawSideEvents } = await evRes.json();
     const sideEvents = normalizeEventList(rawSideEvents);
@@ -1581,7 +1583,7 @@ async function loadVideo() {
 
 
 const INPUT_TYPES = new Set(['action.click', 'action.scroll', 'action.navigation']);
-const SYSTEM_TYPES = new Set(['console.warn', 'console.error', 'runtime.exception', 'marker.bug']);
+const SYSTEM_TYPES = new Set(['console.warn', 'console.error', 'runtime.exception', 'marker.bug', 'system.warning']);
 
 function renderVideoFeed(filter) {
   _videoFilter = filter;
@@ -1812,10 +1814,9 @@ async function fetchSlackConfig() {
   return _slackConfigCache;
 }
 
-// ── Settings tab: token + saved channels/threads management ───────────────────
+// ── Integrations tab: hub grid + per-integration detail (Slack today) ─────────
 function switchSidebar(tab) {
   document.getElementById('sidebar-sessions').style.display = tab === 'sessions' ? 'flex' : 'none';
-  document.getElementById('sidebar-settings').style.display = tab === 'settings' ? 'flex' : 'none';
   document.getElementById('nav-btn-sessions').style.borderBottomColor = tab === 'sessions' ? 'var(--accent)' : 'transparent';
   document.getElementById('nav-btn-sessions').style.color = tab === 'sessions' ? 'var(--accent)' : 'var(--text-muted)';
   document.getElementById('nav-btn-settings').style.borderBottomColor = tab === 'settings' ? 'var(--accent)' : 'transparent';
@@ -1825,7 +1826,7 @@ function switchSidebar(tab) {
     document.getElementById('empty-state').style.display = 'none';
     document.getElementById('session-detail').style.display = 'none';
     document.getElementById('settings-view').style.display = 'flex';
-    selectSettingsSection('slack');
+    showIntegrationsHub();
   } else {
     document.getElementById('settings-view').style.display = 'none';
     if (currentSessionId) {
@@ -1837,9 +1838,37 @@ function switchSidebar(tab) {
   }
 }
 
-function selectSettingsSection(id) {
-  document.querySelectorAll('.settings-nav-item').forEach(el => el.classList.toggle('active', el.dataset.settingsId === id));
-  if (id === 'slack') loadSlackSettingsPanel();
+// Only Slack exists today, but this stays a list so a future integration is
+// just another entry here rather than a structural change.
+const INTEGRATIONS = [
+  { id: 'slack', name: 'Slack', iconName: 'slack', isConfigured: (cfg) => cfg.configured },
+];
+
+async function showIntegrationsHub() {
+  document.getElementById('integrations-hub-view').style.display = 'block';
+  document.getElementById('integrations-slack-detail').style.display = 'none';
+  const cfg = await fetchSlackConfig();
+  const grid = document.getElementById('integrations-grid');
+  grid.innerHTML = INTEGRATIONS.map(i => {
+    const configured = i.isConfigured(cfg);
+    return `
+      <div class="integration-card" onclick="openIntegration('${i.id}')">
+        <div class="integration-card-icon">${icon(i.iconName, 18)}</div>
+        <div class="integration-card-name">${esc(i.name)}</div>
+        <div class="integration-card-status ${configured ? 'is-configured' : 'is-unconfigured'}">
+          ${configured ? icon('checkCircle', 12) : icon('infoCircle', 12)}
+          ${configured ? 'Configured' : 'Not set up'}
+        </div>
+      </div>`;
+  }).join('');
+}
+
+function openIntegration(id) {
+  if (id === 'slack') {
+    document.getElementById('integrations-hub-view').style.display = 'none';
+    document.getElementById('integrations-slack-detail').style.display = 'block';
+    loadSlackSettingsPanel();
+  }
 }
 
 async function loadSlackSettingsPanel() {
@@ -1851,50 +1880,109 @@ async function loadSlackSettingsPanel() {
     ? '✓ A Bot Token is configured.'
     : 'Not configured yet — paste a Bot Token (xoxb-…) from your Slack App.';
   renderSlackChannelsList();
-  renderSlackThreadsList();
 }
 
+// Each saved channel renders as a card containing its own nested thread list
+// + a "paste a link" mini-form, so threads never need a separate flat list or
+// re-pasting a channel ID — the thread's channel is inferred from the link.
 function renderSlackChannelsList() {
   const cfg = _slackConfigCache || {};
   const list = document.getElementById('slack-channels-list');
   const channels = cfg.savedChannels || [];
+  const threads = cfg.savedThreads || [];
+
   if (!channels.length) {
     list.innerHTML = '<div class="field-sub">No saved channels yet — add one below.</div>';
-    return;
-  }
-  list.innerHTML = channels.map(c => {
-    const isDefault = cfg.defaultChannel === c.id;
-    return `
-      <div class="saved-row">
-        <button class="saved-row-star ${isDefault ? 'is-default' : ''}" onclick="setDefaultSlackChannel('${esc(c.id)}')" title="${isDefault ? 'Default channel' : 'Set as default'}">${icon('star', 14)}</button>
-        <div style="min-width:0;">
-          <div class="saved-row-name">${esc(c.name)}</div>
-          <div class="saved-row-sub">${esc(c.id)}</div>
+  } else {
+    list.innerHTML = channels.map(c => {
+      const isDefault = cfg.defaultChannel === c.id;
+      const channelThreads = threads.filter(t => t.channel === c.id);
+      const threadRows = channelThreads.map(t => `
+        <div class="thread-row">
+          <span class="thread-row-name">${esc(t.name)}</span>
+          <button class="saved-row-del" onclick="deleteSlackThread('${esc(t.id)}')" title="Remove">${icon('x', 12)}</button>
+        </div>`).join('');
+      return `
+      <div class="channel-card">
+        <div class="saved-row">
+          <button class="saved-row-star ${isDefault ? 'is-default' : ''}" onclick="setDefaultSlackChannel('${esc(c.id)}')" title="${isDefault ? 'Default channel' : 'Set as default'}">${icon('star', 14)}</button>
+          <div style="min-width:0;">
+            <div class="saved-row-name">${esc(c.name)}</div>
+            <div class="saved-row-sub">${esc(c.id)}</div>
+          </div>
+          <button class="saved-row-del" onclick="duplicateSlackChannel('${esc(c.id)}')" title="Duplicate — start a new channel entry with this name/ID pre-filled">${icon('copy', 13)}</button>
+          <button class="saved-row-del" style="margin-left:0;" onclick="deleteSlackChannel('${esc(c.id)}')" title="Remove">${icon('x', 13)}</button>
         </div>
-        <button class="saved-row-del" onclick="deleteSlackChannel('${esc(c.id)}')" title="Remove">${icon('x', 13)}</button>
+        <div class="channel-threads">
+          ${threadRows || '<div class="field-sub">No saved threads in this channel yet.</div>'}
+          <div class="thread-add-row">
+            <input class="field-input" id="thread-link-${esc(c.id)}" placeholder="Paste Slack message link…" />
+            <input class="field-input" id="thread-name-${esc(c.id)}" placeholder="Label (optional)" style="flex:0 0 120px;" />
+            <button class="btn btn-ghost" onclick="confirmAddThreadForChannel('${esc(c.id)}')">+ Add thread</button>
+          </div>
+        </div>
       </div>`;
-  }).join('');
+    }).join('');
+  }
+
+  // Threads whose channel isn't (or no longer is) in the saved-channels list
+  // still need to be visible somewhere rather than silently vanishing.
+  const savedChannelIds = new Set(channels.map(c => c.id));
+  const orphanThreads = threads.filter(t => !savedChannelIds.has(t.channel));
+  const orphanWrap = document.getElementById('slack-orphan-threads-wrap');
+  const orphanList = document.getElementById('slack-orphan-threads-list');
+  if (orphanThreads.length) {
+    orphanWrap.style.display = '';
+    orphanList.innerHTML = orphanThreads.map(t => `
+      <div class="saved-row">
+        <div style="min-width:0; flex:1;">
+          <div class="saved-row-name">${esc(t.name)}</div>
+          <div class="saved-row-sub">${esc(t.channel)}</div>
+        </div>
+        <button class="saved-row-del" onclick="deleteSlackThread('${esc(t.id)}')" title="Remove">${icon('x', 13)}</button>
+      </div>`).join('');
+  } else {
+    orphanWrap.style.display = 'none';
+  }
 }
 
-function renderSlackThreadsList() {
+// "Duplicate" doesn't create a second row sharing the same Slack channel ID
+// (the ID is the natural unique key) — it pre-fills the add-channel form so
+// you can quickly spin up a similarly-named entry pointed at a different
+// channel/ID instead of retyping everything from scratch.
+function duplicateSlackChannel(channelId) {
   const cfg = _slackConfigCache || {};
-  const list = document.getElementById('slack-threads-list');
-  const threads = cfg.savedThreads || [];
-  const hint = document.getElementById('slack-threads-empty-hint');
-  if (!threads.length) {
-    list.innerHTML = '';
-    hint.style.display = '';
-    return;
+  const c = (cfg.savedChannels || []).find(ch => ch.id === channelId);
+  if (!c) return;
+  document.getElementById('slack-new-channel-id').value = c.id;
+  document.getElementById('slack-new-channel-name').value = `${c.name} (copy)`;
+  const idInput = document.getElementById('slack-new-channel-id');
+  idInput.focus();
+  idInput.select();
+  showToast('Edit the Channel ID (and name if you like), then click Add', 'info');
+}
+
+async function confirmAddThreadForChannel(channelId) {
+  const linkInput = document.getElementById(`thread-link-${channelId}`);
+  const nameInput = document.getElementById(`thread-name-${channelId}`);
+  const link = linkInput.value.trim();
+  const name = nameInput.value.trim();
+  if (!link) { showToast('Paste a Slack message link first', 'error'); return; }
+
+  try {
+    const res = await fetch(`${API}/integrations/slack/threads`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, link }),
+    });
+    const data = await res.json();
+    if (!data.ok) throw new Error(data.message || 'Failed to save thread');
+    _slackConfigCache.savedThreads = data.savedThreads;
+    renderSlackChannelsList();
+    showToast('Thread saved', 'success');
+  } catch (e) {
+    showToast(e.message || 'Failed to save thread — check the link', 'error');
   }
-  hint.style.display = 'none';
-  list.innerHTML = threads.map(t => `
-    <div class="saved-row">
-      <div style="min-width:0; flex:1;">
-        <div class="saved-row-name">${esc(t.name)}</div>
-        <div class="saved-row-sub">${esc(t.channel)}</div>
-      </div>
-      <button class="saved-row-del" onclick="deleteSlackThread('${esc(t.id)}')" title="Remove">${icon('x', 13)}</button>
-    </div>`).join('');
 }
 
 async function addSlackChannel() {
@@ -1951,7 +2039,7 @@ async function deleteSlackThread(id) {
     const data = await res.json();
     if (!data.ok) throw new Error();
     _slackConfigCache.savedThreads = data.savedThreads;
-    renderSlackThreadsList();
+    renderSlackChannelsList();
   } catch {
     showToast('Failed to remove thread', 'error');
   }
@@ -2025,10 +2113,14 @@ function renderSlackChannelSelect() {
   document.getElementById('slack-new-channel-inline').style.display = 'none';
 }
 
+// Only shows threads that belong to whichever channel is currently selected
+// above — picking a channel first, then a thread scoped to it, matches how
+// the Settings tab nests threads under their channel.
 function renderSlackThreadSelect() {
   const cfg = _slackConfigCache || {};
   const select = document.getElementById('slack-send-thread-select');
-  const threads = cfg.savedThreads || [];
+  const channelId = document.getElementById('slack-send-channel-select').value;
+  const threads = (cfg.savedThreads || []).filter(t => t.channel === channelId);
   const options = threads.map(t => `<option value="${esc(t.id)}">${esc(t.name)}</option>`).join('');
   select.innerHTML = `<option value="">No thread — new message</option>` + options + `<option value="__new__">+ Add new thread…</option>`;
   select.value = '';
@@ -2038,6 +2130,7 @@ function renderSlackThreadSelect() {
 function onSlackChannelSelectChange() {
   const select = document.getElementById('slack-send-channel-select');
   document.getElementById('slack-new-channel-inline').style.display = select.value === '__new__' ? 'flex' : 'none';
+  renderSlackThreadSelect();
 }
 
 function onSlackThreadSelectChange() {
@@ -2062,7 +2155,12 @@ async function confirmInlineAddChannel() {
     document.getElementById('slack-inline-channel-id').value = '';
     document.getElementById('slack-inline-channel-name').value = '';
     renderSlackChannelSelect();
-    document.getElementById('slack-send-channel-select').value = id;
+    // Select the channel we just saved — read its id back from the server
+    // response rather than the raw input, since the server strips a pasted
+    // URL down to the bare channel ID before saving.
+    const savedChannel = data.savedChannels[data.savedChannels.length - 1];
+    document.getElementById('slack-send-channel-select').value = savedChannel.id;
+    renderSlackThreadSelect();
     showToast('Channel saved', 'success');
   } catch {
     showToast('Failed to save channel', 'error');
@@ -2084,8 +2182,15 @@ async function confirmInlineAddThread() {
     _slackConfigCache.savedThreads = data.savedThreads;
     document.getElementById('slack-inline-thread-link').value = '';
     document.getElementById('slack-inline-thread-name').value = '';
-    renderSlackThreadSelect();
     const newest = data.savedThreads[data.savedThreads.length - 1];
+    // The thread select is scoped to whatever channel is picked above — make
+    // sure that's the thread's actual channel first, or it'd be filtered out
+    // right after we just added it.
+    const channelSelect = document.getElementById('slack-send-channel-select');
+    if (channelSelect.value !== newest.channel && [...channelSelect.options].some(o => o.value === newest.channel)) {
+      channelSelect.value = newest.channel;
+    }
+    renderSlackThreadSelect();
     document.getElementById('slack-send-thread-select').value = newest.id;
     showToast('Thread saved', 'success');
   } catch (err) {
@@ -2100,8 +2205,9 @@ async function confirmInlineAddThread() {
 async function openSlackSendModal(title, text, context) {
   const cfg = _slackConfigCache || await fetchSlackConfig();
   if (!cfg.configured) {
-    showToast('Set up Slack first — opening Settings', 'info');
+    showToast('Set up Slack first — opening Integrations', 'info');
     switchSidebar('settings');
+    openIntegration('slack');
     return;
   }
   document.getElementById('slack-send-title').textContent = title;

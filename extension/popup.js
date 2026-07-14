@@ -145,6 +145,13 @@ async function startRecording() {
             btn.textContent = '● Start Recording';
         } else {
             setRecordingUI(true, res.session_id, res.started_at);
+            if (captureMode === 'video' && res.videoCaptureFailed) {
+                // Recording still proceeded (logs/network still capture fine) —
+                // but video specifically didn't start, and that's easy to miss
+                // until you open the viewer later and find no video tab. Give
+                // it a long-lived toast so it's actually seen now.
+                showToast(`⚠️ Video did not start: ${res.videoCaptureError || 'unknown error'}`, 8000);
+            }
         }
     } catch (e) {
         showToast(`Failed: ${e.message}`);
@@ -225,8 +232,19 @@ async function showScreenshotReport() {
         .map(c => `<option value="${c.id}">${c.name} (${c.id})</option>`).join('');
     if (slackConfigForPopup.defaultChannel) channelSelect.value = slackConfigForPopup.defaultChannel;
 
+    renderScreenshotThreadOptions();
+}
+
+// Threads are scoped to whichever channel is currently selected above, same
+// as the Settings tab nests threads under their channel — otherwise the
+// dropdown mixes threads from every saved channel with no indication of
+// which one they actually belong to.
+function renderScreenshotThreadOptions() {
+    const channelId = document.getElementById('screenshot-channel').value;
+    const threadSelect = document.getElementById('screenshot-thread');
+    const threads = (slackConfigForPopup?.savedThreads || []).filter(t => t.channel === channelId);
     threadSelect.innerHTML = '<option value="">No thread — new message</option>' +
-        (slackConfigForPopup.savedThreads || []).map(t => `<option value="${t.id}">${t.name}</option>`).join('');
+        threads.map(t => `<option value="${t.id}">${t.name}</option>`).join('');
 }
 
 function hideScreenshotReport() {
@@ -298,6 +316,7 @@ document.addEventListener('DOMContentLoaded', () => {
     document.getElementById('btn-viewer').addEventListener('click', openViewer);
     document.getElementById('btn-send-screenshot').addEventListener('click', sendScreenshotReport);
     document.getElementById('btn-cancel-screenshot').addEventListener('click', hideScreenshotReport);
+    document.getElementById('screenshot-channel').addEventListener('change', renderScreenshotThreadOptions);
 
     init();
 });

@@ -43,10 +43,11 @@ let state = {
     liteCapture: false,
     captureLogs: true,
     cdpAttached: false,
+    videoCaptureFailed: false,
+    videoCaptureError: null,
     // Buffered events
     eventBuffer: [],
     batchTimer: null,
-    chunkIndex: 0,
     // CDP request tracking
     pendingRequests: {},
 };
@@ -74,6 +75,8 @@ async function getStatus() {
         sessionId: state.sessionId,
         tabId: state.tabId,
         startedAt: state.startedAt,
+        videoCaptureFailed: state.videoCaptureFailed,
+        videoCaptureError: state.videoCaptureError,
     };
 }
 
@@ -761,6 +764,9 @@ async function startVideoCapture(tabId) {
     const settings = await loadSettings();
     if (!settings.videoEnabled) return;
 
+    state.videoCaptureFailed = false;
+    state.videoCaptureError = null;
+
     try {
         const streamId = await new Promise((resolve, reject) => {
             chrome.tabCapture.getMediaStreamId(
@@ -774,15 +780,30 @@ async function startVideoCapture(tabId) {
 
         await ensureOffscreenDocument();
 
-        // Send message to offscreen document
-        await chrome.runtime.sendMessage({
+        // Send message to offscreen document — its response tells us whether
+        // getUserMedia/MediaRecorder actually started, not just whether the
+        // message itself was delivered.
+        const response = await chrome.runtime.sendMessage({
             type: 'START_VIDEO_CAPTURE',
             streamId,
             sessionId: state.sessionId,
             collectorUrl: settings.collectorUrl,
         });
+        if (!response || !response.ok) {
+            throw new Error(response?.error || 'Offscreen document failed to start recording');
+        }
     } catch (e) {
         console.warn('[QA Recorder] Video capture not available or timed out:', e.message);
+        state.videoCaptureFailed = true;
+        state.videoCaptureError = e.message;
+        // Surface into the session itself so it shows up in Triage/Events —
+        // a console.warn buried in the service worker's own devtools is easy
+        // to miss, and this is exactly the kind of thing a developer picking
+        // up the session later needs to know ("no video? here's why").
+        bufferEvent(makeEvent('system.warning', 'extension', {
+            message: `Video recording did not start: ${e.message}`,
+            component: 'video_capture',
+        }));
     }
 }
 
@@ -837,7 +858,6 @@ async function startRecording(tabId) {
     state.videoEnabled = settings.videoEnabled;
     state.liteCapture = settings.liteCapture;
     state.captureLogs = settings.captureLogs;
-    state.chunkIndex = 0;
     state.pendingRequests = {};
     state.eventBuffer = [];
     _pathSampleCounts = {};
@@ -889,8 +909,19 @@ async function startRecording(tabId) {
     chrome.action.setBadgeText({ text: '●', tabId });
     chrome.action.setBadgeBackgroundColor({ color: '#ef4444', tabId });
 
+    // The popup closes the instant it loses focus (normal Chrome behavior for
+    // action popups) — without an on-page indicator there'd be zero visible
+    // confirmation that a recording is running until you reopen the popup.
+    chrome.tabs.sendMessage(tabId, { type: 'SHOW_RECORDING_INDICATOR', startedAt: started_at }).catch(() => { });
+
     console.log('[QA Recorder] Started session', session_id);
-    return { ok: true, session_id, started_at };
+    return {
+        ok: true,
+        session_id,
+        started_at,
+        videoCaptureFailed: state.videoCaptureFailed,
+        videoCaptureError: state.videoCaptureError,
+    };
 }
 
 // ── Stop Recording ────────────────────────────────────────────────────────────
@@ -935,6 +966,7 @@ async function stopRecording() {
 
     if (tabId) {
         chrome.action.setBadgeText({ text: '', tabId }).catch(() => { });
+        chrome.tabs.sendMessage(tabId, { type: 'HIDE_RECORDING_INDICATOR' }).catch(() => { });
     }
     await getStatus();
 
@@ -1007,27 +1039,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                 sendResponse({ ok: true });
                 break;
 
-            case 'VIDEO_CHUNK': {
-                // Video chunk from content script
-                if (!state.sessionId) break;
-                const settings = await loadSettings();
-                const idx = state.chunkIndex++;
-                const blob = msg.chunk;
-                await fetch(`${settings.collectorUrl}/session/${state.sessionId}/video-chunk`, {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/octet-stream',
-                        'x-chunk-index': String(idx),
-                    },
-                    body: blob,
-                }).catch(e => console.warn('Chunk upload failed:', e.message));
-                sendResponse({ ok: true });
-                break;
-            }
-
             case 'STOP_RECORDING_FROM_SYSTEM_BAR':
                 if (state.recording) {
                     stopRecording().catch(e => console.error('Failed to stop recording from sys bar', e));
+                }
+                sendResponse({ ok: true });
+                break;
+
+            case 'STOP_RECORDING_FROM_INDICATOR':
+                if (state.recording) {
+                    const settings = await loadSettings();
+                    await stopRecording().catch(e => console.error('Failed to stop recording from indicator', e));
+                    chrome.tabs.create({ url: settings.collectorUrl }).catch(() => { });
                 }
                 sendResponse({ ok: true });
                 break;

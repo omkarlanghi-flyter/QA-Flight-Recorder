@@ -142,12 +142,13 @@ function generateTriageView(sessionDir, ignoredSignatures = []) {
         }
     }
 
-    // Include all bug markers
+    // Include all bug markers + system warnings (e.g. "video did not start")
     for (const event of allEvents) {
-        if (getEventType(event) === 'marker.bug') {
+        const type = getEventType(event);
+        if (type === 'marker.bug' || type === 'system.warning') {
             anchorTimestamps.add(event.ts_epoch_ms);
             anchorEventSet.add(event);
-            rulesTriggered.push({ rule: 'marker.bug', ts: event.ts_epoch_ms });
+            rulesTriggered.push({ rule: type, ts: event.ts_epoch_ms });
         }
     }
 

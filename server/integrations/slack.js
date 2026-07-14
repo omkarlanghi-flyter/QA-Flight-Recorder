@@ -24,12 +24,36 @@ function loadConfig() {
     } catch {
         cfg = {};
     }
-    return {
+    const savedChannels = Array.isArray(cfg.savedChannels) ? cfg.savedChannels : [];
+    const savedThreads = Array.isArray(cfg.savedThreads) ? cfg.savedThreads : [];
+
+    // Self-heal channels saved before extractChannelId()/name-cleanup existed
+    // — a pasted full Slack URL could end up stored as the "id" verbatim, or
+    // (just as easily, since the Label field has no validation either) as
+    // the "name" — either way showing up as a full path wherever displayed.
+    let needsRewrite = false;
+    const idRemap = new Map();
+    const cleanedChannels = savedChannels.map((c) => {
+        const cleanId = extractChannelId(c.id);
+        const cleanName = isUrlLike(c.name) ? cleanId : c.name;
+        if (cleanId !== c.id) { needsRewrite = true; idRemap.set(c.id, cleanId); }
+        if (cleanName !== c.name) needsRewrite = true;
+        return { ...c, id: cleanId, name: cleanName };
+    });
+    let defaultChannel = cfg.defaultChannel || null;
+    if (defaultChannel && idRemap.has(defaultChannel)) defaultChannel = idRemap.get(defaultChannel);
+
+    const result = {
         botToken: cfg.botToken || null,
-        defaultChannel: cfg.defaultChannel || null,
-        savedChannels: Array.isArray(cfg.savedChannels) ? cfg.savedChannels : [],
-        savedThreads: Array.isArray(cfg.savedThreads) ? cfg.savedThreads : [],
+        defaultChannel,
+        savedChannels: cleanedChannels,
+        savedThreads,
     };
+    if (needsRewrite) {
+        fs.mkdirSync(path.dirname(CONFIG_FILE), { recursive: true });
+        fs.writeFileSync(CONFIG_FILE, JSON.stringify(result, null, 2));
+    }
+    return result;
 }
 
 function saveConfig({ botToken, defaultChannel, savedChannels, savedThreads }) {
@@ -50,13 +74,37 @@ function isConfigured() {
     return Boolean(cfg.botToken);
 }
 
+/**
+ * Pulls a bare channel ID (e.g. "C0123456789") out of whatever was pasted —
+ * a raw ID, or a full Slack channel/message URL like
+ * https://yourteam.slack.com/archives/C0123456789[/p169...]. Without this,
+ * pasting a URL by mistake saves the whole link as the "id" and every place
+ * that displays it (dropdowns, saved-channel rows) shows that full path
+ * instead of a clean channel ID.
+ */
+function extractChannelId(raw) {
+    if (!raw || typeof raw !== 'string') return raw;
+    const trimmed = raw.trim();
+    const match = trimmed.match(/\/archives\/([A-Z0-9]+)/i);
+    return match ? match[1] : trimmed;
+}
+
+function isUrlLike(str) {
+    return typeof str === 'string' && /^https?:\/\//i.test(str.trim());
+}
+
 /** Adds (or updates, if the id already exists) a saved channel shortcut. */
 function addChannel({ id, name }) {
+    const cleanId = extractChannelId(id);
+    // A Slack message/thread link pasted into the Label field by mistake is
+    // just as easy to do as pasting a channel URL into the ID field — don't
+    // let a raw link become the display name either.
+    const cleanName = (name && !isUrlLike(name)) ? name : cleanId;
     const cfg = loadConfig();
-    const next = [...cfg.savedChannels.filter(c => c.id !== id), { id, name: name || id }];
+    const next = [...cfg.savedChannels.filter(c => c.id !== cleanId), { id: cleanId, name: cleanName }];
     const patch = { savedChannels: next };
     // First saved channel becomes the default automatically if none is set yet.
-    if (!cfg.defaultChannel) patch.defaultChannel = id;
+    if (!cfg.defaultChannel) patch.defaultChannel = cleanId;
     return saveConfig(patch);
 }
 
@@ -77,17 +125,25 @@ function addThread({ name, link }) {
     const parsed = parsePermalink(link);
     if (!parsed) throw new Error('Could not parse that Slack message link');
     const cfg = loadConfig();
-    // Re-saving the same message link updates the existing entry (keeps its
-    // id) instead of creating a duplicate row in the dropdown.
-    const existing = cfg.savedThreads.find(t => t.link === link);
+    const trimmedName = (name || '').trim();
+
+    // A saved thread's identity is its NAME, not its link — two differently
+    // named shortcuts ("Login Bug", "Auth Team Thread") can legitimately
+    // point at the exact same Slack thread. Re-saving the same name updates
+    // that entry's link (lets you repoint a shortcut); a blank name still
+    // dedupes by link so accidental double-submits don't pile up identical
+    // "Thread in C0123..." rows.
+    const existing = trimmedName
+        ? cfg.savedThreads.find(t => t.channel === parsed.channel && t.name.toLowerCase() === trimmedName.toLowerCase())
+        : cfg.savedThreads.find(t => t.link === link);
     const entry = {
         id: existing ? existing.id : crypto.randomUUID(),
-        name: name || existing?.name || `Thread in ${parsed.channel}`,
+        name: trimmedName || existing?.name || `Thread in ${parsed.channel}`,
         link,
         channel: parsed.channel,
         thread_ts: parsed.thread_ts,
     };
-    const next = [...cfg.savedThreads.filter(t => t.link !== link), entry];
+    const next = [...cfg.savedThreads.filter(t => t.id !== entry.id), entry];
     return saveConfig({ savedThreads: next });
 }
 
@@ -259,5 +315,5 @@ async function uploadFile({ channel, thread_ts, buffer, filename, initialComment
 
 module.exports = {
     loadConfig, saveConfig, isConfigured, parsePermalink, postMessage, uploadFile,
-    addChannel, removeChannel, setDefaultChannel, addThread, removeThread,
+    addChannel, removeChannel, setDefaultChannel, addThread, removeThread, extractChannelId,
 };
