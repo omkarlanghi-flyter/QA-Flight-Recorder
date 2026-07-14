@@ -84,7 +84,247 @@ if (!window.__qaRecorderInjected) {
     chrome.runtime.onMessage.addListener((msg) => {
         if (msg.type === 'SHOW_RECORDING_INDICATOR') showRecordingIndicator(msg.startedAt);
         else if (msg.type === 'HIDE_RECORDING_INDICATOR') hideRecordingIndicator();
+        else if (msg.type === 'SHOW_MULTI_CAPTURE_TRAY') renderMultiCaptureTray(msg.shots, msg.maxShots);
+        else if (msg.type === 'HIDE_MULTI_CAPTURE_TRAY') hideMultiCaptureTray(msg.reason);
     });
+
+    // ── Multi-Screenshot Capture Tray ────────────────────────────────────────────
+    // Same "popup closes on page click" problem as the recording indicator above,
+    // but for the "Multimedia" bug-report flow: accumulates screenshots across
+    // multiple captures/navigations, then hands off to an inline report form —
+    // all living on the page since that's the only place that survives the user
+    // clicking around between captures.
+    let __qaTrayHost = null;
+    let __qaTrayShots = [];
+
+    const TRAY_STYLE = `
+        :host { all: initial; }
+        .tray {
+            width: 280px;
+            background: #1a1d29; color: #e2e8f0; border: 1px solid #3730a3;
+            border-radius: 14px; box-shadow: 0 8px 32px rgba(0,0,0,0.45);
+            font: 500 12px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            overflow: hidden;
+        }
+        .tray-header {
+            display: flex; align-items: center; justify-content: space-between;
+            padding: 10px 12px; font-weight: 700; border-bottom: 1px solid #2d3245;
+        }
+        .tray-header button {
+            all: unset; cursor: pointer; color: #94a3b8; padding: 2px 6px; border-radius: 6px;
+        }
+        .tray-header button:hover { background: #2d3245; color: #e2e8f0; }
+        .thumbs {
+            display: flex; gap: 6px; flex-wrap: wrap; padding: 10px 12px;
+            max-height: 160px; overflow-y: auto;
+        }
+        .thumb { position: relative; width: 56px; height: 56px; border-radius: 6px; overflow: hidden; border: 1px solid #2d3245; }
+        .thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+        .thumb-x {
+            all: unset; position: absolute; top: 2px; right: 2px; cursor: pointer;
+            background: rgba(0,0,0,0.6); color: #fff; width: 16px; height: 16px;
+            border-radius: 50%; display: flex; align-items: center; justify-content: center;
+            font-size: 10px; line-height: 1;
+        }
+        .thumb-x:hover { background: #ef4444; }
+        .empty-hint { padding: 4px 12px 10px; color: #64748b; font-size: 11px; }
+        .actions { display: flex; gap: 8px; padding: 10px 12px; border-top: 1px solid #2d3245; }
+        button.primary, button.secondary {
+            all: unset; cursor: pointer; flex: 1; text-align: center;
+            padding: 7px 0; border-radius: 8px; font: 700 11px inherit;
+        }
+        button.primary { background: #6366f1; color: #fff; }
+        button.primary:hover { background: #818cf8; }
+        button.primary:disabled { opacity: 0.4; cursor: default; }
+        button.secondary { background: #2d3245; color: #e2e8f0; }
+        button.secondary:hover { background: #3a4058; }
+        .field-label { display: block; font-size: 11px; font-weight: 700; color: #94a3b8; margin: 10px 12px 4px; }
+        textarea, select {
+            all: unset; box-sizing: border-box; display: block; width: calc(100% - 24px);
+            margin: 0 12px; background: #12141c; border: 1px solid #2d3245; border-radius: 8px;
+            padding: 7px 9px; color: #e2e8f0; font: 500 12px inherit;
+        }
+        textarea { resize: vertical; min-height: 50px; }
+        .strip { display: flex; gap: 4px; padding: 10px 12px 0; }
+        .strip img { width: 32px; height: 32px; object-fit: cover; border-radius: 4px; border: 1px solid #2d3245; }
+        .status-msg { padding: 8px 12px; font-size: 11px; color: #94a3b8; }
+        .status-msg.error { color: #f87171; }
+        .status-msg.success { color: #34d399; font-weight: 700; }
+    `;
+
+    function ensureTrayHost() {
+        if (__qaTrayHost) return __qaTrayHost.shadowRoot;
+        __qaTrayHost = document.createElement('div');
+        __qaTrayHost.style.cssText = 'all:initial; position:fixed; z-index:2147483647; bottom:16px; right:16px;';
+        document.documentElement.appendChild(__qaTrayHost);
+        return __qaTrayHost.attachShadow({ mode: 'open' });
+    }
+
+    function renderMultiCaptureTray(shots, maxShots) {
+        __qaTrayShots = shots || [];
+        const shadow = ensureTrayHost();
+        const atLimit = __qaTrayShots.length >= maxShots;
+        shadow.innerHTML = `
+            <style>${TRAY_STYLE}</style>
+            <div class="tray">
+                <div class="tray-header">
+                    <span>📸 ${__qaTrayShots.length} screenshot${__qaTrayShots.length !== 1 ? 's' : ''}${atLimit ? ' (max)' : ''}</span>
+                    <button id="close" title="Cancel — discard all">✕</button>
+                </div>
+                ${__qaTrayShots.length
+                    ? `<div class="thumbs">${__qaTrayShots.map(s => `
+                        <div class="thumb">
+                            <img src="${s.dataUrl}" />
+                            <button class="thumb-x" data-id="${s.id}" title="Remove">✕</button>
+                        </div>`).join('')}</div>`
+                    : `<div class="empty-hint">Navigate/click around the page, then "+ Capture" to add another shot. Switch to another tab and reopen the popup to capture there too, or add a screenshot of another app from a file.</div>`}
+                <div class="actions">
+                    <button class="secondary" id="add" ${atLimit ? 'disabled' : ''}>+ Capture</button>
+                    <button class="secondary" id="from-file" ${atLimit ? 'disabled' : ''} title="Import a screenshot of another app (e.g. Postman) taken with your OS screenshot tool">🖼 File</button>
+                </div>
+                <div class="actions" style="padding-top:0;">
+                    <button class="primary" id="report" ${__qaTrayShots.length === 0 ? 'disabled' : ''}>Report Bug →</button>
+                </div>
+                <input type="file" id="file-input" accept="image/*" multiple style="display:none;" />
+            </div>
+        `;
+        shadow.getElementById('close').addEventListener('click', () => {
+            chrome.runtime.sendMessage({ type: 'CANCEL_MULTI_CAPTURE' }).catch(() => { });
+        });
+        shadow.getElementById('add').addEventListener('click', (e) => {
+            e.currentTarget.disabled = true;
+            e.currentTarget.textContent = '…';
+            chrome.runtime.sendMessage({ type: 'CAPTURE_ANOTHER_SHOT' }).catch(() => { });
+        });
+        shadow.getElementById('from-file').addEventListener('click', () => shadow.getElementById('file-input').click());
+        shadow.getElementById('file-input').addEventListener('change', (e) => handleTrayFileImport(e.target.files));
+        shadow.getElementById('report').addEventListener('click', () => showTrayReportForm());
+        shadow.querySelectorAll('.thumb-x').forEach(btn => {
+            btn.addEventListener('click', () => {
+                chrome.runtime.sendMessage({ type: 'REMOVE_MULTI_CAPTURE_SHOT', shotId: btn.dataset.id }).catch(() => { });
+            });
+        });
+    }
+
+    function readFileAsDataUrl(file) {
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(reader.result);
+            reader.onerror = () => reject(reader.error);
+            reader.readAsDataURL(file);
+        });
+    }
+
+    async function handleTrayFileImport(fileList) {
+        const files = Array.from(fileList || []).filter(f => f.type.startsWith('image/'));
+        if (!files.length) return;
+        const dataUrls = await Promise.all(files.map(readFileAsDataUrl));
+        chrome.runtime.sendMessage({ type: 'ADD_MULTI_CAPTURE_FILES', dataUrls }).catch(() => { });
+    }
+
+    async function showTrayReportForm() {
+        const shadow = __qaTrayHost.shadowRoot;
+        shadow.innerHTML = `<style>${TRAY_STYLE}</style><div class="tray"><div class="tray-header"><span>Loading…</span></div></div>`;
+
+        const cfg = await chrome.runtime.sendMessage({ type: 'GET_SLACK_CONFIG_FOR_TRAY' }).catch(() => null);
+
+        if (!cfg || !cfg.configured || !(cfg.savedChannels || []).length) {
+            shadow.innerHTML = `
+                <style>${TRAY_STYLE}</style>
+                <div class="tray">
+                    <div class="tray-header"><span>Report Bug</span><button id="close">✕</button></div>
+                    <div class="status-msg error">Set up a Slack channel in the Dashboard → Integrations first.</div>
+                    <div class="actions"><button class="secondary" id="back">← Back</button></div>
+                </div>`;
+            shadow.getElementById('close').addEventListener('click', () => {
+                chrome.runtime.sendMessage({ type: 'CANCEL_MULTI_CAPTURE' }).catch(() => { });
+            });
+            shadow.getElementById('back').addEventListener('click', () => renderMultiCaptureTray(__qaTrayShots, 8));
+            return;
+        }
+
+        const threadsForChannel = (channelId) => (cfg.savedThreads || []).filter(t => t.channel === channelId);
+        const defaultChannel = cfg.defaultChannel && cfg.savedChannels.some(c => c.id === cfg.defaultChannel)
+            ? cfg.defaultChannel : cfg.savedChannels[0].id;
+
+        const renderForm = () => `
+            <style>${TRAY_STYLE}</style>
+            <div class="tray">
+                <div class="tray-header"><span>Report Bug (${__qaTrayShots.length} shot${__qaTrayShots.length !== 1 ? 's' : ''})</span><button id="close">✕</button></div>
+                <div class="strip">${__qaTrayShots.map(s => `<img src="${s.dataUrl}" />`).join('')}</div>
+                <label class="field-label">Description</label>
+                <textarea id="desc" placeholder="What's broken?"></textarea>
+                <label class="field-label">Channel</label>
+                <select id="channel">
+                    ${cfg.savedChannels.map(c => `<option value="${c.id}" ${c.id === defaultChannel ? 'selected' : ''}>${c.name}</option>`).join('')}
+                </select>
+                <label class="field-label">Thread</label>
+                <select id="thread"></select>
+                <div class="status-msg" id="status-msg"></div>
+                <div class="actions">
+                    <button class="secondary" id="back">← Back</button>
+                    <button class="primary" id="send">Send to Slack</button>
+                </div>
+            </div>`;
+
+        shadow.innerHTML = renderForm();
+
+        const populateThreads = () => {
+            const channelId = shadow.getElementById('channel').value;
+            const threads = threadsForChannel(channelId);
+            shadow.getElementById('thread').innerHTML =
+                `<option value="">No thread — new message</option>` +
+                threads.map(t => `<option value="${t.id}">${t.name}</option>`).join('');
+        };
+        populateThreads();
+
+        shadow.getElementById('channel').addEventListener('change', populateThreads);
+        shadow.getElementById('close').addEventListener('click', () => {
+            chrome.runtime.sendMessage({ type: 'CANCEL_MULTI_CAPTURE' }).catch(() => { });
+        });
+        shadow.getElementById('back').addEventListener('click', () => renderMultiCaptureTray(__qaTrayShots, 8));
+        shadow.getElementById('send').addEventListener('click', async () => {
+            const sendBtn = shadow.getElementById('send');
+            const statusEl = shadow.getElementById('status-msg');
+            const channel = shadow.getElementById('channel').value;
+            const threadId = shadow.getElementById('thread').value;
+            const thread = threadId ? threadsForChannel(channel).find(t => t.id === threadId) : null;
+            const text = shadow.getElementById('desc').value.trim();
+
+            sendBtn.disabled = true;
+            sendBtn.textContent = 'Sending…';
+            statusEl.textContent = '';
+            statusEl.className = 'status-msg';
+
+            const result = await chrome.runtime.sendMessage({
+                type: 'SUBMIT_MULTI_CAPTURE_REPORT',
+                channel, threadLink: thread ? thread.link : undefined, text,
+            }).catch((e) => ({ error: e.message }));
+
+            if (result && result.ok) {
+                statusEl.textContent = '✓ Sent to Slack';
+                statusEl.className = 'status-msg success';
+                // Background already tore down multiCapture state and will send
+                // HIDE_MULTI_CAPTURE_TRAY; leave the success message showing
+                // briefly so it isn't a jarring instant disappearance.
+            } else {
+                sendBtn.disabled = false;
+                sendBtn.textContent = 'Send to Slack';
+                statusEl.textContent = (result && result.error) || 'Failed to send';
+                statusEl.className = 'status-msg error';
+            }
+        });
+    }
+
+    function hideMultiCaptureTray(reason) {
+        if (!__qaTrayHost) return;
+        if (reason === 'sent') {
+            setTimeout(() => { if (__qaTrayHost) { __qaTrayHost.remove(); __qaTrayHost = null; } }, 1400);
+        } else {
+            __qaTrayHost.remove();
+            __qaTrayHost = null;
+        }
+    }
 
     // ── Event Helpers ──────────────────────────────────────────────────────────
     function sendEvent(type, data) {

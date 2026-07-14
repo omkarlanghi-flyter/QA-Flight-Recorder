@@ -1290,6 +1290,74 @@
       font-weight: 700;
     }
 
+    /* ── WebSocket Connections ───────────────────────────────── */
+    .ws-conn-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-left: 3px solid var(--accent2);
+      border-radius: var(--radius-sm);
+      overflow: hidden;
+    }
+
+    .ws-conn-card.has-error {
+      border-left-color: var(--danger);
+    }
+
+    .ws-conn-summary {
+      cursor: pointer;
+      padding: 10px 14px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      list-style: none;
+    }
+
+    .ws-conn-summary::-webkit-details-marker { display: none; }
+
+    .ws-conn-url {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 11px;
+      color: var(--text);
+      word-break: break-all;
+      flex: 1;
+    }
+
+    .ws-conn-stat {
+      font-size: 10px;
+      color: var(--text-muted);
+      white-space: nowrap;
+    }
+
+    .ws-status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      flex-shrink: 0;
+      background: var(--text-dim);
+    }
+
+    .ws-status-dot.open { background: var(--success); }
+    .ws-status-dot.error { background: var(--danger); }
+    .ws-status-dot.closed { background: var(--text-dim); }
+
+    .ws-conn-body {
+      padding: 4px 14px 12px 30px;
+      border-top: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .ws-frame-row {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 11px;
+      color: var(--text-muted);
+      padding: 3px 0;
+    }
+
+    .ws-frame-row.is-error { color: var(--danger); font-weight: 600; }
+    .ws-frame-row.is-tail { color: var(--warn); }
+
     /* ── Events Table ─────────────────────────────────────────── */
     .events-toolbar {
       display: flex;
@@ -1947,49 +2015,48 @@
     }
     .integration-back-link:hover { color: var(--accent); }
 
-    .channel-card {
-      border: 1px solid var(--border);
-      border-radius: var(--radius-sm);
-      background: var(--surface2);
-      overflow: hidden;
+    /* ── Channel > Thread > Bug breadcrumb ───────────────────────*/
+    .integration-breadcrumb {
+      display: flex; align-items: center; flex-wrap: wrap; gap: 4px;
+      font-size: 12px; margin-bottom: 4px;
     }
-    .channel-card .saved-row {
-      border: none;
-      border-radius: 0;
-      background: transparent;
+    .integration-breadcrumb .crumb {
+      color: var(--text-muted); cursor: pointer;
     }
-    .channel-threads {
-      padding: 6px 10px 10px 34px;
-      border-top: 1px dashed var(--border);
-      display: flex;
-      flex-direction: column;
-      gap: 6px;
+    .integration-breadcrumb .crumb:hover { color: var(--accent); }
+    .integration-breadcrumb .crumb.current {
+      color: var(--text); cursor: default; font-weight: 600;
     }
+    .integration-breadcrumb .crumb-sep { color: var(--text-dim); }
     .thread-row {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      font-size: 11px;
-      padding: 4px 8px;
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: var(--radius-sm);
+      display: flex; align-items: center; gap: 8px;
+      padding: 8px 10px; background: var(--surface2); border: 1px solid var(--border);
+      border-radius: var(--radius-sm); cursor: pointer;
     }
-    .thread-row-name { color: var(--text); flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .thread-add-row {
-      display: flex;
-      gap: 6px;
+    .thread-row:hover { border-color: var(--accent); }
+    .thread-row-name { flex: 1; font-size: 12px; font-weight: 500; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+    /* ── Bug status pills ────────────────────────────────────────*/
+    .bug-status-pill {
+      font-size: 12px; font-weight: 600; padding: 6px 14px;
+      border-radius: 99px; border: 1px solid var(--border);
+      background: var(--surface2); color: var(--text-dim); cursor: pointer;
     }
-    .thread-add-row input {
-      flex: 1;
-      font-size: 11px;
-      padding: 5px 8px;
+    .bug-status-pill:hover { border-color: var(--text-dim); }
+    .bug-status-pill:disabled { cursor: default; }
+    .bug-status-pill.active.status-open { background: var(--warn-light); color: var(--warn); border-color: var(--warn); }
+    .bug-status-pill.active.status-fixed { background: var(--success-light); color: var(--success); border-color: var(--success); }
+    .bug-status-pill.active.status-next_release { background: var(--accent-light); color: var(--accent); border-color: var(--accent); }
+    .bug-status-pill.active.status-wont_fix { background: var(--surface2); color: var(--text); border-color: var(--text-dim); }
+    .bug-note-item {
+      background: var(--surface2); border: 1px solid var(--border); border-radius: var(--radius-sm);
+      padding: 8px 10px; font-size: 12px;
     }
-    .thread-add-row button {
-      font-size: 11px;
-      padding: 5px 10px;
-      white-space: nowrap;
-    }
+    .bug-note-ts { font-size: 10px; color: var(--text-dim); margin-bottom: 3px; }
+    /* Status-change timeline entries stand out from plain comments so a
+       status flip (and its reason, if any) is scannable at a glance. */
+    .bug-note-status { border-left: 3px solid var(--accent); }
+    .bug-note-status-line { font-weight: 600; color: var(--text); margin-bottom: 2px; }
 
     /* ── Misc ─────────────────────────────────────────────────── */
 
@@ -2091,7 +2158,7 @@
       }
     }
 
-    /* ── Input Track Panel ────────────────────────────────────── */
+    /* ── User Actions Panel ───────────────────────────────────── */
     .input-stat-row {
       display: flex;
       gap: 8px;
@@ -2360,14 +2427,78 @@
     </div>
   </div>
 
+  <div class="modal-overlay" id="slack-token-modal">
+    <div class="modal-card">
+      <div class="modal-header">
+        <span class="modal-title">Slack Bot Token</span>
+        <button class="modal-close" onclick="closeModal('slack-token-modal')"><svg class="icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+      </div>
+      <div class="modal-body">
+        <div>
+          <label class="field-label" for="slack-bot-token">Bot Token</label>
+          <input class="field-input" type="password" id="slack-bot-token" placeholder="xoxb-…" autocomplete="off" />
+          <div class="field-sub" id="slack-token-status">Not configured yet.</div>
+          <div class="field-sub">One bot token covers every channel below — you only set this once.</div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-ghost" onclick="closeModal('slack-token-modal')">Cancel</button>
+        <button class="btn btn-primary" id="slack-settings-save-btn" onclick="saveSlackSettings()">Save Token</button>
+      </div>
+    </div>
+  </div>
 
+  <div class="modal-overlay" id="new-channel-modal">
+    <div class="modal-card">
+      <div class="modal-header">
+        <span class="modal-title">New Channel</span>
+        <button class="modal-close" onclick="closeModal('new-channel-modal')"><svg class="icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+      </div>
+      <div class="modal-body">
+        <div>
+          <label class="field-label" for="slack-new-channel-name">Label</label>
+          <input class="field-input" id="slack-new-channel-name" placeholder="e.g. qa-bugs" />
+        </div>
+        <div>
+          <label class="field-label" for="slack-new-channel-id">Channel ID</label>
+          <input class="field-input" id="slack-new-channel-id" placeholder="C0123456789 or a Slack channel link" />
+          <div class="field-sub">The bot must be invited to the channel first (<code>/invite @your-bot</code> in Slack).</div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-ghost" onclick="closeModal('new-channel-modal')">Cancel</button>
+        <button class="btn btn-primary" onclick="confirmNewChannel()">Create</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-overlay" id="new-bug-modal">
+    <div class="modal-card">
+      <div class="modal-header">
+        <span class="modal-title">New Bug</span>
+        <button class="modal-close" onclick="closeModal('new-bug-modal')"><svg class="icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+      </div>
+      <div class="modal-body">
+        <div>
+          <label class="field-label" for="new-bug-description">Description</label>
+          <textarea class="field-input field-textarea" id="new-bug-description" placeholder="Describe the bug…"></textarea>
+          <div class="field-sub">Tracked bugs reported to Slack (bug marker, screenshot, or session report) are added here automatically — this is for tracking one manually, outside that flow.</div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-ghost" onclick="closeModal('new-bug-modal')">Cancel</button>
+        <button class="btn btn-primary" onclick="confirmNewBug()">Create</button>
+      </div>
+    </div>
+  </div>
 
   <div class="layout">
     <!-- ── Sidebar ── -->
     <aside class="sidebar" style="display: flex; flex-direction: column;">
       <div style="display: flex; gap: 0; border-bottom: 1px solid var(--border); overflow: hidden; flex-shrink: 0;">
-        <button id="nav-btn-sessions" onclick="switchSidebar('sessions')" style="flex:1; background: var(--surface); color: var(--accent); border: none; border-bottom: 2px solid var(--accent); padding: 11px 10px; font-weight: 600; font-size: 12px; cursor: pointer; display:flex; align-items:center; justify-content:center; gap:6px;"><svg class="icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg> Sessions</button>
-        <button id="nav-btn-settings" onclick="switchSidebar('settings')" style="flex:1; background: var(--surface2); color: var(--text-muted); border: none; border-bottom: 2px solid transparent; padding: 11px 10px; font-weight: 600; font-size: 12px; cursor: pointer; display:flex; align-items:center; justify-content:center; gap:6px;"><svg class="icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg> Integrations</button>
+        <button id="nav-btn-sessions" onclick="switchSidebar('sessions')" style="flex:1; background: var(--surface); color: var(--accent); border: none; border-bottom: 2px solid var(--accent); padding: 11px 8px; font-weight: 600; font-size: 12px; cursor: pointer; display:flex; align-items:center; justify-content:center; gap:6px;"><svg class="icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg> Sessions</button>
+        <button id="nav-btn-bugs" onclick="switchSidebar('bugs')" style="flex:1; background: var(--surface2); color: var(--text-muted); border: none; border-bottom: 2px solid transparent; padding: 11px 8px; font-weight: 600; font-size: 12px; cursor: pointer; display:flex; align-items:center; justify-content:center; gap:6px;"><svg class="icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2v4M16 2v4M6 10h12M6 16h4M6 4h12a2 2 0 0 1 2 2v13a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z"/></svg> Bug Manager</button>
+        <button id="nav-btn-settings" onclick="switchSidebar('settings')" style="flex:1; background: var(--surface2); color: var(--text-muted); border: none; border-bottom: 2px solid transparent; padding: 11px 8px; font-weight: 600; font-size: 12px; cursor: pointer; display:flex; align-items:center; justify-content:center; gap:6px;"><svg class="icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg> Integrations</button>
       </div>
 
       <div id="sidebar-sessions" style="display: flex; flex-direction: column; flex: 1; overflow: hidden;">
@@ -2394,6 +2525,43 @@
         <div class="sessions-list" id="sessions-list">
           <div class="loading-row"><span class="spinner"></span> Loading…</div>
         </div>
+      </div>
+
+      <div id="sidebar-settings" style="display: none; flex-direction: column; flex: 1; overflow: hidden;">
+        <div class="sidebar-header">
+          <div class="sidebar-title-row">
+            <h2>Integrations</h2>
+            <span class="session-count" id="integrations-count">—</span>
+          </div>
+          <div class="field-sub" style="padding:0 0 4px;">Connect Slack channels and manage reply threads here. To browse and manage reported bugs, use the Bug Manager tab.</div>
+        </div>
+        <div id="slack-token-strip"></div>
+        <div style="padding:10px 16px; border-bottom:1px solid var(--border); flex-shrink:0;">
+          <button class="btn btn-ghost" style="width:100%; justify-content:center;" onclick="openNewChannelModal()"><svg class="icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg> New Channel</button>
+        </div>
+        <div class="sessions-list" id="integrations-list"></div>
+      </div>
+
+      <!-- Bug Manager sidebar: same channels as Integrations, but a read-only
+           picker into bug data rather than connection config — click a
+           channel to see the bugs reported under it, grouped by thread. -->
+      <div id="sidebar-bugs" style="display: none; flex-direction: column; flex: 1; overflow: hidden;">
+        <div class="sidebar-header">
+          <div class="sidebar-title-row">
+            <h2>Bug Manager</h2>
+            <span class="session-count" id="bugmanager-count">—</span>
+          </div>
+          <div class="search-row">
+            <select class="filter-select" id="bugmanager-status-filter" onchange="renderBugManagerSidebarList()" style="width:100%;">
+              <option value="">All statuses</option>
+              <option value="open">Open</option>
+              <option value="fixed">Fixed</option>
+              <option value="next_release">Next Release</option>
+              <option value="wont_fix">Won't Fix</option>
+            </select>
+          </div>
+        </div>
+        <div class="sessions-list" id="bugmanager-channel-list"></div>
       </div>
 
     </aside>
@@ -2468,12 +2636,14 @@
           <div class="tab active" id="tab-overview" onclick="switchTab('overview')"><svg class="icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg> Overview</div>
           <div class="tab" id="tab-triage" onclick="switchTab('triage')"><svg class="icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg> Triage <span class="tab-badge"
               id="tab-triage-badge" style="display:none"></span></div>
-          <div class="tab" id="tab-input" onclick="switchTab('input')"><svg class="icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3l7.07 16.97 2.51-7.39 7.39-2.51L3 3z"/><path d="M13 13l6 6"/></svg> Input Track <span class="tab-badge info"
-              id="tab-input-badge" style="display:none"></span></div>
-          <div class="tab" id="tab-events" onclick="switchTab('events')"><svg class="icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg> Events <span class="tab-badge info"
-              id="tab-events-badge" style="display:none"></span></div>
           <div class="tab" id="tab-video" onclick="switchTab('video')"><svg class="icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="20" rx="2"/><line x1="7" y1="2" x2="7" y2="22"/><line x1="17" y1="2" x2="17" y2="22"/><line x1="2" y1="12" x2="22" y2="12"/><line x1="2" y1="7" x2="7" y2="7"/><line x1="2" y1="17" x2="7" y2="17"/><line x1="17" y1="17" x2="22" y2="17"/><line x1="17" y1="7" x2="22" y2="7"/></svg> Video</div>
           <div class="tab" id="tab-repro" onclick="switchTab('repro')"><svg class="icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="9" y1="6" x2="20" y2="6"/><line x1="9" y1="12" x2="20" y2="12"/><line x1="9" y1="18" x2="20" y2="18"/><circle cx="4" cy="6" r="1.5"/><circle cx="4" cy="12" r="1.5"/><circle cx="4" cy="18" r="1.5"/></svg> Repro Steps</div>
+          <div class="tab" id="tab-input" onclick="switchTab('input')"><svg class="icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3l7.07 16.97 2.51-7.39 7.39-2.51L3 3z"/><path d="M13 13l6 6"/></svg> User Actions <span class="tab-badge info"
+              id="tab-input-badge" style="display:none"></span></div>
+          <div class="tab" id="tab-events" onclick="switchTab('events')"><svg class="icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg> Raw Events <span class="tab-badge info"
+              id="tab-events-badge" style="display:none"></span></div>
+          <div class="tab" id="tab-ws" onclick="switchTab('ws')"><svg class="icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a10 10 0 1 0 10 10"/><path d="M12 2v10l7.07 7.07"/><circle cx="12" cy="12" r="1"/></svg> WebSockets <span class="tab-badge warn"
+              id="tab-ws-badge" style="display:none"></span></div>
         </div>
 
         <div class="tab-panels">
@@ -2526,12 +2696,13 @@
                 <button class="btn btn-ghost" id="triage-filter-errors" onclick="filterTriage('errors')"><svg class="icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg> Errors Only</button>
                 <button class="btn btn-ghost" id="triage-filter-all" onclick="filterTriage('all')"
                   style="display:none">Show All</button>
+                <button class="btn btn-ghost" id="triage-toggle-muted" onclick="toggleMutedVisibility()" title="Muted errors are hidden by default — this is what actually declutters the list">Show Muted</button>
               </div>
             </div>
             <div id="triage-list" style="display:flex;flex-direction:column;gap:6px;"></div>
           </div>
 
-          <!-- Input Track -->
+          <!-- User Actions -->
           <div class="tab-panel" id="panel-input">
             <div class="events-toolbar">
               <input class="events-search" type="search" id="input-search" placeholder="Filter interactions…"
@@ -2566,14 +2737,21 @@
                 oninput="filterEventsTable()" />
               <select class="filter-select" id="type-filter" onchange="loadEvents()">
                 <option value="">All types</option>
-                <option value="network.request">network.request</option>
-                <option value="network.response">network.response</option>
-                <option value="network.failure">network.failure</option>
-                <option value="network.timing">network.timing</option>
-                <option value="console.warn">console.warn</option>
-                <option value="console.error">console.error</option>
-                <option value="runtime.exception">runtime.exception</option>
-                <option value="marker.bug">marker.bug</option>
+                <option value="network.request">Network Request</option>
+                <option value="network.response">Network Response</option>
+                <option value="network.failure">Network Failure</option>
+                <option value="network.timing">Network Timing</option>
+                <option value="network.ws_open">WebSocket Open</option>
+                <option value="network.ws_handshake">WebSocket Handshake</option>
+                <option value="network.ws_frame">WebSocket Frame</option>
+                <option value="network.ws_error">WebSocket Error</option>
+                <option value="network.ws_tail">WebSocket Tail (pre-failure frames)</option>
+                <option value="network.ws_close">WebSocket Close</option>
+                <option value="console.warn">Console Warning</option>
+                <option value="console.error">Console Error</option>
+                <option value="runtime.exception">JS Exception</option>
+                <option value="system.warning">System Warning</option>
+                <option value="marker.bug">Bug Marker</option>
               </select>
               <span id="events-total" style="font-size:11px;color:var(--text-muted);white-space:nowrap;"></span>
             </div>
@@ -2589,6 +2767,18 @@
                 <tbody id="events-tbody"></tbody>
               </table>
             </div>
+          </div>
+
+          <!-- WebSockets -->
+          <div class="tab-panel" id="panel-ws">
+            <div class="events-toolbar">
+              <input class="events-search" type="search" id="ws-search" placeholder="Filter by socket URL…"
+                oninput="filterWsConnections()" />
+              <button class="btn btn-ghost" id="ws-filter-errors" onclick="filterWsBy('errors')"><svg class="icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg> Errors Only</button>
+              <button class="btn btn-ghost" id="ws-filter-all" onclick="filterWsBy('all')" style="display:none">Show All</button>
+              <span id="ws-total" style="font-size:11px;color:var(--text-muted);white-space:nowrap;margin-left:auto;"></span>
+            </div>
+            <div id="ws-conn-list" style="display:flex;flex-direction:column;gap:6px;"></div>
           </div>
 
           <!-- Video -->
@@ -2630,54 +2820,154 @@
       <!-- Integrations -->
       <div id="settings-view" style="display:none; flex-direction:column; height:100%; overflow:auto;">
 
-        <!-- Hub: grid of available integrations -->
-        <div id="integrations-hub-view">
-          <div class="detail-header">
-            <div class="detail-header-info">
-              <div class="detail-title">Integrations</div>
-              <div class="detail-url">Connect tools to report bugs and sessions straight from a recording.</div>
-            </div>
+        <!-- Landing state: shown until a channel is picked from the sidebar list -->
+        <div id="integrations-hub-view" class="empty-state">
+          <div style="text-align:center; margin-bottom: 4px;">
+            <div style="display:flex; justify-content:center; margin-bottom:14px; color:var(--text-dim);"><svg class="icon" width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg></div>
+            <h2 style="font-size: 22px; font-weight: 700; color: var(--text);">Integrations</h2>
+            <p style="font-size: 14px; color: var(--text-dim); margin-top: 6px; max-width:44ch;">Select a channel from the sidebar, or create one to get started. This is where you connect Slack — to work with reported bugs, use the Bug Manager tab.</p>
           </div>
-          <div class="integrations-grid" id="integrations-grid"></div>
-        </div>
-
-        <!-- Detail: Slack config (hidden until the Slack card is opened) -->
-        <div id="integrations-slack-detail" style="display:none;">
-        <div class="detail-header">
-          <div class="detail-header-info">
-            <div class="integration-back-link" onclick="showIntegrationsHub()">← Integrations</div>
-            <div class="detail-title">Slack Integration</div>
-            <div class="detail-url">Manage the Bot Token, saved channels, and saved threads used when reporting bugs.</div>
-          </div>
-        </div>
-        <div style="padding:24px; max-width:560px; display:flex; flex-direction:column; gap:18px;">
-          <div>
-            <label class="field-label" for="slack-bot-token">Bot Token</label>
-            <input class="field-input" type="password" id="slack-bot-token" placeholder="xoxb-…" autocomplete="off" />
-            <div class="field-sub" id="slack-token-status">Not configured yet.</div>
-          </div>
-          <div>
-            <label class="field-label">Saved Channels</label>
-            <div id="slack-channels-list" style="display:flex; flex-direction:column; gap:8px;"></div>
-            <div style="display:flex; gap:6px; margin-top:8px;">
-              <input class="field-input" id="slack-new-channel-id" placeholder="Channel ID (C0123456789)" style="flex:1;" />
-              <input class="field-input" id="slack-new-channel-name" placeholder="Label (e.g. qa-bugs)" style="flex:1;" />
-              <button class="btn btn-ghost" onclick="addSlackChannel()">Add</button>
-            </div>
-            <div class="field-sub">The bot must be invited to the channel first (<code>/invite @your-bot</code> in Slack). Each channel below can have its own saved threads — paste a Slack message link ("Copy link" on any message) to save a reply target.</div>
-          </div>
-          <div id="slack-orphan-threads-wrap" style="display:none;">
-            <label class="field-label">Other Saved Threads</label>
-            <div class="field-sub" style="margin-bottom:6px;">Threads whose channel isn't in your saved list above.</div>
+          <div id="slack-orphan-threads-wrap" style="display:none; margin-top:24px; max-width:420px; width:100%; text-align:left;">
+            <label class="field-label">Unassigned Threads</label>
+            <div class="field-sub" style="margin-bottom:6px;">Saved threads whose channel is no longer in your list.</div>
             <div id="slack-orphan-threads-list" style="display:flex; flex-direction:column; gap:6px;"></div>
           </div>
+        </div>
+
+        <!-- Level 2: a single channel's threads (connection config only — no
+             bug browsing here, that's the Bug Manager tab's job) -->
+        <div id="integrations-channel-detail" style="display:none; flex-direction:column; height:100%;">
+        <div class="detail-header">
+          <div class="detail-header-info">
+            <div class="integration-breadcrumb" id="channel-breadcrumb"></div>
+            <div class="detail-title" id="channel-detail-title">—</div>
+            <div class="detail-url" id="channel-detail-id">—</div>
+          </div>
+        </div>
+        <div style="padding:24px; max-width:640px; display:flex; flex-direction:column; gap:18px; overflow:auto;">
           <div>
-            <button class="btn btn-primary" id="slack-settings-save-btn" onclick="saveSlackSettings()">Save Token</button>
+            <label class="field-label">Add a thread</label>
+            <div style="display:flex; gap:6px; margin-top:4px;">
+              <input class="field-input" id="channel-thread-link" placeholder="Paste Slack message link…" style="flex:1;" />
+              <input class="field-input" id="channel-thread-name" placeholder="Label" style="flex:0 0 160px;" />
+              <button class="btn btn-primary" onclick="confirmAddThreadForSelectedChannel()">Add</button>
+            </div>
+            <div class="field-sub">"Copy link" on any Slack message saves it as a reply target for this channel. Manage the bugs reported into these threads from the Bug Manager tab.</div>
+          </div>
+          <div>
+            <label class="field-label">Threads</label>
+            <div id="channel-threads-list" style="display:flex; flex-direction:column; gap:8px; margin-top:6px;"></div>
+          </div>
+        </div>
+        </div>
+      </div>
+
+      <!-- ═══ Bug Manager: Channel > Thread > Bug drill-down, separate from
+           Integrations connection config above. ═══ -->
+      <div id="bugmanager-view" style="display:none; flex-direction:column; height:100%; overflow:auto;">
+
+        <div id="bugmanager-hub-view" class="empty-state">
+          <div style="text-align:center; margin-bottom: 4px;">
+            <div style="display:flex; justify-content:center; margin-bottom:14px; color:var(--text-dim);"><svg class="icon" width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2v4M16 2v4M6 10h12M6 16h4M6 4h12a2 2 0 0 1 2 2v13a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z"/></svg></div>
+            <h2 style="font-size: 22px; font-weight: 700; color: var(--text);">Bug Manager</h2>
+            <p style="font-size: 14px; color: var(--text-dim); margin-top: 6px; max-width:44ch;">Select a channel from the sidebar to see the threads reported into it, and the bugs in each thread. No channels yet? Connect one from the Integrations tab.</p>
+          </div>
+        </div>
+
+        <!-- Level 2: a channel's threads (bug-count badges) + channel-level bugs -->
+        <div id="bm-channel-detail" style="display:none; flex-direction:column; height:100%;">
+        <div class="detail-header">
+          <div class="detail-header-info">
+            <div class="integration-breadcrumb" id="bm-channel-breadcrumb"></div>
+            <div class="detail-title" id="bm-channel-detail-title">—</div>
+            <div class="detail-url" id="bm-channel-detail-id">—</div>
+          </div>
+        </div>
+        <div style="padding:24px; max-width:640px; display:flex; flex-direction:column; gap:18px; overflow:auto;">
+          <div>
+            <label class="field-label">Threads</label>
+            <div id="bm-channel-threads-list" style="display:flex; flex-direction:column; gap:8px; margin-top:6px;"></div>
+          </div>
+          <div id="bm-channel-level-bugs-wrap" style="display:none;">
+            <label class="field-label">Channel-level Bugs</label>
+            <div class="field-sub" style="margin-bottom:6px;">Reported to this channel with no specific thread.</div>
+            <div id="bm-channel-level-bugs-list" style="display:flex; flex-direction:column; gap:6px;"></div>
+          </div>
+        </div>
+        </div>
+
+        <!-- Level 3: bugs reported into a single thread -->
+        <div id="thread-bug-list-view" style="display:none; flex-direction:column; height:100%;">
+        <div class="detail-header">
+          <div class="detail-header-info">
+            <div class="integration-breadcrumb" id="thread-breadcrumb"></div>
+            <div class="detail-title" id="thread-detail-title">—</div>
+          </div>
+        </div>
+        <div style="padding:24px; max-width:640px; display:flex; flex-direction:column; gap:16px; overflow:auto;">
+          <div>
+            <button class="btn btn-ghost" onclick="openNewBugModal()"><svg class="icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg> New Bug</button>
+          </div>
+          <div>
+            <label class="field-label">Bugs</label>
+            <div id="thread-bugs-list" style="display:flex; flex-direction:column; gap:8px; margin-top:6px;"></div>
+          </div>
+        </div>
+        </div>
+
+        <!-- Level 4: a single bug's full detail -->
+        <div id="bug-detail" style="display:none; flex-direction:column; height:100%;">
+        <div class="detail-header">
+          <div class="detail-header-info">
+            <div class="integration-breadcrumb" id="bug-breadcrumb"></div>
+            <div class="detail-title" id="bug-detail-description">—</div>
+            <div class="detail-meta" id="bug-detail-meta"></div>
+          </div>
+          <div class="detail-actions">
+            <button class="btn btn-ghost" style="color:var(--danger);" onclick="confirmDeleteBug()"><svg class="icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg> Delete</button>
+          </div>
+        </div>
+        <div style="padding:24px; max-width:640px; display:flex; flex-direction:column; gap:18px; overflow:auto;">
+          <div id="bug-detail-context-wrap" style="display:none;">
+            <details class="payload-accordion" open>
+              <summary style="cursor:pointer;font-weight:600;color:var(--text-muted);font-size:11px;padding:3px 0;">Session Context</summary>
+              <pre class="payload-pre" id="bug-detail-context" style="white-space:pre-wrap;"></pre>
+            </details>
+          </div>
+          <div>
+            <label class="field-label">Status</label>
+            <div id="bug-status-pills" style="display:flex; gap:6px; margin-top:6px; flex-wrap:wrap;"></div>
+          </div>
+          <div>
+            <label class="field-label">Timeline</label>
+            <div id="bug-notes-list" style="display:flex; flex-direction:column; gap:8px; margin-top:6px;"></div>
+            <div style="display:flex; gap:6px; margin-top:10px;">
+              <input class="field-input" id="bug-note-input" placeholder="Add a comment — why it's not fixed, or when it will be…" style="flex:1;" />
+              <button class="btn btn-ghost" onclick="confirmAddBugNote()">Add</button>
+            </div>
           </div>
         </div>
         </div>
       </div>
     </main>
+  </div>
+
+  <!-- Status-change comment modal — reused for every status pill click -->
+  <div class="modal-overlay" id="bug-status-comment-modal">
+    <div class="modal">
+      <div class="modal-header">
+        <span class="modal-title" id="bug-status-comment-title">Update Status</span>
+        <button class="modal-close" onclick="closeModal('bug-status-comment-modal')"><svg class="icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+      </div>
+      <div class="modal-body">
+        <label class="field-label">Why? (optional)</label>
+        <textarea class="field-input" id="bug-status-comment-input" rows="3" placeholder="e.g. Fixed in v2.3, deploying next release…" style="resize:vertical;"></textarea>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-ghost" onclick="closeModal('bug-status-comment-modal')">Cancel</button>
+        <button class="btn btn-primary" onclick="confirmBugStatusChange()">Update Status</button>
+      </div>
+    </div>
   </div>
 
   <div id="tl-tooltip"></div>

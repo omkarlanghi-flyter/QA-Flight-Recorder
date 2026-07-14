@@ -14,6 +14,7 @@ const { getEventType, normalizeEventType } = require('./event_type');
 const { generateTriageView, errorSignature } = require('./filter');
 const { resolveStack } = require('./debug/sourcemap');
 const slack = require('./integrations/slack');
+const bugs = require('./bugs');
 
 const ingestMetrics = {
     legacy_calls: 0,
@@ -956,8 +957,13 @@ function resolveSlackTarget({ channel, threadLink }) {
     return { targetChannel, thread_ts };
 }
 
+function channelNameFor(channelId) {
+    const saved = (slack.loadConfig().savedChannels || []).find(c => c.id === channelId);
+    return saved ? saved.name : null;
+}
+
 app.post('/integrations/slack/send', async (req, res) => {
-    const { text, channel, threadLink } = req.body || {};
+    const { text, note, context, channel, threadLink, session_id, source } = req.body || {};
     if (!text || typeof text !== 'string') {
         return sendApiError(res, 400, 'INVALID_BODY', 'Body must include "text"');
     }
@@ -970,7 +976,29 @@ app.post('/integrations/slack/send', async (req, res) => {
 
     try {
         const result = await slack.postMessage({ channel: target.targetChannel, text, thread_ts: target.thread_ts });
-        res.json({ ok: true, ...result });
+        // Reporting to Slack is otherwise fire-and-forget — this is what lets
+        // the Bugs tab show it afterward. Never let a tracker-write failure
+        // fail the send itself; the message already reached Slack. `text` is
+        // the full message actually posted to Slack (note + context, if the
+        // sender chose to include it); `note`/`context` are the same two
+        // pieces kept separate so the tracker's description isn't a wall of
+        // concatenated page/URL/health text — see bugs.js createBug().
+        let bug = null;
+        try {
+            bug = bugs.createBug({
+                description: (note && note.trim()) || text,
+                context: context || null,
+                session_id: session_id || null,
+                channel: target.targetChannel,
+                channel_name: channelNameFor(target.targetChannel),
+                thread_link: threadLink || null,
+                permalink: result.permalink,
+                source: source === 'bug_marker' ? 'bug_marker' : 'session_report',
+            });
+        } catch (e) {
+            console.warn('[BUGS] Failed to record bug after Slack send:', e.message);
+        }
+        res.json({ ok: true, ...result, bug_id: bug?.id || null });
     } catch (err) {
         return sendApiError(res, 502, 'SLACK_SEND_FAILED', 'Failed to send Slack message', { reason: err.message });
     }
@@ -1000,10 +1028,127 @@ app.post('/integrations/slack/send-screenshot', upload.single('image'), async (r
             filename: 'screenshot.png',
             initialComment: text || undefined,
         });
-        res.json({ ok: true, ...result });
+        let bug = null;
+        try {
+            bug = bugs.createBug({
+                description: text || '(screenshot, no description)',
+                channel: target.targetChannel,
+                channel_name: channelNameFor(target.targetChannel),
+                thread_link: threadLink || null,
+                permalink: result.permalink,
+                source: 'screenshot',
+            });
+        } catch (e) {
+            console.warn('[BUGS] Failed to record bug after screenshot upload:', e.message);
+        }
+        res.json({ ok: true, ...result, bug_id: bug?.id || null });
     } catch (err) {
         return sendApiError(res, 502, 'SLACK_UPLOAD_FAILED', 'Failed to upload screenshot to Slack', { reason: err.message });
     }
+});
+
+/**
+ * POST /integrations/slack/send-screenshots
+ * multipart/form-data: images (multiple PNG files, field name "images"), channel?, threadLink?, text? (caption)
+ * "Multimedia" bug report — multiple screenshots captured via the on-page
+ * tray (extension/content.js), sent as ONE Slack message with several
+ * attachments, and recorded as ONE bug (not one per image).
+ */
+// The 8-image cap here matches MAX_MULTI_SHOTS in extension/background.js —
+// the client already stops the user at 8, this is just the server-side backstop.
+app.post('/integrations/slack/send-screenshots', upload.array('images', 8), async (req, res) => {
+    if (!req.files || !req.files.length) {
+        return sendApiError(res, 400, 'INVALID_BODY', 'No images uploaded (field name must be "images")');
+    }
+    if (!slack.isConfigured()) {
+        return sendApiError(res, 400, 'SLACK_NOT_CONFIGURED', 'Slack is not configured yet — add a Bot Token first');
+    }
+
+    const { channel, threadLink, text } = req.body || {};
+    const target = resolveSlackTarget({ channel, threadLink });
+    if (target.error) return sendApiError(res, 400, target.error.code, target.error.message);
+
+    try {
+        const result = await slack.uploadFiles({
+            channel: target.targetChannel,
+            thread_ts: target.thread_ts,
+            files: req.files.map((f, i) => ({ buffer: f.buffer, filename: `screenshot-${i + 1}.png` })),
+            initialComment: text || undefined,
+        });
+        let bug = null;
+        try {
+            bug = bugs.createBug({
+                description: text || `(${req.files.length} screenshots, no description)`,
+                channel: target.targetChannel,
+                channel_name: channelNameFor(target.targetChannel),
+                thread_link: threadLink || null,
+                permalink: result.permalink,
+                source: 'screenshot',
+            });
+        } catch (e) {
+            console.warn('[BUGS] Failed to record bug after multi-screenshot upload:', e.message);
+        }
+        res.json({ ok: true, ...result, bug_id: bug?.id || null });
+    } catch (err) {
+        return sendApiError(res, 502, 'SLACK_UPLOAD_FAILED', 'Failed to upload screenshots to Slack', { reason: err.message });
+    }
+});
+
+// ── Bug Tracker ─────────────────────────────────────────────────────────────
+app.get('/bugs', (req, res) => {
+    const { status, channel } = req.query;
+    res.json({ ok: true, bugs: bugs.listBugs({ status, channel }) });
+});
+
+app.get('/bugs/:id', (req, res) => {
+    const bug = bugs.getBug(req.params.id);
+    if (!bug) return sendApiError(res, 404, 'BUG_NOT_FOUND', 'Bug not found');
+    res.json({ ok: true, bug });
+});
+
+app.post('/bugs', (req, res) => {
+    const { description, session_id, channel, channel_name, thread_link } = req.body || {};
+    if (!description || typeof description !== 'string' || !description.trim()) {
+        return sendApiError(res, 400, 'INVALID_BODY', 'description is required');
+    }
+    try {
+        const bug = bugs.createBug({
+            description: description.trim(),
+            session_id: session_id || null,
+            channel: channel || null,
+            channel_name: channel_name || null,
+            thread_link: thread_link || null,
+            source: 'manual',
+        });
+        res.json({ ok: true, bug });
+    } catch (err) {
+        return sendApiError(res, 400, 'CREATE_FAILED', err.message);
+    }
+});
+
+app.patch('/bugs/:id/status', (req, res) => {
+    const { status, comment } = req.body || {};
+    try {
+        const bug = bugs.updateBugStatus(req.params.id, status, comment);
+        res.json({ ok: true, bug });
+    } catch (err) {
+        return sendApiError(res, 400, 'UPDATE_FAILED', err.message);
+    }
+});
+
+app.post('/bugs/:id/notes', (req, res) => {
+    const { text } = req.body || {};
+    try {
+        const bug = bugs.addBugNote(req.params.id, text);
+        res.json({ ok: true, bug });
+    } catch (err) {
+        return sendApiError(res, 400, 'ADD_NOTE_FAILED', err.message);
+    }
+});
+
+app.delete('/bugs/:id', (req, res) => {
+    const remaining = bugs.deleteBug(req.params.id);
+    res.json({ ok: true, bugs: remaining });
 });
 
 /**

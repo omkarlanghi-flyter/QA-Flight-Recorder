@@ -230,6 +230,31 @@ function runBodyFetch(fn) {
 const WS_FRAME_SAMPLE_LIMIT = 5; // full payload captured for the first N frames per direction per socket
 let _wsConnections = {}; // reset per recording — key: requestId
 
+// Black-box tail buffer: the frames right before a failure are usually the
+// ones that matter most for debugging, but they're also the ones most likely
+// to have aged out of the head sample above on a long-lived connection. Every
+// frame gets a cheap raw (unredacted, untruncated-cost) entry pushed into a
+// small ring buffer; redaction only runs on the handful of frames actually
+// flushed on ws_error/ws_close, so steady-state cost per frame stays O(1) and
+// the flood-protection this sampling exists for is preserved.
+const WS_TAIL_BUFFER_SIZE = 5;
+
+function flushWsTail(requestId, conn, reason) {
+    if (!conn || !conn.hadOmittedFrame || !conn.tailFrames.length) return;
+    bufferEvent(makeEvent('network.ws_tail', 'cdp', {
+        request_id: requestId,
+        reason, // 'error' | 'close'
+        url_sanitized: conn.url,
+        frames: conn.tailFrames.map(f => ({
+            direction: f.direction,
+            opcode: f.opcode,
+            size: f.size,
+            frame_index: f.frame_index,
+            payload: redactBodyText(f.rawPayload),
+        })),
+    }, conn.url));
+}
+
 /**
  * Attempt to extract GraphQL operation name and query type from a POST body.
  * Returns null if the request is not a GraphQL request.
@@ -445,6 +470,8 @@ function handleCDPEvent(source, method, params) {
                 sentBytes: 0,
                 receivedBytes: 0,
                 startTime: null,
+                tailFrames: [],       // ring buffer, see WS_TAIL_BUFFER_SIZE above
+                hadOmittedFrame: false,
             };
             bufferEvent(makeEvent('network.ws_open', 'cdp', {
                 request_id: params.requestId,
@@ -488,6 +515,18 @@ function handleCDPEvent(source, method, params) {
             const frameIndex = isSent ? (conn?.sentCount || 1) : (conn?.receivedCount || 1);
             const sampled = frameIndex <= WS_FRAME_SAMPLE_LIMIT;
 
+            if (conn) {
+                if (!sampled) conn.hadOmittedFrame = true;
+                conn.tailFrames.push({
+                    direction: isSent ? 'sent' : 'received',
+                    opcode: frame.opcode,
+                    size: payload.length,
+                    frame_index: frameIndex,
+                    rawPayload: payload.substring(0, BODY_SIZE_LIMIT_BYTES),
+                });
+                if (conn.tailFrames.length > WS_TAIL_BUFFER_SIZE) conn.tailFrames.shift();
+            }
+
             bufferEvent(makeEvent('network.ws_frame', 'cdp', {
                 request_id: params.requestId,
                 direction: isSent ? 'sent' : 'received',
@@ -508,6 +547,7 @@ function handleCDPEvent(source, method, params) {
                 errorMessage: params.errorMessage,
                 url_sanitized: conn?.url,
             }, conn?.url));
+            flushWsTail(params.requestId, conn, 'error');
             break;
         }
 
@@ -521,6 +561,7 @@ function handleCDPEvent(source, method, params) {
                 bytes_sent: conn?.sentBytes || 0,
                 bytes_received: conn?.receivedBytes || 0,
             }, conn?.url));
+            flushWsTail(params.requestId, conn, 'close');
             delete _wsConnections[params.requestId];
             break;
         }
@@ -1008,6 +1049,138 @@ async function captureScreenshot() {
     }
 }
 
+// ── Multi-Screenshot Capture ("Multimedia" bug report) ──────────────────────
+// Same rationale as captureScreenshot() above (independent of the recording
+// session), extended to accumulate several screenshots — taken across
+// multiple page states/navigations — before writing one combined bug report.
+// The accumulation UI has to live on the page itself (content.js, Shadow DOM
+// tray), not the popup: the popup closes the instant the user clicks the
+// underlying page to move to the next state they want to capture, so it
+// can't be the thing driving "capture another" clicks.
+let multiCapture = { active: false, tabId: null, shots: [] };
+const MAX_MULTI_SHOTS = 8;
+
+async function ensureContentScript(tabId) {
+    try {
+        await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] });
+    } catch (e) {
+        // Already injected (guarded by window.__qaRecorderInjected), or a
+        // restricted page (chrome://, Web Store, etc.) — either way, safe to ignore.
+    }
+}
+
+async function showMultiCaptureTray(tabId) {
+    if (!tabId) return;
+    chrome.tabs.sendMessage(tabId, {
+        type: 'SHOW_MULTI_CAPTURE_TRAY',
+        shots: multiCapture.shots.map(s => ({ id: s.id, dataUrl: s.dataUrl })),
+        maxShots: MAX_MULTI_SHOTS,
+    }).catch(() => { });
+}
+
+function teardownMultiCapture(tabId, reason) {
+    multiCapture = { active: false, tabId: null, shots: [] };
+    if (tabId) chrome.tabs.sendMessage(tabId, { type: 'HIDE_MULTI_CAPTURE_TRAY', reason }).catch(() => { });
+}
+
+async function startMultiCapture(tabId) {
+    const tab = tabId
+        ? await chrome.tabs.get(tabId).catch(() => null)
+        : (await chrome.tabs.query({ active: true, currentWindow: true }))[0];
+    if (!tab) return { error: 'No active tab found' };
+
+    multiCapture = { active: true, tabId: tab.id, shots: [] };
+    await ensureContentScript(tab.id);
+    const shotResult = await captureAnotherShot();
+    if (!shotResult.ok) { multiCapture.active = false; return shotResult; }
+    await showMultiCaptureTray(tab.id);
+    return { ok: true, shots: multiCapture.shots.length };
+}
+
+// Captures whichever tab is currently active/focused at the moment of the
+// call — NOT necessarily multiCapture.tabId (the tab the on-page tray lives
+// on). This is what lets "+ Capture" on the tray work (that tab is active
+// when you click it) AND "Capture This Tab" from the popup after switching
+// to a completely different tab work too (chrome.tabs.query({active:true,
+// currentWindow:true}) resolves to whatever the popup's own window is
+// showing). multiCapture.tabId stays fixed to the tray's home tab purely for
+// re-injecting/redrawing the tray there after navigation.
+async function captureAnotherShot() {
+    if (!multiCapture.active) return { error: 'No multi-capture in progress' };
+    if (multiCapture.shots.length >= MAX_MULTI_SHOTS) {
+        return { error: `Limit of ${MAX_MULTI_SHOTS} screenshots reached` };
+    }
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!tab) return { error: 'No active tab found' };
+    try {
+        const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' });
+        multiCapture.shots.push({ id: crypto.randomUUID(), dataUrl });
+        return { ok: true, shots: multiCapture.shots.length };
+    } catch (e) {
+        return { error: e.message || 'Failed to capture screenshot' };
+    }
+}
+
+// Screenshots of things the extension fundamentally cannot capture itself —
+// a native app like Postman, another program's window — get added here
+// instead: the user takes an OS-level screenshot separately and imports it,
+// same collection, same report.
+function addMultiCaptureFiles(dataUrls) {
+    if (!multiCapture.active) return { error: 'No multi-capture in progress' };
+    const room = MAX_MULTI_SHOTS - multiCapture.shots.length;
+    if (room <= 0) return { error: `Limit of ${MAX_MULTI_SHOTS} screenshots reached` };
+    const toAdd = (dataUrls || []).slice(0, room);
+    for (const dataUrl of toAdd) {
+        multiCapture.shots.push({ id: crypto.randomUUID(), dataUrl });
+    }
+    return { ok: true, shots: multiCapture.shots.length, added: toAdd.length, skipped: (dataUrls || []).length - toAdd.length };
+}
+
+function getMultiCaptureStatus() {
+    return {
+        active: multiCapture.active,
+        shots: multiCapture.shots.map(s => ({ id: s.id, dataUrl: s.dataUrl })),
+        maxShots: MAX_MULTI_SHOTS,
+    };
+}
+
+function removeMultiCaptureShot(shotId) {
+    multiCapture.shots = multiCapture.shots.filter(s => s.id !== shotId);
+    return { ok: true, shots: multiCapture.shots.length };
+}
+
+async function getSlackConfigForTray() {
+    try {
+        const settings = await loadSettings();
+        const res = await fetch(`${settings.collectorUrl}/integrations/slack/config`);
+        return await res.json();
+    } catch {
+        return { configured: false, savedChannels: [], savedThreads: [] };
+    }
+}
+
+async function submitMultiCaptureReport({ channel, threadLink, text }) {
+    if (!multiCapture.shots.length) return { error: 'No screenshots captured' };
+    try {
+        const settings = await loadSettings();
+        const form = new FormData();
+        for (const [i, shot] of multiCapture.shots.entries()) {
+            const blob = await (await fetch(shot.dataUrl)).blob();
+            form.append('images', blob, `screenshot-${i + 1}.png`);
+        }
+        form.append('channel', channel);
+        if (threadLink) form.append('threadLink', threadLink);
+        if (text) form.append('text', text);
+
+        const res = await fetch(`${settings.collectorUrl}/integrations/slack/send-screenshots`, { method: 'POST', body: form });
+        const data = await res.json();
+        if (!data.ok) return { error: data.message || 'Failed to send' };
+        return { ok: true };
+    } catch (e) {
+        return { error: e.message || 'Failed to send' };
+    }
+}
+
 // ── Message Handler ───────────────────────────────────────────────────────────
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     (async () => {
@@ -1032,6 +1205,52 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             case 'CAPTURE_SCREENSHOT':
                 sendResponse(await captureScreenshot());
                 break;
+
+            case 'START_MULTI_CAPTURE':
+                sendResponse(await startMultiCapture(msg.tabId));
+                break;
+
+            case 'CAPTURE_ANOTHER_SHOT': {
+                const result = await captureAnotherShot();
+                if (result.ok) await showMultiCaptureTray(multiCapture.tabId);
+                sendResponse(result);
+                break;
+            }
+
+            case 'REMOVE_MULTI_CAPTURE_SHOT': {
+                const result = removeMultiCaptureShot(msg.shotId);
+                await showMultiCaptureTray(multiCapture.tabId);
+                sendResponse(result);
+                break;
+            }
+
+            case 'ADD_MULTI_CAPTURE_FILES': {
+                const result = addMultiCaptureFiles(msg.dataUrls);
+                if (result.ok) await showMultiCaptureTray(multiCapture.tabId);
+                sendResponse(result);
+                break;
+            }
+
+            case 'GET_MULTI_CAPTURE_STATUS':
+                sendResponse(getMultiCaptureStatus());
+                break;
+
+            case 'CANCEL_MULTI_CAPTURE':
+                teardownMultiCapture(multiCapture.tabId, 'cancel');
+                sendResponse({ ok: true });
+                break;
+
+            case 'GET_SLACK_CONFIG_FOR_TRAY':
+                sendResponse(await getSlackConfigForTray());
+                break;
+
+            case 'SUBMIT_MULTI_CAPTURE_REPORT': {
+                const tabIdForTeardown = multiCapture.tabId;
+                const result = await submitMultiCaptureReport(msg);
+                if (result.ok) teardownMultiCapture(tabIdForTeardown, 'sent');
+                sendResponse(result);
+                break;
+            }
 
             case 'CONTENT_EVENT':
                 // Action events from content script
@@ -1114,5 +1333,15 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
                 files: ['content.js']
             }).catch(() => {});
         }
+    }
+
+    // Multi-capture tray needs the same navigation survival as the recording
+    // indicator — a full page navigation tears down the content script (and
+    // any in-page UI it owns), but the whole point of "Multimedia" capture is
+    // navigating between the repro steps you're screenshotting, so the tray
+    // must reappear with its accumulated shots (held here in background
+    // memory, untouched by the page reload) rather than silently vanishing.
+    if (multiCapture.active && tabId === multiCapture.tabId && changeInfo.status === 'complete') {
+        ensureContentScript(tabId).then(() => showMultiCaptureTray(tabId)).catch(() => { });
     }
 });

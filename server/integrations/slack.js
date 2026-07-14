@@ -269,12 +269,35 @@ async function postMessage({ channel, text, thread_ts }) {
 }
 
 /**
- * Uploads a file (e.g. a screenshot) into a channel or thread using Slack's
- * three-step external-upload flow:
- *   1. files.getUploadURLExternal — reserve an upload slot, get a signed URL
- *   2. POST the raw bytes to that URL (multipart, no auth header needed —
- *      the URL itself is the credential)
- *   3. files.completeUploadExternal — finalize + post it to the channel/thread
+ * Steps 1-2 of Slack's three-step external-upload flow for one file —
+ * reserve a signed upload slot, then POST the raw bytes to it. Shared by
+ * uploadFile (single) and uploadFiles (multiple) below; only step 3
+ * (files.completeUploadExternal) differs between them, since that's the
+ * step that actually decides whether files land as separate messages or
+ * are grouped into one.
+ */
+async function reserveAndUploadFile(botToken, buffer, filename, mimeType) {
+    const urlRes = await callSlackApiForm('files.getUploadURLExternal', botToken, {
+        filename,
+        length: buffer.length,
+    });
+
+    const form = new FormData();
+    form.append('file', new Blob([buffer], { type: mimeType }), filename);
+    const uploadRes = await fetch(urlRes.upload_url, {
+        method: 'POST',
+        body: form,
+        signal: AbortSignal.timeout(20000),
+    });
+    if (!uploadRes.ok) {
+        throw new Error(`Upload to Slack failed: HTTP ${uploadRes.status}`);
+    }
+
+    return { id: urlRes.file_id, title: filename };
+}
+
+/**
+ * Uploads a single file (e.g. a screenshot) into a channel or thread.
  * Returns { channel, permalink }.
  */
 async function uploadFile({ channel, thread_ts, buffer, filename, initialComment }) {
@@ -286,24 +309,46 @@ async function uploadFile({ channel, thread_ts, buffer, filename, initialComment
         throw new Error('No Slack channel specified');
     }
 
-    const urlRes = await callSlackApiForm('files.getUploadURLExternal', cfg.botToken, {
-        filename,
-        length: buffer.length,
-    });
-
-    const form = new FormData();
-    form.append('file', new Blob([buffer], { type: 'image/png' }), filename);
-    const uploadRes = await fetch(urlRes.upload_url, {
-        method: 'POST',
-        body: form,
-        signal: AbortSignal.timeout(20000),
-    });
-    if (!uploadRes.ok) {
-        throw new Error(`Upload to Slack failed: HTTP ${uploadRes.status}`);
-    }
+    const fileRef = await reserveAndUploadFile(cfg.botToken, buffer, filename, 'image/png');
 
     const completeRes = await callSlackApi('files.completeUploadExternal', cfg.botToken, {
-        files: [{ id: urlRes.file_id, title: filename }],
+        files: [fileRef],
+        channel_id: channel,
+        thread_ts: thread_ts || undefined,
+        initial_comment: initialComment || undefined,
+    });
+
+    const uploaded = completeRes.files && completeRes.files[0];
+    return { channel, permalink: uploaded?.permalink || null };
+}
+
+/**
+ * Uploads multiple files (e.g. a "Multimedia" bug report's screenshots) as
+ * ONE Slack message with several attachments. Steps 1-2 of the external-
+ * upload flow are inherently per-file, but files.completeUploadExternal
+ * accepts an array of file refs — a single call there finalizes all of them
+ * into one post/thread reply instead of one message per screenshot.
+ * `files` is [{ buffer, filename }, ...]. Returns { channel, permalink }
+ * (permalink points at the one combined message).
+ */
+async function uploadFiles({ channel, thread_ts, files, initialComment }) {
+    const cfg = loadConfig();
+    if (!cfg.botToken) {
+        throw new Error('Slack is not configured — add a Bot Token first');
+    }
+    if (!channel) {
+        throw new Error('No Slack channel specified');
+    }
+    if (!files || !files.length) {
+        throw new Error('No files to upload');
+    }
+
+    const fileRefs = await Promise.all(
+        files.map(f => reserveAndUploadFile(cfg.botToken, f.buffer, f.filename, 'image/png'))
+    );
+
+    const completeRes = await callSlackApi('files.completeUploadExternal', cfg.botToken, {
+        files: fileRefs,
         channel_id: channel,
         thread_ts: thread_ts || undefined,
         initial_comment: initialComment || undefined,
@@ -314,6 +359,6 @@ async function uploadFile({ channel, thread_ts, buffer, filename, initialComment
 }
 
 module.exports = {
-    loadConfig, saveConfig, isConfigured, parsePermalink, postMessage, uploadFile,
+    loadConfig, saveConfig, isConfigured, parsePermalink, postMessage, uploadFile, uploadFiles,
     addChannel, removeChannel, setDefaultChannel, addThread, removeThread, extractChannelId,
 };

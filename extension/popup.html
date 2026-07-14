@@ -321,6 +321,18 @@
             display: none;
         }
 
+        #multi-capture-status {
+            display: none;
+        }
+
+        #mc-thumbs img, #screenshot-preview-strip img {
+            width: 48px;
+            height: 48px;
+            object-fit: cover;
+            border-radius: 4px;
+            border: 1px solid var(--border);
+        }
+
         #screenshot-preview {
             width: 100%;
             border-radius: 6px;
@@ -465,7 +477,7 @@
         <!-- Timer -->
         <div id="timer-row">
             <div class="rec-dot"></div>
-            <span class="timer-label">Recording</span>
+            <span id="timer-label" class="timer-label">Recording</span>
             <span id="timer-value">0:00</span>
         </div>
 
@@ -485,6 +497,14 @@
                         <button type="button" class="mode-pill active" id="mode-pill-video">🎬 Video</button>
                         <button type="button" class="mode-pill" id="mode-pill-screenshot">📸 Screenshot</button>
                     </div>
+                </div>
+                <div class="mode-row" id="screenshot-submode-row" style="display:none;">
+                    <div class="mode-label">Screenshots</div>
+                    <div class="mode-pills">
+                        <button type="button" class="mode-pill active" id="mode-pill-single">Single Media</button>
+                        <button type="button" class="mode-pill" id="mode-pill-multi">Multimedia</button>
+                    </div>
+                    <div class="toggle-sub" style="margin-top:6px;">Multimedia opens an on-page tray so you can capture several screenshots — even across page navigations — before writing one combined report.</div>
                 </div>
                 <div class="toggle-row" id="row-toggle-logs">
                     <div class="toggle-label">
@@ -526,9 +546,9 @@
                 <button class="marker-submit" id="btn-submit-marker">Add</button>
             </div>
 
-            <!-- Open viewer -->
+            <!-- Open dashboard -->
             <button class="btn btn-viewer" id="btn-viewer">
-                🗂 Open Viewer UI
+                🗂 Open Dashboard
             </button>
 
             <div class="hotkeys">
@@ -537,9 +557,27 @@
             </div>
         </div>
 
-        <!-- Screenshot report screen (shown right after a screenshot capture) -->
+        <!-- Multi-capture status screen: shown instead of the main screen whenever
+             a "Multimedia" capture is already in progress (started from this tab
+             or another) — lets you keep adding shots from whichever tab/app you
+             switch to, since re-opening the popup always reflects the tab that's
+             currently active/focused. -->
+        <div id="multi-capture-status">
+            <div class="mode-label">📸 Multimedia capture in progress</div>
+            <div id="mc-shot-count" style="font-size:13px; font-weight:600; margin-bottom:8px;">0 screenshots</div>
+            <div id="mc-thumbs" style="display:flex; flex-wrap:wrap; gap:6px; margin-bottom:10px;"></div>
+            <button class="btn btn-start" id="btn-mc-capture-tab">📸 Capture This Tab</button>
+            <button class="btn btn-viewer" id="btn-mc-from-file" style="margin-top:6px;">🖼 Add from File…</button>
+            <input type="file" id="mc-file-input" accept="image/*" multiple style="display:none;" />
+            <button class="btn btn-start" id="btn-mc-report" style="margin-top:10px;">Report Bug →</button>
+            <button class="btn btn-viewer" id="btn-mc-cancel" style="margin-top:6px; color:var(--danger, #f87171);">Cancel Capture</button>
+        </div>
+
+        <!-- Screenshot report screen (shown right after a screenshot capture,
+             single or multi — #screenshot-preview for single, #screenshot-preview-strip for multi) -->
         <div id="screenshot-report">
             <img id="screenshot-preview" alt="Captured screenshot" />
+            <div id="screenshot-preview-strip" style="display:none; flex-wrap:wrap; gap:6px; margin-bottom:8px;"></div>
             <div class="field-mini-label">What's the issue?</div>
             <textarea class="marker-input" id="screenshot-desc" placeholder="Describe the bug in your own words…" maxlength="500"></textarea>
             <div class="field-mini-label">Channel</div>

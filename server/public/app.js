@@ -7,7 +7,10 @@ let currentTab = 'overview';
 let allSessionsCache = [];
 let allEventsCache = [];
 let allInputEventsCache = [];
+let allWsConnectionsCache = [];
+let wsFilter = 'all';
 let triageFilter = 'all';
+let triageHideMuted = true; // muted errors are hidden by default — this is what makes "Ignore" actually declutter
 let ignoredSignatures = new Set(); // globally muted error sigs
 
 // ── Icon System ──────────────────────────────────────────────────────────────
@@ -218,6 +221,7 @@ function summarizeEvent(event) {
     case 'network.ws_handshake': summary = `WS HANDSHAKE ${d.status || ''} ${d.statusText || ''} — ${d.url_sanitized || ''}`; break;
     case 'network.ws_frame': summary = `WS ${d.direction === 'sent' ? '↑' : '↓'} ${d.size ?? ''}B — ${d.url_sanitized || ''}`; break;
     case 'network.ws_error': summary = `WS ERROR: ${d.errorMessage || ''} — ${d.url_sanitized || ''}`; break;
+    case 'network.ws_tail': summary = `WS TAIL: recovered ${d.frames?.length || 0} frame(s) leading up to ${d.reason || 'event'} — ${d.url_sanitized || ''}`; break;
     case 'network.ws_close': summary = `WS CLOSE ${d.frames_sent || 0}↑/${d.frames_received || 0}↓ frames — ${d.url_sanitized || ''}`; break;
     case 'console.warn': summary = `WARN: ${d.message || d.text || ''}`; break;
     case 'console.error': summary = `ERROR: ${d.message || d.text || ''}`; break;
@@ -991,6 +995,9 @@ async function ignoreEvent(ev, sessionId) {
   const sig = eventSignature(ev);
   const d = ev.data || {};
   const label = `[${ev.type}] ${(d.message || d.text || d.url_sanitized || '').slice(0, 80)}`;
+  // See renderTriage()'s matchCount comment: console/runtime types are already
+  // deduped server-side, so their real count lives in _triage.dedup_count.
+  const matchCount = ev._triage?.dedup_count || triageEventsCache.filter(e => eventSignature(e) === sig).length;
   try {
     await fetch(`${API}/ignored-errors`, {
       method: 'POST',
@@ -998,8 +1005,11 @@ async function ignoreEvent(ev, sessionId) {
       body: JSON.stringify({ signature: sig, label, source_session_id: sessionId }),
     });
     ignoredSignatures.add(sig);
-    showToast('Error muted globally', 'success');
-    renderTriage(triageEventsCache);  // re-render in-place with greyed-out state
+    showToast(
+      matchCount > 1 ? `Muted ${matchCount} matching errors — hidden here and in future sessions` : 'Error muted — hidden here and in future sessions',
+      'success'
+    );
+    renderTriage(triageEventsCache);  // re-render in-place; muted rows drop out by default
     loadDashboardIgnored();           // refresh the dashboard panel
   } catch {
     showToast('Failed to mute error', 'error');
@@ -1037,8 +1047,7 @@ async function loadDashboardIgnored() {
         <div style="font-size:10px; color:var(--text-dim);">Muted ${formatDate(e.ignored_at)}${e.source_session_id ? ` · from session <code>${e.source_session_id.slice(0,8)}</code>` : ''}</div>
       </div>
       <button onclick="restoreIgnored('${esc(e.id)}')" style="flex-shrink:0; background:none; border:1px solid var(--border); color:var(--text-muted); border-radius:5px; padding:4px 10px; font-size:11px; cursor:pointer;" title="Restore this error">${icon('eye', 12)} Restore</button>
-    </div>`);
-    list.innerHTML += ignored.length > 0 ? '' : '';
+    </div>`).join('');
 }
 
 async function loadTriage() {
@@ -1056,26 +1065,71 @@ async function loadTriage() {
   renderTriage(events);
 }
 
+const TRIAGE_CRITICAL_TYPES = ['console.error', 'runtime.exception', 'network.failure', 'network.ws_error'];
+
+function updateMutedToggleLabel(mutedCount) {
+  const btn = document.getElementById('triage-toggle-muted');
+  if (!btn) return;
+  btn.textContent = triageHideMuted
+    ? `Show Muted${mutedCount ? ` (${mutedCount})` : ''}`
+    : 'Hide Muted';
+}
+
+function toggleMutedVisibility() {
+  triageHideMuted = !triageHideMuted;
+  renderTriage(triageEventsCache);
+}
+
 function renderTriage(events) {
   const listEl = document.getElementById('triage-list');
   document.getElementById('triage-count').textContent = `${events.length} events`;
 
   if (!events.length) {
     listEl.innerHTML = '<div class="empty-list">No triage events — session is clean! 🎉</div>';
+    updateMutedToggleLabel(0);
     return;
   }
 
-  const show = triageFilter === 'errors'
-    ? events.filter(ev => ['console.error', 'runtime.exception', 'network.failure', 'network.ws_error'].includes(ev.type))
+  // Count occurrences per signature across the whole session so the mute button
+  // can say "Mute all N" — one click mutes every matching occurrence (by content
+  // signature, not event id), here and in every future session, since the ignore
+  // list is global. This is the mass-mute affordance in place of a multi-select UI.
+  const sigCounts = {};
+  for (const ev of events) {
+    if (!TRIAGE_CRITICAL_TYPES.includes(ev.type)) continue;
+    const sig = eventSignature(ev);
+    sigCounts[sig] = (sigCounts[sig] || 0) + 1;
+  }
+
+  let show = triageFilter === 'errors'
+    ? events.filter(ev => TRIAGE_CRITICAL_TYPES.includes(ev.type))
     : events;
 
+  // Muted errors are hidden by default (not just dimmed) — that's what makes
+  // "mute" actually declutter the list instead of leaving it there forever.
+  const mutedCount = show.filter(ev => ignoredSignatures.has(eventSignature(ev))).length;
+  if (triageHideMuted) show = show.filter(ev => !ignoredSignatures.has(eventSignature(ev)));
+  updateMutedToggleLabel(mutedCount);
+
   _triageShowCache = show; // update safe index reference
+
+  if (!show.length) {
+    listEl.innerHTML = mutedCount > 0
+      ? `<div class="empty-list">All ${mutedCount} matching event(s) are muted — click "Show Muted" to review them.</div>`
+      : '<div class="empty-list">No triage events — session is clean! 🎉</div>';
+    return;
+  }
 
   listEl.innerHTML = show.map((ev, i) => {
     const d = ev.data || {};
     const sig = eventSignature(ev);
     const isIgnored = ignoredSignatures.has(sig);
-    const isCritical = ['console.error', 'runtime.exception', 'network.failure', 'network.ws_error'].includes(ev.type);
+    const isCritical = TRIAGE_CRITICAL_TYPES.includes(ev.type);
+    // console.error/warn/runtime.exception are already deduped server-side (filter.js),
+    // so their true occurrence count lives in _triage.dedup_count, not in sigCounts
+    // (which only sees the one surviving entry for those types). network.failure and
+    // network.ws_error aren't deduped server-side, so sigCounts is accurate for them.
+    const matchCount = ev._triage?.dedup_count || sigCounts[sig] || 1;
     let msg = d.message || d.text || d.text_snippet || '';
     const stack = d.stack || d.stackTrace || null;
     const dedup = ev._triage?.dedup_count > 1 ? `<span class="dedup-badge">×${ev._triage.dedup_count}</span>` : '';
@@ -1095,7 +1149,7 @@ function renderTriage(events) {
 
     // Use data-idx to avoid embedding event JSON in onclick attrs (breaks on special chars)
     const ignoreBtn = isCritical && !isIgnored
-      ? `<button class="copy-btn" data-idx="${i}" onclick="triageIgnoreByIdx(this.dataset.idx)" title="Mute this error globally">${icon('eyeOff', 11)} Ignore</button>`
+      ? `<button class="copy-btn" data-idx="${i}" onclick="triageIgnoreByIdx(this.dataset.idx)" title="Mute this error signature — hides all ${matchCount} matching occurrence(s) here, and any future ones, everywhere">${icon('eyeOff', 11)} ${matchCount > 1 ? `Mute all ${matchCount}` : 'Mute'}</button>`
       : '';
     const copyBtn = `<button class="copy-btn" data-idx="${i}" onclick="triagreCopyByIdx(this.dataset.idx)" title="Copy">${icon('copy', 11)}</button>`;
     const slackBtn = ev.type === 'marker.bug'
@@ -1222,6 +1276,7 @@ function renderEventsTable(events) {
       case 'network.ws_handshake': brief = `WS HANDSHAKE ${d.status || ''} ${d.statusText || ''} — ${d.url_sanitized || ''}`; break;
       case 'network.ws_frame': brief = `WS ${d.direction === 'sent' ? '↑' : '↓'} ${d.size ?? ''}B — ${d.url_sanitized || ''}`; break;
       case 'network.ws_error': brief = `WS ERROR: ${d.errorMessage || ''} — ${d.url_sanitized || ''}`; break;
+      case 'network.ws_tail': brief = `WS TAIL: recovered ${d.frames?.length || 0} frame(s) leading up to ${d.reason || 'event'} — ${d.url_sanitized || ''}`; break;
       case 'network.ws_close': brief = `WS CLOSE ${d.frames_sent || 0}↑/${d.frames_received || 0}↓ frames — ${d.url_sanitized || ''}`; break;
       case 'console.warn': brief = `WARN: ${d.message || d.text || ''}`; break;
       case 'console.error': brief = `ERROR: ${d.message || d.text || ''}`; break;
@@ -1264,7 +1319,157 @@ function renderEventsTable(events) {
   }).join('');
 }
 
-// ── Input Track ───────────────────────────────────────────────────────────────
+// ── WebSocket Connections ───────────────────────────────────────────────────────
+// Groups the flat network.ws_* event stream by request_id into one row per
+// connection (open→close), with an expandable frame timeline — the flat
+// event list makes reconstructing "what did this one socket say over its
+// lifetime" a manual scan; this view does that grouping for you.
+const WS_EVENT_TYPES = [
+  'network.ws_open', 'network.ws_handshake', 'network.ws_frame',
+  'network.ws_error', 'network.ws_tail', 'network.ws_close',
+];
+
+function buildWsConnections(events) {
+  const conns = new Map(); // request_id → connection
+  const order = [];
+
+  for (const ev of events) {
+    const d = ev.data || {};
+    const reqId = d.request_id;
+    if (!reqId) continue;
+
+    let conn = conns.get(reqId);
+    if (!conn) {
+      conn = {
+        requestId: reqId,
+        url: d.url_full || d.url_sanitized || 'unknown',
+        openTs: ev.ts_epoch_ms,
+        closeTs: null,
+        status: 'open',
+        framesSent: 0,
+        framesReceived: 0,
+        bytesSent: 0,
+        bytesReceived: 0,
+        hasError: false,
+        timeline: [],
+      };
+      conns.set(reqId, conn);
+      order.push(reqId);
+    }
+
+    conn.timeline.push(ev);
+    if (d.url_sanitized || d.url_full) conn.url = d.url_full || d.url_sanitized;
+
+    if (ev.type === 'network.ws_error') conn.hasError = true;
+    if (ev.type === 'network.ws_close') {
+      conn.status = conn.hasError ? 'error' : 'closed';
+      conn.closeTs = ev.ts_epoch_ms;
+      conn.framesSent = d.frames_sent || 0;
+      conn.framesReceived = d.frames_received || 0;
+      conn.bytesSent = d.bytes_sent || 0;
+      conn.bytesReceived = d.bytes_received || 0;
+    }
+  }
+
+  // Most-recent-first, like the rest of the dashboard's event views
+  return order.reverse().map(id => conns.get(id));
+}
+
+async function loadWsConnections() {
+  if (!currentSessionId) return;
+  const listEl = document.getElementById('ws-conn-list');
+  listEl.innerHTML = '<div class="loading-row"><span class="spinner"></span> Loading…</div>';
+
+  const params = new URLSearchParams({ limit: 5000, types: WS_EVENT_TYPES.join(',') });
+  const res = await fetch(`${API}/sessions/${currentSessionId}/events?${params}`);
+  const { events: rawEvents } = await res.json();
+  const events = normalizeEventList(rawEvents);
+  allWsConnectionsCache = buildWsConnections(events);
+
+  const errorCount = allWsConnectionsCache.filter(c => c.hasError).length;
+  const badge = document.getElementById('tab-ws-badge');
+  if (errorCount > 0) { badge.textContent = errorCount; badge.style.display = ''; }
+  else badge.style.display = 'none';
+
+  renderWsConnections(allWsConnectionsCache);
+}
+
+function filterWsBy(mode) {
+  wsFilter = mode;
+  document.getElementById('ws-filter-errors').style.display = mode === 'errors' ? 'none' : '';
+  document.getElementById('ws-filter-all').style.display = mode === 'all' ? 'none' : '';
+  filterWsConnections();
+}
+
+function filterWsConnections() {
+  const q = (document.getElementById('ws-search').value || '').toLowerCase();
+  let conns = allWsConnectionsCache;
+  if (wsFilter === 'errors') conns = conns.filter(c => c.hasError);
+  if (q) conns = conns.filter(c => c.url.toLowerCase().includes(q));
+  renderWsConnections(conns);
+}
+
+function wsFrameRowHtml(ev) {
+  const d = ev.data || {};
+  const ts = formatTs(ev.ts_epoch_ms, sessionStartMs);
+  switch (ev.type) {
+    case 'network.ws_open':
+      return `<div class="ws-frame-row">${ts} — OPEN</div>`;
+    case 'network.ws_handshake':
+      return `<div class="ws-frame-row">${ts} — HANDSHAKE ${esc(String(d.status || ''))} ${esc(d.statusText || '')}</div>`;
+    case 'network.ws_frame': {
+      const arrow = d.direction === 'sent' ? '↑' : '↓';
+      const omitted = !d.payload || d.payload.startsWith('[omitted');
+      const payloadHtml = omitted
+        ? (d.payload ? ` — <span style="opacity:0.7">${esc(d.payload)}</span>` : '')
+        : ` ${makePayloadAccordion('Payload', d.payload, false)}`;
+      return `<div class="ws-frame-row">${ts} — ${arrow} ${d.size ?? ''}B${payloadHtml}</div>`;
+    }
+    case 'network.ws_error':
+      return `<div class="ws-frame-row is-error">${ts} — ERROR: ${esc(d.errorMessage || '')}</div>`;
+    case 'network.ws_tail': {
+      const frames = (d.frames || []).map(f => {
+        const arrow = f.direction === 'sent' ? '↑' : '↓';
+        return makePayloadAccordion(`Recovered frame ${arrow} (${f.size ?? '?'}B, #${f.frame_index})`, f.payload, false);
+      }).join('');
+      return `<div class="ws-frame-row is-tail">${ts} — TAIL: ${d.frames?.length || 0} frame(s) recovered before ${esc(d.reason || 'event')} (fell outside the head sample)${frames}</div>`;
+    }
+    case 'network.ws_close':
+      return `<div class="ws-frame-row">${ts} — CLOSE (${d.frames_sent || 0}↑/${d.frames_received || 0}↓ frames, ${d.bytes_sent || 0}↑/${d.bytes_received || 0}↓ bytes)</div>`;
+    default:
+      return '';
+  }
+}
+
+function renderWsConnections(conns) {
+  const listEl = document.getElementById('ws-conn-list');
+  document.getElementById('ws-total').textContent = `${conns.length} connection${conns.length !== 1 ? 's' : ''}`;
+
+  if (!conns.length) {
+    listEl.innerHTML = '<div class="empty-list">No WebSocket activity captured in this session.</div>';
+    return;
+  }
+
+  listEl.innerHTML = conns.map(conn => {
+    const duration = conn.closeTs ? `${((conn.closeTs - conn.openTs) / 1000).toFixed(1)}s` : 'still open';
+    const dotClass = conn.hasError ? 'error' : (conn.status === 'open' ? 'open' : 'closed');
+    const timelineHtml = conn.timeline.map(wsFrameRowHtml).join('');
+
+    return `
+      <details class="ws-conn-card ${conn.hasError ? 'has-error' : ''}">
+        <summary class="ws-conn-summary">
+          <span class="ws-status-dot ${dotClass}" title="${esc(conn.status)}"></span>
+          <span class="ws-conn-url">${esc(conn.url)}</span>
+          <span class="ws-conn-stat">${formatTs(conn.openTs, sessionStartMs)} · ${duration}</span>
+          <span class="ws-conn-stat">${conn.framesSent}↑/${conn.framesReceived}↓ frames</span>
+          <span class="ws-conn-stat">${conn.bytesSent}↑/${conn.bytesReceived}↓ bytes</span>
+        </summary>
+        <div class="ws-conn-body">${timelineHtml}</div>
+      </details>`;
+  }).join('');
+}
+
+// ── User Actions ──────────────────────────────────────────────────────────────
 async function loadInputTrack() {
   if (!currentSessionId) return;
   const tbody = document.getElementById('input-tbody');
@@ -1654,7 +1859,7 @@ window.seekVideo = function (epochMs) {
 // ── Tabs ──────────────────────────────────────────────────────────────────────
 function switchTab(tab) {
   currentTab = tab;
-  ['overview', 'triage', 'input', 'events', 'video', 'repro'].forEach(t => {
+  ['overview', 'triage', 'video', 'repro', 'input', 'events', 'ws'].forEach(t => {
     document.getElementById(`tab-${t}`)?.classList.toggle('active', t === tab);
     document.getElementById(`panel-${t}`)?.classList.toggle('active', t === tab);
   });
@@ -1664,6 +1869,7 @@ function switchTab(tab) {
   else if (tab === 'events') loadEvents();
   else if (tab === 'video') loadVideo();
   else if (tab === 'repro') loadReproSteps();
+  else if (tab === 'ws') loadWsConnections();
 }
 
 // ── Shareable Deep Links ─────────────────────────────────────────────────────
@@ -1814,21 +2020,29 @@ async function fetchSlackConfig() {
   return _slackConfigCache;
 }
 
-// ── Integrations tab: hub grid + per-integration detail (Slack today) ─────────
+// ── Top-level nav: Sessions | Bug Manager | Integrations ───────────────────────
+// Integrations owns Slack *connection config* (bot token, which channels/
+// threads exist) — Bug Manager owns *browsing/managing the bugs* reported
+// into those channels/threads. They used to be one combined "Integrations"
+// hub; kept as two separate main-content views (settings-view / bugmanager-
+// view) so neither is buried inside the other.
 function switchSidebar(tab) {
-  document.getElementById('sidebar-sessions').style.display = tab === 'sessions' ? 'flex' : 'none';
-  document.getElementById('nav-btn-sessions').style.borderBottomColor = tab === 'sessions' ? 'var(--accent)' : 'transparent';
-  document.getElementById('nav-btn-sessions').style.color = tab === 'sessions' ? 'var(--accent)' : 'var(--text-muted)';
-  document.getElementById('nav-btn-settings').style.borderBottomColor = tab === 'settings' ? 'var(--accent)' : 'transparent';
-  document.getElementById('nav-btn-settings').style.color = tab === 'settings' ? 'var(--accent)' : 'var(--text-muted)';
+  ['sessions', 'bugs', 'settings'].forEach(t => {
+    document.getElementById(`sidebar-${t}`).style.display = t === tab ? 'flex' : 'none';
+    const btn = document.getElementById(`nav-btn-${t}`);
+    btn.style.borderBottomColor = t === tab ? 'var(--accent)' : 'transparent';
+    btn.style.color = t === tab ? 'var(--accent)' : 'var(--text-muted)';
+  });
 
-  if (tab === 'settings') {
+  document.getElementById('settings-view').style.display = tab === 'settings' ? 'flex' : 'none';
+  document.getElementById('bugmanager-view').style.display = tab === 'bugs' ? 'flex' : 'none';
+
+  if (tab === 'settings' || tab === 'bugs') {
     document.getElementById('empty-state').style.display = 'none';
     document.getElementById('session-detail').style.display = 'none';
-    document.getElementById('settings-view').style.display = 'flex';
-    showIntegrationsHub();
+    if (tab === 'settings') showIntegrationsHub();
+    else showBugManagerHub();
   } else {
-    document.getElementById('settings-view').style.display = 'none';
     if (currentSessionId) {
       document.getElementById('session-detail').style.display = 'flex';
     } else {
@@ -1838,95 +2052,170 @@ function switchSidebar(tab) {
   }
 }
 
-// Only Slack exists today, but this stays a list so a future integration is
-// just another entry here rather than a structural change.
-const INTEGRATIONS = [
-  { id: 'slack', name: 'Slack', iconName: 'slack', isConfigured: (cfg) => cfg.configured },
-];
+// One bot token per user/team ("universal" — set once, applies to every
+// channel), so it lives in its own small modal instead of inside the
+// channel-management page. Both sidebars list channels (Integrations for
+// connection config, Bug Manager as a read-only picker into bug data) —
+// same list-then-detail pattern as Sessions, applied deeper still in Bug
+// Manager so each channel drills into its threads, and each thread drills
+// into the bugs reported into it — mirroring how Slack itself organizes a
+// channel into threads.
+let _selectedChannelId = null;
+let _selectedThreadId = null;
+let _selectedBugId = null;
 
 async function showIntegrationsHub() {
-  document.getElementById('integrations-hub-view').style.display = 'block';
-  document.getElementById('integrations-slack-detail').style.display = 'none';
+  _selectedChannelId = null;
+  document.getElementById('integrations-hub-view').style.display = 'flex';
+  document.getElementById('integrations-channel-detail').style.display = 'none';
+  await renderIntegrationsSidebarList();
+}
+
+// ── Bug Manager: same channel data as Integrations, but a read-only
+// picker into bugs rather than connection config. ──────────────────────────
+async function showBugManagerHub() {
+  _selectedChannelId = null;
+  _selectedThreadId = null;
+  _selectedBugId = null;
+  document.getElementById('bugmanager-hub-view').style.display = 'flex';
+  document.getElementById('bm-channel-detail').style.display = 'none';
+  document.getElementById('thread-bug-list-view').style.display = 'none';
+  document.getElementById('bug-detail').style.display = 'none';
+  await renderBugManagerSidebarList();
+}
+
+async function renderBugManagerSidebarList() {
   const cfg = await fetchSlackConfig();
-  const grid = document.getElementById('integrations-grid');
-  grid.innerHTML = INTEGRATIONS.map(i => {
-    const configured = i.isConfigured(cfg);
+  const channels = cfg.savedChannels || [];
+  const status = document.getElementById('bugmanager-status-filter')?.value || '';
+
+  const res = await fetch(`${API}/bugs${status ? `?status=${encodeURIComponent(status)}` : ''}`);
+  const data = await res.json();
+  const allBugs = data.bugs || [];
+
+  document.getElementById('bugmanager-count').textContent =
+    `${allBugs.length} bug${allBugs.length !== 1 ? 's' : ''}`;
+
+  const list = document.getElementById('bugmanager-channel-list');
+  if (!channels.length) {
+    list.innerHTML = '<div class="field-sub" style="padding:12px 16px;">No channels connected yet — add one from the Integrations tab.</div>';
+    return;
+  }
+  list.innerHTML = channels.map(c => {
+    const isActive = c.id === _selectedChannelId;
+    const bugCount = allBugs.filter(b => b.channel === c.id).length;
     return `
-      <div class="integration-card" onclick="openIntegration('${i.id}')">
-        <div class="integration-card-icon">${icon(i.iconName, 18)}</div>
-        <div class="integration-card-name">${esc(i.name)}</div>
-        <div class="integration-card-status ${configured ? 'is-configured' : 'is-unconfigured'}">
-          ${configured ? icon('checkCircle', 12) : icon('infoCircle', 12)}
-          ${configured ? 'Configured' : 'Not set up'}
+      <div class="session-item ${isActive ? 'active' : ''}" onclick="selectBugManagerChannel('${esc(c.id)}')">
+        <div class="session-item-top" style="align-items:center; gap:8px;">
+          <div class="session-title" style="flex:1;">${esc(c.name)}</div>
+          ${bugCount ? `<span class="badge badge-warn">${bugCount}</span>` : ''}
+        </div>
+        <div class="session-meta">
+          <span class="mono" style="font-family:'JetBrains Mono',monospace;">${esc(c.id)}</span>
         </div>
       </div>`;
   }).join('');
 }
 
-function openIntegration(id) {
-  if (id === 'slack') {
-    document.getElementById('integrations-hub-view').style.display = 'none';
-    document.getElementById('integrations-slack-detail').style.display = 'block';
-    loadSlackSettingsPanel();
+function selectBugManagerChannel(channelId) {
+  _selectedChannelId = channelId;
+  _selectedThreadId = null;
+  _selectedBugId = null;
+  renderBugManagerSidebarList();
+  document.getElementById('bugmanager-hub-view').style.display = 'none';
+  document.getElementById('thread-bug-list-view').style.display = 'none';
+  document.getElementById('bug-detail').style.display = 'none';
+  document.getElementById('bm-channel-detail').style.display = 'flex';
+  renderBugManagerChannelDetail(channelId);
+}
+
+// Level 2 (Bug Manager): a channel's threads (bug-count badges, clickable)
+// + bugs reported straight to the channel with no matching saved thread.
+async function renderBugManagerChannelDetail(channelId) {
+  const cfg = _slackConfigCache || {};
+  const channel = (cfg.savedChannels || []).find(c => c.id === channelId);
+  if (!channel) { showBugManagerHub(); return; }
+
+  document.getElementById('bm-channel-breadcrumb').innerHTML =
+    `<span class="crumb" onclick="showBugManagerHub()">Channels</span><span class="crumb-sep">›</span><span class="crumb current">${esc(channel.name)}</span>`;
+  document.getElementById('bm-channel-detail-title').textContent = channel.name;
+  document.getElementById('bm-channel-detail-id').textContent = channel.id;
+
+  const threads = (cfg.savedThreads || []).filter(t => t.channel === channelId);
+  const status = document.getElementById('bugmanager-status-filter')?.value || '';
+
+  const res = await fetch(`${API}/bugs?channel=${encodeURIComponent(channelId)}${status ? `&status=${encodeURIComponent(status)}` : ''}`);
+  const data = await res.json();
+  const channelBugs = data.bugs || [];
+  const threadLinks = new Set(threads.map(t => t.link));
+
+  const list = document.getElementById('bm-channel-threads-list');
+  list.innerHTML = threads.length
+    ? threads.map(t => {
+        const bugCount = channelBugs.filter(b => b.thread_link === t.link).length;
+        return `
+        <div class="thread-row" onclick="selectThread('${esc(channelId)}', '${esc(t.id)}')">
+          <span class="thread-row-name">${esc(t.name)}</span>
+          ${bugCount ? `<span class="badge badge-warn">${bugCount} bug${bugCount !== 1 ? 's' : ''}</span>` : '<span class="field-sub">No bugs yet</span>'}
+        </div>`;
+      }).join('')
+    : '<div class="field-sub">No saved threads in this channel yet — add one from the Integrations tab.</div>';
+
+  const channelLevelBugs = channelBugs.filter(b => !b.thread_link || !threadLinks.has(b.thread_link));
+  const bugsWrap = document.getElementById('bm-channel-level-bugs-wrap');
+  const bugsList = document.getElementById('bm-channel-level-bugs-list');
+  if (channelLevelBugs.length) {
+    bugsWrap.style.display = '';
+    bugsList.innerHTML = channelLevelBugs.map(renderBugRow).join('');
+  } else {
+    bugsWrap.style.display = 'none';
   }
 }
 
-async function loadSlackSettingsPanel() {
+async function renderIntegrationsSidebarList() {
   const cfg = await fetchSlackConfig();
-  const tokenInput = document.getElementById('slack-bot-token');
-  tokenInput.value = '';
-  tokenInput.placeholder = cfg.configured ? 'Already set — leave blank to keep it' : 'xoxb-…';
-  document.getElementById('slack-token-status').textContent = cfg.configured
-    ? '✓ A Bot Token is configured.'
-    : 'Not configured yet — paste a Bot Token (xoxb-…) from your Slack App.';
-  renderSlackChannelsList();
-}
-
-// Each saved channel renders as a card containing its own nested thread list
-// + a "paste a link" mini-form, so threads never need a separate flat list or
-// re-pasting a channel ID — the thread's channel is inferred from the link.
-function renderSlackChannelsList() {
-  const cfg = _slackConfigCache || {};
-  const list = document.getElementById('slack-channels-list');
   const channels = cfg.savedChannels || [];
   const threads = cfg.savedThreads || [];
 
+  document.getElementById('integrations-count').textContent =
+    `${channels.length} channel${channels.length !== 1 ? 's' : ''}`;
+
+  // Bot Token strip — always visible above the channel list.
+  document.getElementById('slack-token-strip').innerHTML = `
+    <div style="display:flex; align-items:center; gap:8px; padding:10px 16px; border-bottom:1px solid var(--border); font-size:12px; flex-shrink:0;">
+      <span style="color:var(--text-dim); display:flex;">${icon('slack', 14)}</span>
+      <span style="flex:1; font-weight:600;">Bot Token</span>
+      <span class="badge ${cfg.configured ? 'badge-success' : 'badge-warn'}">${cfg.configured ? '✓ Configured' : 'Not set'}</span>
+      <button class="icon-btn" onclick="openSlackTokenModal()" title="Edit Bot Token">${icon('edit', 13)}</button>
+    </div>`;
+
+  const list = document.getElementById('integrations-list');
   if (!channels.length) {
-    list.innerHTML = '<div class="field-sub">No saved channels yet — add one below.</div>';
+    list.innerHTML = '<div class="field-sub" style="padding:12px 16px;">No channels yet — click "+ New Channel" above to add one.</div>';
   } else {
     list.innerHTML = channels.map(c => {
       const isDefault = cfg.defaultChannel === c.id;
-      const channelThreads = threads.filter(t => t.channel === c.id);
-      const threadRows = channelThreads.map(t => `
-        <div class="thread-row">
-          <span class="thread-row-name">${esc(t.name)}</span>
-          <button class="saved-row-del" onclick="deleteSlackThread('${esc(t.id)}')" title="Remove">${icon('x', 12)}</button>
-        </div>`).join('');
+      const isActive = c.id === _selectedChannelId;
+      const threadCount = threads.filter(t => t.channel === c.id).length;
       return `
-      <div class="channel-card">
-        <div class="saved-row">
-          <button class="saved-row-star ${isDefault ? 'is-default' : ''}" onclick="setDefaultSlackChannel('${esc(c.id)}')" title="${isDefault ? 'Default channel' : 'Set as default'}">${icon('star', 14)}</button>
-          <div style="min-width:0;">
-            <div class="saved-row-name">${esc(c.name)}</div>
-            <div class="saved-row-sub">${esc(c.id)}</div>
-          </div>
-          <button class="saved-row-del" onclick="duplicateSlackChannel('${esc(c.id)}')" title="Duplicate — start a new channel entry with this name/ID pre-filled">${icon('copy', 13)}</button>
-          <button class="saved-row-del" style="margin-left:0;" onclick="deleteSlackChannel('${esc(c.id)}')" title="Remove">${icon('x', 13)}</button>
+      <div class="session-item ${isActive ? 'active' : ''}" onclick="selectChannel('${esc(c.id)}')">
+        <div class="session-item-top" style="align-items:center; gap:8px;">
+          <button class="saved-row-star ${isDefault ? 'is-default' : ''}" onclick="event.stopPropagation(); setDefaultSlackChannel('${esc(c.id)}')" title="${isDefault ? 'Default channel' : 'Set as default'}">${icon('star', 13)}</button>
+          <div class="session-title" style="flex:1;">${esc(c.name)}</div>
+          <button class="saved-row-del" onclick="event.stopPropagation(); duplicateSlackChannel('${esc(c.id)}')" title="Duplicate">${icon('copy', 12)}</button>
+          <button class="saved-row-del" style="margin-left:0;" onclick="event.stopPropagation(); deleteSlackChannel('${esc(c.id)}')" title="Remove">${icon('x', 12)}</button>
         </div>
-        <div class="channel-threads">
-          ${threadRows || '<div class="field-sub">No saved threads in this channel yet.</div>'}
-          <div class="thread-add-row">
-            <input class="field-input" id="thread-link-${esc(c.id)}" placeholder="Paste Slack message link…" />
-            <input class="field-input" id="thread-name-${esc(c.id)}" placeholder="Label (optional)" style="flex:0 0 120px;" />
-            <button class="btn btn-ghost" onclick="confirmAddThreadForChannel('${esc(c.id)}')">+ Add thread</button>
-          </div>
+        <div class="session-meta">
+          <span class="mono" style="font-family:'JetBrains Mono',monospace;">${esc(c.id)}</span>
+          <span>${threadCount} thread${threadCount !== 1 ? 's' : ''}</span>
         </div>
       </div>`;
     }).join('');
   }
 
   // Threads whose channel isn't (or no longer is) in the saved-channels list
-  // still need to be visible somewhere rather than silently vanishing.
+  // still need to be visible somewhere rather than silently vanishing —
+  // shown on the landing state, since there's no channel to nest them under.
   const savedChannelIds = new Set(channels.map(c => c.id));
   const orphanThreads = threads.filter(t => !savedChannelIds.has(t.channel));
   const orphanWrap = document.getElementById('slack-orphan-threads-wrap');
@@ -1946,25 +2235,51 @@ function renderSlackChannelsList() {
   }
 }
 
-// "Duplicate" doesn't create a second row sharing the same Slack channel ID
-// (the ID is the natural unique key) — it pre-fills the add-channel form so
-// you can quickly spin up a similarly-named entry pointed at a different
-// channel/ID instead of retyping everything from scratch.
-function duplicateSlackChannel(channelId) {
+function selectChannel(channelId) {
+  _selectedChannelId = channelId;
+  renderIntegrationsSidebarList();
+  document.getElementById('integrations-hub-view').style.display = 'none';
+  document.getElementById('integrations-channel-detail').style.display = 'flex';
+  renderChannelDetail(channelId);
+}
+
+// Level 2 (Integrations): a channel's threads — connection config only, so
+// this is deliberately just names + delete, not clickable into bugs. Bug
+// counts/browsing live in the Bug Manager tab's parallel
+// renderBugManagerChannelDetail(), which fetches /bugs; this one doesn't
+// need to.
+function renderChannelDetail(channelId) {
   const cfg = _slackConfigCache || {};
-  const c = (cfg.savedChannels || []).find(ch => ch.id === channelId);
-  if (!c) return;
-  document.getElementById('slack-new-channel-id').value = c.id;
-  document.getElementById('slack-new-channel-name').value = `${c.name} (copy)`;
-  const idInput = document.getElementById('slack-new-channel-id');
-  idInput.focus();
-  idInput.select();
-  showToast('Edit the Channel ID (and name if you like), then click Add', 'info');
+  const channel = (cfg.savedChannels || []).find(c => c.id === channelId);
+  if (!channel) { showIntegrationsHub(); return; }
+
+  document.getElementById('channel-breadcrumb').innerHTML =
+    `<span class="crumb" onclick="showIntegrationsHub()">Channels</span><span class="crumb-sep">›</span><span class="crumb current">${esc(channel.name)}</span>`;
+  document.getElementById('channel-detail-title').textContent = channel.name;
+  document.getElementById('channel-detail-id').textContent = channel.id;
+
+  const threads = (cfg.savedThreads || []).filter(t => t.channel === channelId);
+
+  const list = document.getElementById('channel-threads-list');
+  list.innerHTML = threads.length
+    ? threads.map(t => `
+        <div class="thread-row">
+          <span class="thread-row-name">${esc(t.name)}</span>
+          <button class="saved-row-del" style="margin-left:0;" onclick="event.stopPropagation(); deleteSlackThread('${esc(t.id)}')" title="Remove">${icon('x', 12)}</button>
+        </div>`).join('')
+    : '<div class="field-sub">No saved threads in this channel yet — add one above.</div>';
+
+  document.getElementById('channel-thread-link').value = '';
+  document.getElementById('channel-thread-name').value = '';
+}
+
+function confirmAddThreadForSelectedChannel() {
+  if (_selectedChannelId) confirmAddThreadForChannel(_selectedChannelId);
 }
 
 async function confirmAddThreadForChannel(channelId) {
-  const linkInput = document.getElementById(`thread-link-${channelId}`);
-  const nameInput = document.getElementById(`thread-name-${channelId}`);
+  const linkInput = document.getElementById('channel-thread-link');
+  const nameInput = document.getElementById('channel-thread-name');
   const link = linkInput.value.trim();
   const name = nameInput.value.trim();
   if (!link) { showToast('Paste a Slack message link first', 'error'); return; }
@@ -1978,14 +2293,39 @@ async function confirmAddThreadForChannel(channelId) {
     const data = await res.json();
     if (!data.ok) throw new Error(data.message || 'Failed to save thread');
     _slackConfigCache.savedThreads = data.savedThreads;
-    renderSlackChannelsList();
+    renderChannelDetail(channelId);
+    renderIntegrationsSidebarList();
     showToast('Thread saved', 'success');
   } catch (e) {
     showToast(e.message || 'Failed to save thread — check the link', 'error');
   }
 }
 
-async function addSlackChannel() {
+// "Duplicate" doesn't create a second row sharing the same Slack channel ID
+// (the ID is the natural unique key) — it pre-fills the New Channel modal so
+// you can quickly spin up a similarly-named entry pointed at a different
+// channel/ID instead of retyping everything from scratch.
+function duplicateSlackChannel(channelId) {
+  const cfg = _slackConfigCache || {};
+  const c = (cfg.savedChannels || []).find(ch => ch.id === channelId);
+  if (!c) return;
+  openNewChannelModal();
+  document.getElementById('slack-new-channel-id').value = c.id;
+  document.getElementById('slack-new-channel-name').value = `${c.name} (copy)`;
+  const idInput = document.getElementById('slack-new-channel-id');
+  idInput.focus();
+  idInput.select();
+  showToast('Edit the Channel ID (and name if you like), then click Create', 'info');
+}
+
+function openNewChannelModal() {
+  document.getElementById('slack-new-channel-id').value = '';
+  document.getElementById('slack-new-channel-name').value = '';
+  openModal('new-channel-modal');
+  document.getElementById('slack-new-channel-name').focus();
+}
+
+async function confirmNewChannel() {
   const id = document.getElementById('slack-new-channel-id').value.trim();
   const name = document.getElementById('slack-new-channel-name').value.trim();
   if (!id) { showToast('Enter a channel ID', 'error'); return; }
@@ -1999,10 +2339,9 @@ async function addSlackChannel() {
     if (!data.ok) throw new Error();
     _slackConfigCache.savedChannels = data.savedChannels;
     _slackConfigCache.defaultChannel = data.defaultChannel;
-    document.getElementById('slack-new-channel-id').value = '';
-    document.getElementById('slack-new-channel-name').value = '';
-    renderSlackChannelsList();
-    showToast('Channel saved', 'success');
+    closeModal('new-channel-modal');
+    renderIntegrationsSidebarList();
+    showToast('Channel created', 'success');
   } catch {
     showToast('Failed to save channel', 'error');
   }
@@ -2015,7 +2354,8 @@ async function deleteSlackChannel(id) {
     if (!data.ok) throw new Error();
     _slackConfigCache.savedChannels = data.savedChannels;
     _slackConfigCache.defaultChannel = data.defaultChannel;
-    renderSlackChannelsList();
+    if (_selectedChannelId === id) showIntegrationsHub();
+    else renderIntegrationsSidebarList();
   } catch {
     showToast('Failed to remove channel', 'error');
   }
@@ -2027,7 +2367,7 @@ async function setDefaultSlackChannel(id) {
     const data = await res.json();
     if (!data.ok) throw new Error();
     _slackConfigCache.defaultChannel = data.defaultChannel;
-    renderSlackChannelsList();
+    renderIntegrationsSidebarList();
   } catch {
     showToast('Failed to set default channel', 'error');
   }
@@ -2039,10 +2379,23 @@ async function deleteSlackThread(id) {
     const data = await res.json();
     if (!data.ok) throw new Error();
     _slackConfigCache.savedThreads = data.savedThreads;
-    renderSlackChannelsList();
+    if (_selectedChannelId) renderChannelDetail(_selectedChannelId);
+    renderIntegrationsSidebarList();
   } catch {
     showToast('Failed to remove thread', 'error');
   }
+}
+
+function openSlackTokenModal() {
+  const cfg = _slackConfigCache || {};
+  const tokenInput = document.getElementById('slack-bot-token');
+  tokenInput.value = '';
+  tokenInput.placeholder = cfg.configured ? 'Already set — leave blank to keep it' : 'xoxb-…';
+  document.getElementById('slack-token-status').textContent = cfg.configured
+    ? '✓ A Bot Token is configured.'
+    : 'Not configured yet — paste a Bot Token (xoxb-…) from your Slack App.';
+  openModal('slack-token-modal');
+  tokenInput.focus();
 }
 
 async function saveSlackSettings() {
@@ -2061,11 +2414,280 @@ async function saveSlackSettings() {
     if (!data.ok) throw new Error();
     _slackConfigCache = data;
     showToast('Slack token saved', 'success');
-    loadSlackSettingsPanel();
+    closeModal('slack-token-modal');
+    renderIntegrationsSidebarList();
   } catch {
     showToast('Failed to save Slack token', 'error');
   }
   btn.disabled = false;
+}
+
+// ── Bug Tracker ─────────────────────────────────────────────────────────────
+// Reporting to Slack (session report, bug marker, screenshot) is otherwise
+// fire-and-forget — the server auto-creates a bug record on every successful
+// send (see /integrations/slack/send[-screenshot]). Bugs are organized the
+// same way Slack itself organizes them: under the channel, and within that,
+// under the specific thread they were reported into — Channel > Thread >
+// Bugs > bug detail, all inside Integrations, rather than a separate flat
+// "Bugs" tab (levels 2-4 of the same drill-down `selectChannel()` starts).
+const BUG_STATUS_META = {
+  open: { label: 'Open', badgeClass: 'badge-warn' },
+  fixed: { label: 'Fixed', badgeClass: 'badge-success' },
+  next_release: { label: 'Next Release', badgeClass: 'badge-info' },
+  wont_fix: { label: "Won't Fix", badgeClass: 'badge' },
+};
+const BUG_SOURCE_LABELS = {
+  session_report: 'Session Report',
+  bug_marker: 'Bug Marker',
+  screenshot: 'Screenshot',
+  manual: 'Manual',
+};
+
+function renderBugRow(bug) {
+  const meta = BUG_STATUS_META[bug.status] || BUG_STATUS_META.open;
+  return `
+    <div class="saved-row" style="cursor:pointer;" onclick="selectBug('${esc(bug.id)}')">
+      <div style="min-width:0; flex:1;">
+        <div class="saved-row-name">${esc(bug.description.slice(0, 90))}</div>
+      </div>
+      <span class="badge ${meta.badgeClass}">${meta.label}</span>
+    </div>`;
+}
+
+// Level 3 (Bug Manager): bugs reported into one specific thread.
+async function selectThread(channelId, threadId) {
+  _selectedChannelId = channelId;
+  _selectedThreadId = threadId;
+  _selectedBugId = null;
+  document.getElementById('bugmanager-hub-view').style.display = 'none';
+  document.getElementById('bm-channel-detail').style.display = 'none';
+  document.getElementById('bug-detail').style.display = 'none';
+  document.getElementById('thread-bug-list-view').style.display = 'flex';
+  await renderThreadBugList();
+}
+
+async function renderThreadBugList() {
+  const cfg = _slackConfigCache || {};
+  const channel = (cfg.savedChannels || []).find(c => c.id === _selectedChannelId);
+  const thread = (cfg.savedThreads || []).find(t => t.id === _selectedThreadId);
+  if (!channel || !thread) { showBugManagerHub(); return; }
+
+  document.getElementById('thread-breadcrumb').innerHTML =
+    `<span class="crumb" onclick="showBugManagerHub()">Channels</span><span class="crumb-sep">›</span>` +
+    `<span class="crumb" onclick="selectBugManagerChannel('${esc(channel.id)}')">${esc(channel.name)}</span><span class="crumb-sep">›</span>` +
+    `<span class="crumb current">${esc(thread.name)}</span>`;
+  document.getElementById('thread-detail-title').textContent = thread.name;
+
+  const res = await fetch(`${API}/bugs?channel=${encodeURIComponent(channel.id)}`);
+  const data = await res.json();
+  const bugs = (data.bugs || []).filter(b => b.thread_link === thread.link);
+
+  document.getElementById('thread-bugs-list').innerHTML = bugs.length
+    ? bugs.map(renderBugRow).join('')
+    : '<div class="field-sub">No bugs reported into this thread yet.</div>';
+}
+
+// Level 4 (Bug Manager): a single bug's full detail — reachable from either
+// the channel-level bugs list or a thread's bug list, so the breadcrumb is
+// derived from the bug's own channel/thread_link rather than assumed
+// navigation history.
+async function selectBug(id) {
+  _selectedBugId = id;
+  document.getElementById('bugmanager-hub-view').style.display = 'none';
+  document.getElementById('bm-channel-detail').style.display = 'none';
+  document.getElementById('thread-bug-list-view').style.display = 'none';
+  document.getElementById('bug-detail').style.display = 'flex';
+
+  const res = await fetch(`${API}/bugs/${encodeURIComponent(id)}`);
+  const data = await res.json();
+  if (!data.ok) { showBugManagerHub(); return; }
+  renderBugDetail(data.bug);
+}
+
+let _currentBugDetail = null;
+
+function renderBugDetail(bug) {
+  _currentBugDetail = bug;
+  const cfg = _slackConfigCache || {};
+  const channel = (cfg.savedChannels || []).find(c => c.id === bug.channel);
+  const thread = bug.thread_link ? (cfg.savedThreads || []).find(t => t.link === bug.thread_link) : null;
+
+  let crumbHtml = `<span class="crumb" onclick="showBugManagerHub()">Channels</span>`;
+  if (channel) {
+    crumbHtml += `<span class="crumb-sep">›</span><span class="crumb" onclick="selectBugManagerChannel('${esc(channel.id)}')">${esc(channel.name)}</span>`;
+    if (thread) {
+      crumbHtml += `<span class="crumb-sep">›</span><span class="crumb" onclick="selectThread('${esc(channel.id)}', '${esc(thread.id)}')">${esc(thread.name)}</span>`;
+    }
+  }
+  crumbHtml += `<span class="crumb-sep">›</span><span class="crumb current">Bug</span>`;
+  document.getElementById('bug-breadcrumb').innerHTML = crumbHtml;
+
+  // description is the note the reporter actually wrote — kept separate from
+  // the read-only page/URL/health context below, instead of the two being
+  // concatenated into one wall of text (see confirmSendToSlack()).
+  document.getElementById('bug-detail-description').textContent = bug.description;
+
+  const contextWrap = document.getElementById('bug-detail-context-wrap');
+  if (bug.context) {
+    contextWrap.style.display = '';
+    document.getElementById('bug-detail-context').textContent = bug.context;
+  } else {
+    contextWrap.style.display = 'none';
+  }
+
+  const metaParts = [BUG_SOURCE_LABELS[bug.source] || bug.source, formatDate(bug.created_at)];
+  let metaHtml = esc(metaParts.join(' · '));
+  if (bug.session_id) {
+    metaHtml += ` · <a href="${esc(sessionDeepLink(bug.session_id, 'overview'))}" style="color:var(--accent);">View session</a>` +
+      ` · <button class="copy-btn" style="padding:1px 6px;" onclick="copyEventText('${esc(sessionDeepLink(bug.session_id, 'overview'))}')" title="Copy a shareable link to the session">${icon('copy', 10)} Copy session link</button>`;
+  }
+  if (bug.permalink) {
+    metaHtml += ` · <a href="${esc(bug.permalink)}" target="_blank" rel="noopener" style="color:var(--accent);">View in Slack</a>`;
+  }
+  document.getElementById('bug-detail-meta').innerHTML = metaHtml;
+
+  const pills = document.getElementById('bug-status-pills');
+  pills.innerHTML = Object.entries(BUG_STATUS_META).map(([status, meta]) => `
+    <button class="bug-status-pill status-${status} ${bug.status === status ? 'active' : ''}" onclick="openBugStatusModal('${status}')" ${bug.status === status ? 'disabled' : ''}>${meta.label}</button>
+  `).join('');
+
+  // Unified timeline: plain comments and status transitions share one list,
+  // newest last, so a status change and the reason for it read together
+  // instead of living in two disconnected places.
+  const notesList = document.getElementById('bug-notes-list');
+  notesList.innerHTML = bug.notes.length
+    ? bug.notes.map(n => {
+        if (n.type === 'status_change') {
+          const fromMeta = BUG_STATUS_META[n.from] || { label: n.from };
+          const toMeta = BUG_STATUS_META[n.to] || { label: n.to };
+          return `
+          <div class="bug-note-item bug-note-status">
+            <div class="bug-note-ts">${formatDate(n.ts)}</div>
+            <div class="bug-note-status-line">Status: ${esc(fromMeta.label)} → <strong>${esc(toMeta.label)}</strong></div>
+            ${n.text ? `<div>${esc(n.text)}</div>` : ''}
+          </div>`;
+        }
+        return `
+      <div class="bug-note-item">
+        <div class="bug-note-ts">${formatDate(n.ts)}</div>
+        <div>${esc(n.text)}</div>
+      </div>`;
+      }).join('')
+    : '<div class="field-sub">No activity yet.</div>';
+
+  document.getElementById('bug-note-input').value = '';
+}
+
+// Every status change goes through this small modal instead of firing the
+// PATCH immediately on click — gives the reporter a place to say *why* it's
+// Won't Fix / Next Release / etc, without forcing one (comment is optional).
+let _pendingBugStatus = null;
+
+function openBugStatusModal(status) {
+  if (!_selectedBugId || (_currentBugDetail && _currentBugDetail.status === status)) return;
+  _pendingBugStatus = status;
+  const meta = BUG_STATUS_META[status] || { label: status };
+  document.getElementById('bug-status-comment-title').textContent = `Move to "${meta.label}"`;
+  document.getElementById('bug-status-comment-input').value = '';
+  openModal('bug-status-comment-modal');
+  document.getElementById('bug-status-comment-input').focus();
+}
+
+async function confirmBugStatusChange() {
+  if (!_selectedBugId || !_pendingBugStatus) return;
+  const comment = document.getElementById('bug-status-comment-input').value.trim();
+  try {
+    const res = await fetch(`${API}/bugs/${encodeURIComponent(_selectedBugId)}/status`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status: _pendingBugStatus, comment }),
+    });
+    const data = await res.json();
+    if (!data.ok) throw new Error();
+    closeModal('bug-status-comment-modal');
+    renderBugDetail(data.bug);
+    showToast('Status updated', 'success');
+  } catch {
+    showToast('Failed to update status', 'error');
+  }
+  _pendingBugStatus = null;
+}
+
+async function confirmAddBugNote() {
+  if (!_selectedBugId) return;
+  const input = document.getElementById('bug-note-input');
+  const text = input.value.trim();
+  if (!text) { showToast('Write a note first', 'error'); return; }
+  try {
+    const res = await fetch(`${API}/bugs/${encodeURIComponent(_selectedBugId)}/notes`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text }),
+    });
+    const data = await res.json();
+    if (!data.ok) throw new Error();
+    renderBugDetail(data.bug);
+    showToast('Note added', 'success');
+  } catch {
+    showToast('Failed to add note', 'error');
+  }
+}
+
+// Scoped to whichever thread you're currently viewing (level 3) — the
+// created bug's channel/thread_link are pre-filled from that context so it
+// immediately shows up in the right place instead of needing a separate
+// "assign to thread" step.
+function openNewBugModal() {
+  document.getElementById('new-bug-description').value = '';
+  openModal('new-bug-modal');
+  document.getElementById('new-bug-description').focus();
+}
+
+async function confirmNewBug() {
+  const description = document.getElementById('new-bug-description').value.trim();
+  if (!description) { showToast('Enter a description', 'error'); return; }
+  const cfg = _slackConfigCache || {};
+  const channel = (cfg.savedChannels || []).find(c => c.id === _selectedChannelId);
+  const thread = (cfg.savedThreads || []).find(t => t.id === _selectedThreadId);
+  try {
+    const res = await fetch(`${API}/bugs`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        description,
+        session_id: currentSessionId || null,
+        channel: channel ? channel.id : null,
+        channel_name: channel ? channel.name : null,
+        thread_link: thread ? thread.link : null,
+      }),
+    });
+    const data = await res.json();
+    if (!data.ok) throw new Error();
+    closeModal('new-bug-modal');
+    if (_selectedThreadId) renderThreadBugList();
+    showToast('Bug created', 'success');
+  } catch {
+    showToast('Failed to create bug', 'error');
+  }
+}
+
+// Returns to wherever the bug was opened from — a thread's bug list, a
+// channel's channel-level bugs, or (fallback) the channel list — rather
+// than a single fixed "back to hub" target.
+async function confirmDeleteBug() {
+  if (!_selectedBugId) return;
+  if (!confirm('Delete this bug? This cannot be undone.')) return;
+  try {
+    const res = await fetch(`${API}/bugs/${encodeURIComponent(_selectedBugId)}`, { method: 'DELETE' });
+    const data = await res.json();
+    if (!data.ok) throw new Error();
+    showToast('Bug deleted', 'success');
+    if (_selectedThreadId) selectThread(_selectedChannelId, _selectedThreadId);
+    else if (_selectedChannelId) selectBugManagerChannel(_selectedChannelId);
+    else showBugManagerHub();
+  } catch {
+    showToast('Failed to delete bug', 'error');
+  }
 }
 
 // Plain-English session health, no jargon — used in the read-only context
@@ -2202,14 +2824,17 @@ async function confirmInlineAddThread() {
 // description). `context` is a separate, plain-language, read-only summary
 // (page/health/link) shown below with a checkbox to include or drop it — kept
 // apart from `text` so the two never get jumbled into one wall of markdown.
-async function openSlackSendModal(title, text, context) {
+let _slackSendSource = 'session_report';
+
+async function openSlackSendModal(title, text, context, source) {
   const cfg = _slackConfigCache || await fetchSlackConfig();
   if (!cfg.configured) {
-    showToast('Set up Slack first — opening Integrations', 'info');
+    showToast('Set up your Bot Token first', 'info');
     switchSidebar('settings');
-    openIntegration('slack');
+    openSlackTokenModal();
     return;
   }
+  _slackSendSource = source || 'session_report';
   document.getElementById('slack-send-title').textContent = title;
   document.getElementById('slack-send-text').value = text || '';
   _slackContextText = context || '';
@@ -2243,7 +2868,17 @@ async function confirmSendToSlack() {
     const res = await fetch(`${API}/integrations/slack/send`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ channel, threadLink, text }),
+      // `text` is the full message actually posted to Slack; `note`/`context`
+      // are the same content kept separate so the Bug Manager's tracker
+      // record gets a clean description instead of the two concatenated —
+      // see createBug()/updateBugStatus() in bugs.js.
+      body: JSON.stringify({
+        channel, threadLink, text,
+        note: noteText,
+        context: includeContext ? _slackContextText : '',
+        session_id: currentSessionId || null,
+        source: _slackSendSource,
+      }),
     });
     const data = await res.json();
     if (!data.ok) throw new Error(data.message || 'Failed to send');
@@ -2258,7 +2893,7 @@ async function confirmSendToSlack() {
 
 function reportSessionToSlack() {
   if (!currentSessionData) return;
-  openSlackSendModal('Report Session to Slack', '', buildSlackContext(currentSessionData, 'overview'));
+  openSlackSendModal('Report Session to Slack', '', buildSlackContext(currentSessionData, 'overview'), 'session_report');
 }
 
 window.sendBugMarkerToSlack = function (idx) {
@@ -2268,7 +2903,7 @@ window.sendBugMarkerToSlack = function (idx) {
   const context = currentSessionData
     ? buildSlackContext(currentSessionData, 'triage')
     : `Link: ${sessionDeepLink(currentSessionId, 'triage')}`;
-  openSlackSendModal('Send Bug to Slack', d.note || '', context);
+  openSlackSendModal('Send Bug to Slack', d.note || '', context, 'bug_marker');
 };
 
 // ── Init ──────────────────────────────────────────────────────────────────────

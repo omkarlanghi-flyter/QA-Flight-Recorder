@@ -72,6 +72,12 @@ function errorSignature(event) {
         const url = event.data.url_sanitized || event.data.url_full || 'unknown_url';
         return `network.failure::${url}`;
     }
+    if (type === 'network.ws_error') {
+        // Must mirror the client's eventSignature() in app.js exactly — this used to
+        // fall through to the generic branch below, which reads fields ws_error events
+        // don't have (message/text), collapsing every socket error into one signature.
+        return `network.ws_error::${event.data.url_sanitized || 'unknown_url'}::${event.data.errorMessage || ''}`;
+    }
     const msg = event.data.message || event.data.text || '';
     // Take first 120 chars of message as signature
     return `${type}::${msg.slice(0, 120)}`;

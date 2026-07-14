@@ -5,7 +5,10 @@
 let timerInterval = null;
 let startedAt = null;
 let captureMode = 'video'; // 'video' | 'screenshot'
+let screenshotSubMode = 'single'; // 'single' | 'multi' — only relevant when captureMode === 'screenshot'
 let currentScreenshotDataUrl = null;
+let reportingMultiCapture = false; // true while the report screen is submitting a multi-capture batch, not a single shot
+let multiCaptureShotsForReport = []; // snapshot used only to render the preview strip on the report screen
 let slackConfigForPopup = null; // cached { configured, defaultChannel, savedChannels, savedThreads }
 
 const DEFAULT_COLLECTOR_URL = 'http://127.0.0.1:17890';
@@ -88,8 +91,13 @@ function updateModeUI() {
     document.getElementById('row-toggle-logs').classList.toggle('dimmed', captureMode !== 'video');
     document.getElementById('row-toggle-bodies').classList.toggle('dimmed', captureMode !== 'video' || !document.getElementById('toggle-logs').checked);
 
+    document.getElementById('screenshot-submode-row').style.display = captureMode === 'screenshot' ? '' : 'none';
+    document.getElementById('mode-pill-single').classList.toggle('active', screenshotSubMode === 'single');
+    document.getElementById('mode-pill-multi').classList.toggle('active', screenshotSubMode === 'multi');
+
     const btnStart = document.getElementById('btn-start');
-    btnStart.textContent = captureMode === 'screenshot' ? '📸 Capture Screenshot' : '● Start Recording';
+    if (captureMode !== 'screenshot') btnStart.textContent = '● Start Recording';
+    else btnStart.textContent = screenshotSubMode === 'multi' ? '📸 Start Multi-Capture' : '📸 Capture Screenshot';
 }
 
 function selectMode(mode) {
@@ -98,16 +106,34 @@ function selectMode(mode) {
     updateModeUI();
 }
 
+function selectScreenshotSubMode(mode) {
+    screenshotSubMode = mode;
+    chrome.storage.local.set({ screenshotSubMode: mode });
+    updateModeUI();
+}
+
 // ── Load state on open ────────────────────────────────────────────────────────
 async function init() {
+    // A "Multimedia" capture in progress takes over the whole popup, regardless
+    // of which tab it was started from — reopening the popup on ANY tab (after
+    // switching tabs to capture something else) should offer to add this tab's
+    // shot to the same collection, not show the normal start screen.
+    const mcStatus = await chrome.runtime.sendMessage({ type: 'GET_MULTI_CAPTURE_STATUS' });
+    if (mcStatus && mcStatus.active) {
+        showMultiCaptureStatusScreen(mcStatus);
+        wireMultiCaptureStatusScreen();
+        return;
+    }
+
     const status = await chrome.runtime.sendMessage({ type: 'GET_STATUS' });
     setRecordingUI(status.recording, status.sessionId, status.startedAt);
 
     // Load settings
-    const settings = await chrome.storage.local.get(['liteCapture', 'captureLogs', 'captureMode']);
+    const settings = await chrome.storage.local.get(['liteCapture', 'captureLogs', 'captureMode', 'screenshotSubMode']);
     document.getElementById('toggle-bodies').checked = settings.liteCapture !== undefined ? settings.liteCapture : false;
     document.getElementById('toggle-logs').checked = settings.captureLogs !== undefined ? settings.captureLogs : true;
     captureMode = settings.captureMode === 'screenshot' ? 'screenshot' : 'video';
+    screenshotSubMode = settings.screenshotSubMode === 'multi' ? 'multi' : 'single';
     updateModeUI();
 
     // Save on toggle change
@@ -120,12 +146,116 @@ async function init() {
     });
     document.getElementById('mode-pill-video').addEventListener('click', () => selectMode('video'));
     document.getElementById('mode-pill-screenshot').addEventListener('click', () => selectMode('screenshot'));
+    document.getElementById('mode-pill-single').addEventListener('click', () => selectScreenshotSubMode('single'));
+    document.getElementById('mode-pill-multi').addEventListener('click', () => selectScreenshotSubMode('multi'));
 }
 
 // ── Start / Capture dispatcher ─────────────────────────────────────────────────
 function onStartClick() {
-    if (captureMode === 'screenshot') captureScreenshot();
-    else startRecording();
+    if (captureMode === 'screenshot') {
+        if (screenshotSubMode === 'multi') startMultiCapture();
+        else captureScreenshot();
+    } else {
+        startRecording();
+    }
+}
+
+// ── Multi-capture ("Multimedia") — hands off to the on-page tray immediately;
+// the popup has nothing further to do since it'll close the moment the user
+// clicks the page to navigate/interact between captures. All subsequent
+// state lives in background.js, driven by content.js's tray widget.
+async function startMultiCapture() {
+    const btn = document.getElementById('btn-start');
+    btn.disabled = true;
+    btn.textContent = '…Starting';
+    try {
+        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        const res = await chrome.runtime.sendMessage({ type: 'START_MULTI_CAPTURE', tabId: tab?.id });
+        if (res.error) throw new Error(res.error);
+        showToast('📸 Capture tray opened — bottom-right of the page');
+        window.close();
+    } catch (e) {
+        showToast(`Failed to start: ${e.message}`);
+        btn.disabled = false;
+        btn.textContent = '📸 Start Multi-Capture';
+    }
+}
+
+// ── Multi-capture status screen (shown on reopen while a capture is active) ────
+// This is what makes cross-tab/cross-app capture work: chrome.tabs.captureVisibleTab
+// can only ever grab the tab that's active right now, so to add a shot of a
+// *different* tab, the user switches to it and reopens the popup — which,
+// since the popup always reflects whichever tab it's opened from, naturally
+// captures the right one. For anything the extension can't capture at all
+// (a native app like Postman), "Add from File" imports an existing image
+// instead of trying to screenshot it.
+function readFileAsDataUrl(file) {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = () => reject(reader.error);
+        reader.readAsDataURL(file);
+    });
+}
+
+function showMultiCaptureStatusScreen(mcStatus) {
+    document.getElementById('main-screen').style.display = 'none';
+    document.getElementById('screenshot-report').style.display = 'none';
+    document.getElementById('multi-capture-status').style.display = 'block';
+    renderMultiCaptureStatus(mcStatus);
+}
+
+function renderMultiCaptureStatus(mcStatus) {
+    const count = mcStatus.shots.length;
+    const atLimit = count >= mcStatus.maxShots;
+    document.getElementById('mc-shot-count').textContent =
+        `${count} screenshot${count !== 1 ? 's' : ''}${atLimit ? ' (max reached)' : ''}`;
+    document.getElementById('mc-thumbs').innerHTML = mcStatus.shots.map(s => `<img src="${s.dataUrl}" />`).join('');
+    document.getElementById('btn-mc-capture-tab').disabled = atLimit;
+    document.getElementById('btn-mc-from-file').disabled = atLimit;
+    document.getElementById('btn-mc-report').disabled = count === 0;
+}
+
+function wireMultiCaptureStatusScreen() {
+    document.getElementById('btn-mc-capture-tab').addEventListener('click', async (e) => {
+        const btn = e.currentTarget;
+        btn.disabled = true;
+        btn.textContent = '…Capturing';
+        const res = await chrome.runtime.sendMessage({ type: 'CAPTURE_ANOTHER_SHOT' });
+        btn.textContent = '📸 Capture This Tab';
+        if (res.error) { showToast(res.error); btn.disabled = false; return; }
+        const mcStatus = await chrome.runtime.sendMessage({ type: 'GET_MULTI_CAPTURE_STATUS' });
+        renderMultiCaptureStatus(mcStatus);
+    });
+
+    document.getElementById('btn-mc-from-file').addEventListener('click', () => {
+        document.getElementById('mc-file-input').click();
+    });
+
+    document.getElementById('mc-file-input').addEventListener('change', async (e) => {
+        const files = Array.from(e.target.files || []).filter(f => f.type.startsWith('image/'));
+        e.target.value = ''; // allow re-selecting the same file next time
+        if (!files.length) return;
+        const dataUrls = await Promise.all(files.map(readFileAsDataUrl));
+        const res = await chrome.runtime.sendMessage({ type: 'ADD_MULTI_CAPTURE_FILES', dataUrls });
+        if (res.error) { showToast(res.error); return; }
+        if (res.skipped > 0) showToast(`Added ${res.added}, skipped ${res.skipped} — hit the ${8} screenshot limit`);
+        const mcStatus = await chrome.runtime.sendMessage({ type: 'GET_MULTI_CAPTURE_STATUS' });
+        renderMultiCaptureStatus(mcStatus);
+    });
+
+    document.getElementById('btn-mc-report').addEventListener('click', async () => {
+        const mcStatus = await chrome.runtime.sendMessage({ type: 'GET_MULTI_CAPTURE_STATUS' });
+        if (!mcStatus.shots.length) return;
+        reportingMultiCapture = true;
+        multiCaptureShotsForReport = mcStatus.shots;
+        await showScreenshotReport();
+    });
+
+    document.getElementById('btn-mc-cancel').addEventListener('click', async () => {
+        await chrome.runtime.sendMessage({ type: 'CANCEL_MULTI_CAPTURE' });
+        window.close();
+    });
 }
 
 // ── Start Recording (video mode) ────────────────────────────────────────────────
@@ -172,7 +302,7 @@ async function stopRecording() {
             showToast(`Error: ${res.error}`);
         } else {
             setRecordingUI(false);
-            showToast('Session saved ✓ Open Viewer to browse');
+            showToast('Session saved ✓ Open Dashboard to browse');
         }
     } catch (e) {
         showToast(`Failed: ${e.message}`);
@@ -203,8 +333,20 @@ async function captureScreenshot() {
 
 async function showScreenshotReport() {
     document.getElementById('main-screen').style.display = 'none';
+    document.getElementById('multi-capture-status').style.display = 'none';
     document.getElementById('screenshot-report').style.display = 'block';
-    document.getElementById('screenshot-preview').src = currentScreenshotDataUrl;
+
+    const preview = document.getElementById('screenshot-preview');
+    const strip = document.getElementById('screenshot-preview-strip');
+    if (reportingMultiCapture) {
+        preview.style.display = 'none';
+        strip.style.display = 'flex';
+        strip.innerHTML = multiCaptureShotsForReport.map(s => `<img src="${s.dataUrl}" />`).join('');
+    } else {
+        preview.style.display = 'block';
+        strip.style.display = 'none';
+        preview.src = currentScreenshotDataUrl;
+    }
     document.getElementById('screenshot-desc').value = '';
 
     const collectorUrl = await getCollectorUrl();
@@ -222,7 +364,7 @@ async function showScreenshotReport() {
 
     if (!slackConfigForPopup.configured || !(slackConfigForPopup.savedChannels || []).length) {
         channelSelect.innerHTML = '<option value="">No channel configured</option>';
-        showToast('Set up Slack channels in the Viewer UI → Settings first');
+        showToast('Set up Slack channels in the Dashboard → Integrations first');
         document.getElementById('btn-send-screenshot').disabled = true;
         return;
     }
@@ -247,14 +389,25 @@ function renderScreenshotThreadOptions() {
         threads.map(t => `<option value="${t.id}">${t.name}</option>`).join('');
 }
 
-function hideScreenshotReport() {
+async function hideScreenshotReport() {
     document.getElementById('screenshot-report').style.display = 'none';
-    document.getElementById('main-screen').style.display = 'block';
     currentScreenshotDataUrl = null;
+
+    if (reportingMultiCapture) {
+        reportingMultiCapture = false;
+        // "Cancel" here just backs out of the report form — the capture itself
+        // is still in progress, so return to the status screen rather than
+        // discarding it. "Cancel Capture" on that screen is the real cancel.
+        const mcStatus = await chrome.runtime.sendMessage({ type: 'GET_MULTI_CAPTURE_STATUS' });
+        if (mcStatus && mcStatus.active) showMultiCaptureStatusScreen(mcStatus);
+        else window.close(); // already sent/cancelled elsewhere in the meantime
+    } else {
+        document.getElementById('main-screen').style.display = 'block';
+    }
 }
 
 async function sendScreenshotReport() {
-    if (!currentScreenshotDataUrl) return;
+    if (!reportingMultiCapture && !currentScreenshotDataUrl) return;
     const btn = document.getElementById('btn-send-screenshot');
     const channel = document.getElementById('screenshot-channel').value;
     const threadId = document.getElementById('screenshot-thread').value;
@@ -267,24 +420,35 @@ async function sendScreenshotReport() {
     btn.disabled = true;
     btn.textContent = 'Sending…';
     try {
-        const collectorUrl = await getCollectorUrl();
-        const blob = await (await fetch(currentScreenshotDataUrl)).blob();
-        const form = new FormData();
-        form.append('image', blob, 'screenshot.png');
-        form.append('channel', channel);
-        if (savedThread) form.append('threadLink', savedThread.link);
-        if (text) form.append('text', text);
+        if (reportingMultiCapture) {
+            // Shots already live in background.js (multiCapture.shots) — no
+            // need to re-send the image data, just the report fields.
+            const res = await chrome.runtime.sendMessage({
+                type: 'SUBMIT_MULTI_CAPTURE_REPORT',
+                channel, threadLink: savedThread ? savedThread.link : undefined, text,
+            });
+            if (res.error) throw new Error(res.error);
+        } else {
+            const collectorUrl = await getCollectorUrl();
+            const blob = await (await fetch(currentScreenshotDataUrl)).blob();
+            const form = new FormData();
+            form.append('image', blob, 'screenshot.png');
+            form.append('channel', channel);
+            if (savedThread) form.append('threadLink', savedThread.link);
+            if (text) form.append('text', text);
 
-        const res = await fetch(`${collectorUrl}/integrations/slack/send-screenshot`, { method: 'POST', body: form });
-        const data = await res.json();
-        if (!data.ok) throw new Error(data.message || 'Failed to send');
+            const res = await fetch(`${collectorUrl}/integrations/slack/send-screenshot`, { method: 'POST', body: form });
+            const data = await res.json();
+            if (!data.ok) throw new Error(data.message || 'Failed to send');
+        }
         showToast('📸 Sent to Slack ✓');
-        hideScreenshotReport();
+        reportingMultiCapture = false; // capture already torn down server-side; just close, nothing to return to
+        window.close();
     } catch (e) {
         showToast(`Failed to send: ${e.message}`);
+        btn.disabled = false;
+        btn.textContent = 'Send to Slack';
     }
-    btn.disabled = false;
-    btn.textContent = 'Send to Slack';
 }
 
 // ── Bug Marker ────────────────────────────────────────────────────────────────
@@ -313,7 +477,7 @@ document.addEventListener('DOMContentLoaded', () => {
     document.getElementById('btn-stop').addEventListener('click', stopRecording);
     document.getElementById('btn-marker').addEventListener('click', toggleMarkerInput);
     document.getElementById('btn-submit-marker').addEventListener('click', submitMarker);
-    document.getElementById('btn-viewer').addEventListener('click', openViewer);
+    document.getElementById('btn-viewer').addEventListener('click', openDashboard);
     document.getElementById('btn-send-screenshot').addEventListener('click', sendScreenshotReport);
     document.getElementById('btn-cancel-screenshot').addEventListener('click', hideScreenshotReport);
     document.getElementById('screenshot-channel').addEventListener('change', renderScreenshotThreadOptions);
@@ -321,7 +485,7 @@ document.addEventListener('DOMContentLoaded', () => {
     init();
 });
 
-// ── Open Viewer ───────────────────────────────────────────────────────────────
-function openViewer() {
+// ── Open Dashboard ────────────────────────────────────────────────────────────
+function openDashboard() {
     chrome.tabs.create({ url: 'http://127.0.0.1:17890' });
 }
